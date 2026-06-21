@@ -10,6 +10,8 @@ Gerbil sessions are self-contained and sandboxed: each session is run
 in a container, producing a git commit, for example:
 
 ```bash
+$ ... # git clone this repo, cd gerbil
+
 # build the lean-sandbox Docker image (only have to do this once)
 $ docker build -t lean-sandbox:latest .
 
