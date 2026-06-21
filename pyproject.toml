@@ -1,0 +1,14 @@
+[project]
+name = "gerbil"
+version = "0.1.0"
+description = "A sandboxed Lean theorem-proving agent."
+requires-python = ">=3.12"
+dependencies = [
+    "docker>=7.0",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.50"]
+gemini = ["google-genai>=0.3"]
+all = ["anthropic>=0.40", "openai>=1.50", "google-genai>=0.3"]
