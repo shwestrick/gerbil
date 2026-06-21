@@ -72,9 +72,9 @@ def main() -> None:
 
     prompt = prompt_file.read_text()
     timestamp = datetime.now().strftime("%y%m%d-%H%M%S")
-    session_path = Path(f"gerbil-{timestamp}.jsonl")
-    diff_path = Path(f"gerbil-{timestamp}.patch")
-    commit_path = Path(f"gerbil-{timestamp}.commit")
+    session_path = project_dir / f"gerbil-{timestamp}.jsonl"
+    diff_path = project_dir / f"gerbil-{timestamp}.patch"
+    commit_path = project_dir / f"gerbil-{timestamp}.commit"
 
     session = Session(
         path=session_path,
