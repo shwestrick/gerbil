@@ -100,13 +100,25 @@ def main() -> None:
     print(f"session: {session_path}")
     print(f"diff:    {diff_path}")
 
-    # The commit message was produced as the session's final turn.
+    # The commit message was produced as the session's final turn; append a
+    # footer recording how this run of Gerbil was invoked.
     if result and result.commit_message:
-        commit_path.write_text(result.commit_message + "\n")
+        footer = _run_footer(args)
+        commit_path.write_text(result.commit_message + "\n\n" + footer + "\n")
         print(f"commit:  {commit_path}")
         print(f"\n{result.commit_message.splitlines()[0]}")
     else:
         print("commit:  (no changes; skipped)")
+
+
+def _run_footer(args) -> str:
+    """A trailer describing this Gerbil run, appended to the commit message."""
+    max_turns = args.max_turns if args.max_turns is not None else "unlimited"
+    return (
+        "authored by Gerbil:\n"
+        f"--model {args.model}\n"
+        f"--max-turns {max_turns}"
+    )
 
 
 if __name__ == "__main__":
