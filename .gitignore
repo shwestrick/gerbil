@@ -4,3 +4,4 @@ __pycache__/
 # gerbil session outputs
 gerbil-*.jsonl
 gerbil-*.patch
+gerbil-*.commit

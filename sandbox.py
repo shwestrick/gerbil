@@ -45,9 +45,15 @@ class LeanSandbox:
             diff = sandbox.get_diff()
     """
 
-    def __init__(self, project_dir: str | Path, image: str = "lean-sandbox:latest"):
+    def __init__(
+        self,
+        project_dir: str | Path,
+        image: str = "lean-sandbox:latest",
+        fetch_cache: bool = True,
+    ):
         self.project_dir = Path(project_dir).resolve()
         self.image = image
+        self.fetch_cache = fetch_cache
         self._docker = docker.from_env()
         self._container = None
 
@@ -62,7 +68,8 @@ class LeanSandbox:
         self._wait_running()
         self._upload_project()
         self._init_git()
-        self._fetch_mathlib_cache()
+        if self.fetch_cache:
+            self._fetch_mathlib_cache()
         return self
 
     def __exit__(self, *_) -> None:

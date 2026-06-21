@@ -11,10 +11,10 @@ Outputs (in the current working directory):
 
 import argparse
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
-from agent import MODEL_PRICING, run_session
+from agent import MODEL_PRICING, generate_commit_message, run_session
 from sandbox import LeanSandbox
 from session import Session
 
@@ -54,6 +54,12 @@ def main() -> None:
         default=None,
         help="Safety cap on agent turns (default: unlimited, runs until done).",
     )
+    parser.add_argument(
+        "--skip-cache",
+        action="store_true",
+        help="Skip 'lake exe cache get' at startup (faster, but mathlib will "
+        "rebuild from source on first use).",
+    )
     args = parser.parse_args()
 
     project_dir = Path(args.at).resolve()
@@ -65,9 +71,10 @@ def main() -> None:
         sys.exit(f"error: {prompt_file} is not a file")
 
     prompt = prompt_file.read_text()
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now().strftime("%y%m%d-%H%M%S")
     session_path = Path(f"gerbil-{timestamp}.jsonl")
     diff_path = Path(f"gerbil-{timestamp}.patch")
+    commit_path = Path(f"gerbil-{timestamp}.commit")
 
     session = Session(
         path=session_path,
@@ -76,8 +83,11 @@ def main() -> None:
         prompt_file=prompt_file,
     )
 
+    diff = ""
     try:
-        with LeanSandbox(project_dir=project_dir) as sandbox:
+        with LeanSandbox(
+            project_dir=project_dir, fetch_cache=not args.skip_cache
+        ) as sandbox:
             run_session(
                 sandbox, session, prompt, args.model, max_turns=args.max_turns
             )
@@ -89,6 +99,15 @@ def main() -> None:
 
     print(f"session: {session_path}")
     print(f"diff:    {diff_path}")
+
+    # Generate a commit title + message describing the changes.
+    if diff.strip():
+        commit_msg = generate_commit_message(args.model, prompt, diff)
+        commit_path.write_text(commit_msg + "\n")
+        print(f"commit:  {commit_path}")
+        print(f"\n{commit_msg.splitlines()[0]}")
+    else:
+        print("commit:  (no changes; skipped)")
 
 
 if __name__ == "__main__":

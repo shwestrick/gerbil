@@ -104,12 +104,14 @@ def _stream_gemini(model, system, messages, tools):
 
     client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
 
-    declarations = [
-        {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}
-        for t in tools
-    ]
-    gemini_tools = types.Tool(function_declarations=declarations)
-    config = types.GenerateContentConfig(tools=[gemini_tools], system_instruction=system)
+    config_kwargs = {"system_instruction": system}
+    if tools:
+        declarations = [
+            {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}
+            for t in tools
+        ]
+        config_kwargs["tools"] = [types.Tool(function_declarations=declarations)]
+    config = types.GenerateContentConfig(**config_kwargs)
 
     contents = []
     for msg in messages:
@@ -213,13 +215,16 @@ def _stream_anthropic(model, system, messages, tools):
     current_tool_json = ""
     current_tool_id = None
 
-    with client.messages.stream(
+    stream_kwargs = dict(
         model=model,
         max_tokens=ANTHROPIC_MAX_TOKENS,
         system=system,
         messages=anthropic_messages,
-        tools=anthropic_tools,
-    ) as s:
+    )
+    if anthropic_tools:
+        stream_kwargs["tools"] = anthropic_tools
+
+    with client.messages.stream(**stream_kwargs) as s:
         for event in s:
             if event.type == "content_block_start":
                 if event.content_block.type == "tool_use":
@@ -312,13 +317,16 @@ def _stream_openai(model, system, messages, tools):
     usage = Usage()
     tool_calls_acc = {}  # index -> {id, name, args_json}
 
-    response = client.chat.completions.create(
+    create_kwargs = dict(
         model=model,
         messages=openai_messages,
-        tools=openai_tools,
         stream=True,
         stream_options={"include_usage": True},
     )
+    if openai_tools:
+        create_kwargs["tools"] = openai_tools
+
+    response = client.chat.completions.create(**create_kwargs)
 
     for chunk in response:
         if chunk.usage:
@@ -407,13 +415,16 @@ def _stream_openai_responses(model, system, messages, tools):
     usage = Usage()
     pending_calls = {}  # item_id -> {call_id, name, args_json}
 
-    s = client.responses.create(
+    create_kwargs = dict(
         model=model,
         instructions=system,
         input=input_items,
-        tools=openai_tools,
         stream=True,
     )
+    if openai_tools:
+        create_kwargs["tools"] = openai_tools
+
+    s = client.responses.create(**create_kwargs)
 
     for event in s:
         etype = getattr(event, "type", "")

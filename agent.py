@@ -158,6 +158,36 @@ def run_session(
         messages.append({"role": "user", "content": tool_results})
 
 
+COMMIT_SYSTEM_PROMPT = """\
+You write a single git commit message for a set of changes to a Lean project.
+
+Output format (and nothing else -- no code fences, no preamble):
+  - First line: a concise imperative title, at most ~72 characters.
+  - Then one blank line.
+  - Then a short body explaining what changed and why, wrapped at ~72 columns.
+"""
+
+
+def generate_commit_message(
+    model: str,
+    task: str,
+    diff: str,
+    provider: str | None = None,
+) -> str:
+    """Make a single tool-less LLM call to produce a commit title + message
+    describing the given diff. Returns the message text."""
+    user = (
+        f"The requested task was:\n{task}\n\n"
+        f"The git diff of the changes that were made:\n{diff}"
+    )
+    messages = [{"role": "user", "content": user}]
+    text = ""
+    for event in stream(model, COMMIT_SYSTEM_PROMPT, messages, [], provider):
+        if isinstance(event, TextDelta):
+            text += event.text
+    return text.strip()
+
+
 def _print_usage(model: str, turns: int, usage: Usage) -> None:
     """Print a summary line with token counts and estimated cost."""
     price_in, price_out = MODEL_PRICING.get(model, DEFAULT_PRICING)
