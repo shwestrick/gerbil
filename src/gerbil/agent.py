@@ -10,10 +10,10 @@ tool result to the Session as it goes.
 import sys
 from dataclasses import dataclass
 
-from providers import Done, TextDelta, ToolCall, Usage, _ToolMeta, stream
-from sandbox import LeanSandbox
-from session import Session
-from tools import TOOLS, dispatch
+from .providers import Done, TextDelta, ToolCall, Usage, _ToolMeta, stream
+from .sandbox import LeanSandbox
+from .session import Session
+from .tools import TOOLS, dispatch
 
 # Known models and per-million-token pricing (input, output). Best-effort
 # estimates, used only for the cost summary. Ported from lea-prover.

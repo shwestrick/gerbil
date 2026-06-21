@@ -14,9 +14,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from agent import MODEL_PRICING, run_session
-from sandbox import LeanSandbox
-from session import Session
+from .agent import MODEL_PRICING, run_session
+from .sandbox import LeanSandbox
+from .session import Session
 
 
 DEFAULT_MODEL = "gemini-3.1-pro-preview"

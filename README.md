@@ -13,7 +13,7 @@ in a container, producing a git commit, for example:
 $ ... # git clone this repo, cd gerbil
 
 # build the lean-sandbox Docker image (only have to do this once)
-$ docker build -t lean-sandbox:latest .
+$ docker build -t lean-sandbox:latest src/lean-sandbox
 
 # run a session
 $ uv run gerbil --at /path/to/lake/project --prompt PROMPT.md

@@ -6,14 +6,11 @@ tools, bash, command timeout, and git diff.
 """
 
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import tools
-from sandbox import LeanSandbox
+from gerbil import tools
+from gerbil.sandbox import LeanSandbox
 
 
 def make_project(root: Path) -> None:

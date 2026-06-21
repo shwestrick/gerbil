@@ -16,11 +16,8 @@ Requires GOOGLE_API_KEY in the environment and the gemini extra installed:
 
 import os
 import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from providers import Done, TextDelta, ToolCall, Usage, _ToolMeta, stream
+from gerbil.providers import Done, TextDelta, ToolCall, Usage, _ToolMeta, stream
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "gemini-2.5-flash"
 

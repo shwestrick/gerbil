@@ -8,7 +8,7 @@ retry rather than crashing the session.
 
 from dataclasses import dataclass
 
-from sandbox import CommandResult, LeanSandbox
+from .sandbox import CommandResult, LeanSandbox
 
 
 TOOLS = [
