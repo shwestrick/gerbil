@@ -8,6 +8,7 @@ tool result to the Session as it goes.
 """
 
 import sys
+from dataclasses import dataclass
 
 from providers import Done, TextDelta, ToolCall, Usage, _ToolMeta, stream
 from sandbox import LeanSandbox
@@ -53,6 +54,73 @@ summary of what you did. Do not call any more tools once you are done.
 """
 
 
+@dataclass
+class SessionResult:
+    final_text: str       # the model's last task-phase message
+    diff: str             # git patch of all changes made during the session
+    commit_message: str   # generated commit title + body ("" if no changes)
+
+
+def _commit_request(diff: str) -> str:
+    """The user message that asks the model to write the commit message."""
+    return (
+        "The task is complete. Here is the final git diff of all your changes:\n\n"
+        f"{diff}\n\n"
+        "Write a git commit message for these changes. Output ONLY the commit "
+        "message, with no code fences or preamble:\n"
+        "  - First line: a concise imperative title, at most ~72 characters.\n"
+        "  - Then one blank line.\n"
+        "  - Then a short body explaining what changed and why, wrapped at ~72 columns."
+    )
+
+
+def _run_turn(model, system, messages, tools, provider):
+    """Stream a single turn, printing text and tool calls live.
+
+    Returns (assistant_parts, tool_calls, text, usage).
+    """
+    assistant_parts = []
+    current_text = ""
+    tool_calls = []  # {name, args, id, raw_part}
+    usage = Usage()
+
+    for event in stream(model, system, messages, tools, provider):
+        if isinstance(event, TextDelta):
+            sys.stdout.write(event.text)
+            sys.stdout.flush()
+            current_text += event.text
+        elif isinstance(event, ToolCall):
+            if current_text:
+                assistant_parts.append({"type": "text", "text": current_text})
+                current_text = ""
+            print(f"\n  -> {event.name}({event.args})", flush=True)
+            tool_calls.append({
+                "name": event.name,
+                "args": event.args,
+                "id": None,
+                "raw_part": event.raw_part,
+            })
+        elif isinstance(event, _ToolMeta):
+            if tool_calls:
+                tool_calls[-1]["id"] = event.tool_use_id
+        elif isinstance(event, Done):
+            usage = event.usage
+
+    if current_text:
+        assistant_parts.append({"type": "text", "text": current_text})
+    for tc in tool_calls:
+        assistant_parts.append({
+            "type": "tool_call",
+            "name": tc["name"],
+            "args": tc["args"],
+            "id": tc["id"],
+            "raw_part": tc["raw_part"],
+        })
+
+    text = "".join(p["text"] for p in assistant_parts if p["type"] == "text")
+    return assistant_parts, tool_calls, text, usage
+
+
 def run_session(
     sandbox: LeanSandbox,
     session: Session,
@@ -60,10 +128,12 @@ def run_session(
     model: str,
     provider: str | None = None,
     max_turns: int | None = None,
-) -> str:
+) -> SessionResult:
     """Run the agent loop until the model stops calling tools (or max_turns).
 
-    Returns the final assistant text.
+    When the model finishes the task naturally, one more turn is appended to the
+    same conversation asking it to write a commit message for its diff; that turn
+    is recorded and counted like any other.
     """
     messages = [{"role": "user", "content": prompt}]
     session.record_turn("user", prompt)
@@ -71,68 +141,31 @@ def run_session(
     total = Usage()
     turn = 0
     final_text = ""
+    stopped_at_max = False
+
     while True:
+        if max_turns and turn >= max_turns:
+            stopped_at_max = True
+            break
         turn += 1
-        if max_turns and turn > max_turns:
-            print(f"\n[stopped: reached max_turns={max_turns}]", flush=True)
-            _print_usage(model, turn - 1, total)
-            return final_text
 
         print(f"\n--- turn {turn} ---", flush=True)
 
-        assistant_parts = []
-        current_text = ""
-        tool_calls = []  # {name, args, id, raw_part}
-        usage = Usage()
-
-        for event in stream(model, SYSTEM_PROMPT, messages, TOOLS, provider):
-            if isinstance(event, TextDelta):
-                sys.stdout.write(event.text)
-                sys.stdout.flush()
-                current_text += event.text
-            elif isinstance(event, ToolCall):
-                if current_text:
-                    assistant_parts.append({"type": "text", "text": current_text})
-                    current_text = ""
-                print(f"\n  -> {event.name}({event.args})", flush=True)
-                tool_calls.append({
-                    "name": event.name,
-                    "args": event.args,
-                    "id": None,
-                    "raw_part": event.raw_part,
-                })
-            elif isinstance(event, _ToolMeta):
-                if tool_calls:
-                    tool_calls[-1]["id"] = event.tool_use_id
-            elif isinstance(event, Done):
-                usage = event.usage
+        assistant_parts, tool_calls, final_text, usage = _run_turn(
+            model, SYSTEM_PROMPT, messages, TOOLS, provider
+        )
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
 
-        if current_text:
-            assistant_parts.append({"type": "text", "text": current_text})
-        for tc in tool_calls:
-            assistant_parts.append({
-                "type": "tool_call",
-                "name": tc["name"],
-                "args": tc["args"],
-                "id": tc["id"],
-                "raw_part": tc["raw_part"],
-            })
-
         messages.append({"role": "assistant", "content": assistant_parts})
-        final_text = "".join(
-            p["text"] for p in assistant_parts if p["type"] == "text"
-        )
         session.record_turn(
             "assistant", final_text, usage.input_tokens, usage.output_tokens
         )
 
-        # No tool calls => the model is done.
+        # No tool calls => the model is done with the task.
         if not tool_calls:
             print(flush=True)
-            _print_usage(model, turn, total)
-            return final_text
+            break
 
         # Execute tool calls and feed results back.
         tool_results = []
@@ -157,35 +190,39 @@ def run_session(
 
         messages.append({"role": "user", "content": tool_results})
 
+    if stopped_at_max:
+        print(f"\n[stopped: reached max_turns={max_turns}]", flush=True)
 
-COMMIT_SYSTEM_PROMPT = """\
-You write a single git commit message for a set of changes to a Lean project.
+    # Final turn: ask for a commit message as a true continuation of the
+    # conversation. Skipped if nothing changed, or if we bailed on max_turns
+    # (the work is incomplete and the history ends on a tool result).
+    diff = sandbox.get_diff()
+    commit_message = ""
+    if diff.strip() and not stopped_at_max:
+        turn += 1
+        print(f"\n--- turn {turn} (commit message) ---", flush=True)
 
-Output format (and nothing else -- no code fences, no preamble):
-  - First line: a concise imperative title, at most ~72 characters.
-  - Then one blank line.
-  - Then a short body explaining what changed and why, wrapped at ~72 columns.
-"""
+        request = _commit_request(diff)
+        messages.append({"role": "user", "content": request})
+        session.record_turn("user", request)
 
+        parts, _calls, text, usage = _run_turn(
+            model, SYSTEM_PROMPT, messages, [], provider
+        )
+        total.input_tokens += usage.input_tokens
+        total.output_tokens += usage.output_tokens
 
-def generate_commit_message(
-    model: str,
-    task: str,
-    diff: str,
-    provider: str | None = None,
-) -> str:
-    """Make a single tool-less LLM call to produce a commit title + message
-    describing the given diff. Returns the message text."""
-    user = (
-        f"The requested task was:\n{task}\n\n"
-        f"The git diff of the changes that were made:\n{diff}"
+        messages.append({"role": "assistant", "content": parts})
+        session.record_turn(
+            "assistant", text, usage.input_tokens, usage.output_tokens
+        )
+        commit_message = text.strip()
+        print(flush=True)
+
+    _print_usage(model, turn, total)
+    return SessionResult(
+        final_text=final_text, diff=diff, commit_message=commit_message
     )
-    messages = [{"role": "user", "content": user}]
-    text = ""
-    for event in stream(model, COMMIT_SYSTEM_PROMPT, messages, [], provider):
-        if isinstance(event, TextDelta):
-            text += event.text
-    return text.strip()
 
 
 def _print_usage(model: str, turns: int, usage: Usage) -> None:
