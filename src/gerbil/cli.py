@@ -10,6 +10,7 @@ Outputs (in the current working directory):
 """
 
 import argparse
+import contextlib
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ from .agent import MODEL_PRICING, run_session
 from .sandbox import LeanSandbox
 from .session import Session
 from .term import style
+from .tools import Toolset
 
 
 DEFAULT_MODEL = "gemini-3.1-pro-preview"
@@ -61,6 +63,12 @@ def main() -> None:
         help="Skip 'lake exe cache get' at startup (faster, but mathlib will "
         "rebuild from source on first use).",
     )
+    parser.add_argument(
+        "--no-mcp",
+        dest="mcp",
+        action="store_false",
+        help="Disable the lean-lsp MCP tools; use only the built-in tools.",
+    )
     args = parser.parse_args()
 
     project_dir = Path(args.at).resolve()
@@ -88,9 +96,19 @@ def main() -> None:
         with LeanSandbox(
             project_dir=project_dir, fetch_cache=not args.skip_cache
         ) as sandbox:
-            result = run_session(
-                sandbox, session, prompt, args.model, max_turns=args.max_turns
-            )
+            # The MCP server runs inside the container, so it must be started
+            # after the sandbox is ready and torn down before it (ExitStack
+            # guarantees that ordering on every exit path). If it fails to start,
+            # warn and continue with just the built-in tools.
+            with contextlib.ExitStack() as stack:
+                mcp = None
+                if args.mcp:
+                    mcp = _start_mcp(sandbox, session, stack)
+                toolset = Toolset(sandbox, mcp)
+                result = run_session(
+                    sandbox, session, prompt, args.model, toolset,
+                    max_turns=args.max_turns,
+                )
     except Exception as exc:
         # Catch-all: record the failure as the session's terminal event, point
         # the user at the session file, and exit non-zero.
@@ -123,6 +141,34 @@ def main() -> None:
         print(f"{style('commit:', 'bold')}  {commit_path}")
     else:
         print(f"{style('commit:', 'bold')}  (no changes; skipped)")
+
+
+def _start_mcp(sandbox, session, stack):
+    """Start the lean-lsp MCP client, registering it for teardown on the stack.
+
+    Returns the McpClient, or None if it could not be started (in which case the
+    failure is recorded to the session and a warning is printed -- the run then
+    continues with just the built-in tools).
+    """
+    try:
+        from .mcp_client import McpClient
+
+        mcp = stack.enter_context(McpClient(sandbox))
+        print(
+            style(f"[mcp: {len(mcp.list_tools())} lean tools available]", "gray"),
+            flush=True,
+        )
+        return mcp
+    except Exception as exc:
+        session.record_warning(
+            f"lean-lsp MCP unavailable: {type(exc).__name__}: {exc}"
+        )
+        print(
+            f"{style('warning:', 'bold', 'yellow')} lean-lsp MCP unavailable "
+            f"({type(exc).__name__}: {exc}); continuing with built-in tools only.",
+            file=sys.stderr,
+        )
+        return None
 
 
 def _run_footer(args) -> str:

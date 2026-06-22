@@ -9,6 +9,7 @@ Event types:
   tool_call       — one per tool invocation sent to the sandbox
   tool_result     — one per sandbox response
   session_end     — written once at the bottom with totals
+  warning         — non-terminal note about a recoverable problem
   error           — terminal event if the session aborts with an exception
 """
 
@@ -81,6 +82,15 @@ class Session:
                 "input_tokens": self._total_input_tokens,
                 "output_tokens": self._total_output_tokens,
             },
+        })
+
+    def record_warning(self, message: str) -> None:
+        """Non-terminal event noting a recoverable problem (e.g. MCP failed to
+        start so the session continued with built-in tools only)."""
+        self._append({
+            "event": "warning",
+            "timestamp": _now(),
+            "message": message,
         })
 
     def record_error(self, exc: BaseException) -> None:

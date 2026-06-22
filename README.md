@@ -42,3 +42,15 @@ $ cd /path/to/lake/project
 $ git apply gerbil-260621-190350.patch
 $ git commit -F gerbil-260621-190350.commit
 ```
+
+### Lean LSP tools (MCP)
+
+By default gerbil also gives the agent the
+[lean-lsp-mcp](https://github.com/oOo0oOo/lean-lsp-mcp) tools — proof state
+(`lean_goal`), diagnostics, hover info, tactic trials (`lean_multi_attempt`),
+and mathlib search — alongside the built-in `bash`/`read_file`/`write_file`/
+`edit_file` tools. The MCP server runs inside the sandbox container (where the
+Lean toolchain lives); gerbil connects to it over `docker exec`.
+
+Pass `--no-mcp` to disable it and use only the built-in tools. If the MCP server
+fails to start, gerbil warns and continues with the built-in tools.

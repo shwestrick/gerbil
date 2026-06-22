@@ -7,8 +7,12 @@ retry rather than crashing the session.
 """
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .sandbox import CommandResult, LeanSandbox
+
+if TYPE_CHECKING:
+    from .mcp_client import McpClient
 
 
 TOOLS = [
@@ -121,6 +125,44 @@ def dispatch(sandbox: LeanSandbox, name: str, args: dict) -> ToolResult:
         return ToolResult(f"unknown tool: {name}", is_error=True)
     except Exception as e:
         return ToolResult(f"{type(e).__name__}: {e}", is_error=True)
+
+
+class Toolset:
+    """Unified tool registry passed to the agent loop.
+
+    Combines gerbil's sandbox-bound built-in tools with optional MCP-server tools
+    (lean-lsp). Exposes a flat schema list for the provider and a single dispatch
+    entry point that routes by name. dispatch() never raises.
+    """
+
+    def __init__(self, sandbox: LeanSandbox, mcp: "McpClient | None" = None):
+        self._sandbox = sandbox
+        self._mcp = mcp
+        self._mcp_schemas: list[dict] = []
+        self._mcp_names: set[str] = set()
+        if mcp is not None:
+            builtin = {t["name"] for t in TOOLS}
+            # Built-in names win over any colliding MCP tool (today: none collide).
+            self._mcp_schemas = [
+                t for t in mcp.list_tools() if t["name"] not in builtin
+            ]
+            self._mcp_names = {t["name"] for t in self._mcp_schemas}
+
+    def schemas(self) -> list[dict]:
+        """Built-in schemas first, then MCP schemas. Flat gerbil-format list."""
+        return TOOLS + self._mcp_schemas
+
+    def mcp_tool_names(self) -> set[str]:
+        return set(self._mcp_names)
+
+    def dispatch(self, name: str, args: dict) -> ToolResult:
+        """Route to the built-in or MCP handler by name. Never raises."""
+        if name in self._mcp_names:
+            try:
+                return self._mcp.call_tool(name, args)
+            except Exception as e:
+                return ToolResult(f"{type(e).__name__}: {e}", is_error=True)
+        return dispatch(self._sandbox, name, args)
 
 
 def _bash(sandbox: LeanSandbox, command: str) -> ToolResult:

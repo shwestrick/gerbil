@@ -6,9 +6,8 @@ Exercises the full event interface and message round-trip:
   3. feed a tool_result back
   4. stream the follow-up turn and confirm the model uses the result
 
-Requires GOOGLE_API_KEY in the environment and the gemini extra installed:
+Requires GOOGLE_API_KEY in the environment:
 
-    uv sync --extra gemini
     GOOGLE_API_KEY=...  uv run python tests/test_gemini.py
     # optional: choose a model (default: gemini-2.5-flash)
     GOOGLE_API_KEY=...  uv run python tests/test_gemini.py gemini-2.5-pro

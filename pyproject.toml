@@ -5,13 +5,14 @@ description = "A sandboxed Lean theorem-proving agent."
 requires-python = ">=3.12"
 dependencies = [
     "docker>=7.0",
+    # MCP is on by default (lean-lsp tools), so the client SDK is a core dep.
+    "mcp>=1.0",
+    # Provider SDKs. All are core deps so any --model works out of the box and
+    # survives `uv sync`; providers.py imports only the selected one at runtime.
+    "anthropic>=0.40",
+    "openai>=1.50",
+    "google-genai>=0.3",
 ]
-
-[project.optional-dependencies]
-anthropic = ["anthropic>=0.40"]
-openai = ["openai>=1.50"]
-gemini = ["google-genai>=0.3"]
-all = ["anthropic>=0.40", "openai>=1.50", "google-genai>=0.3"]
 
 [project.scripts]
 gerbil = "gerbil.cli:main"

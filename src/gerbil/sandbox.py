@@ -72,6 +72,13 @@ class LeanSandbox:
             self._fetch_mathlib_cache()
         return self
 
+    @property
+    def container_id(self) -> str:
+        """The running container's id (used to `docker exec` into the sandbox)."""
+        if self._container is None:
+            raise RuntimeError("sandbox is not running")
+        return self._container.id
+
     def __exit__(self, *_) -> None:
         if self._container:
             try:

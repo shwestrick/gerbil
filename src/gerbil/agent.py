@@ -14,10 +14,10 @@ from .providers import Done, TextDelta, ToolCall, Usage, _ToolMeta, stream
 from .sandbox import LeanSandbox
 from .session import Session
 from .term import style
+from .tools import Toolset
 
 # Single accent color for every tool invocation.
 TOOL_COLOR = "cyan"
-from .tools import TOOLS, dispatch
 
 # Known models and per-million-token pricing (input, output). Best-effort
 # estimates, used only for the cost summary. Ported from lea-prover.
@@ -56,6 +56,27 @@ Guidelines:
   - When the task is complete and the project builds, stop and give a short \
 summary of what you did. Do not call any more tools once you are done.
 """
+
+# Appended to the system prompt when lean-lsp (MCP) tools are available.
+LSP_TOOLS_NOTE = """\
+
+You also have lean_* tools backed by the Lean language server. Prefer them for \
+understanding the proof state instead of guessing:
+  - lean_goal / lean_term_goal: the proof state at a position (line/col are 1-indexed)
+  - lean_diagnostic_messages: compiler errors/warnings for a file
+  - lean_hover_info: type signature and docs for an identifier
+  - lean_multi_attempt: try candidate tactics at a position WITHOUT editing the file
+  - search tools (lean_leansearch, lean_loogle, lean_local_search, ...): find \
+mathlib lemmas -- these are RATE-LIMITED, so use them sparingly
+The lean_* tools never modify files; keep using edit_file / write_file for changes. \
+After editing a file, re-run lean_build (or a diagnostics call) so the language \
+server sees your changes.
+"""
+
+
+def build_system_prompt(has_lsp_tools: bool) -> str:
+    """The system prompt, with the LSP-tools note appended when MCP is active."""
+    return SYSTEM_PROMPT + LSP_TOOLS_NOTE if has_lsp_tools else SYSTEM_PROMPT
 
 
 @dataclass
@@ -134,6 +155,7 @@ def run_session(
     session: Session,
     prompt: str,
     model: str,
+    toolset: Toolset,
     provider: str | None = None,
     max_turns: int | None = None,
 ) -> SessionResult:
@@ -145,6 +167,9 @@ def run_session(
     """
     messages = [{"role": "user", "content": prompt}]
     session.record_turn("user", prompt)
+
+    system = build_system_prompt(bool(toolset.mcp_tool_names()))
+    tools = toolset.schemas()
 
     total = Usage()
     turn = 0
@@ -160,7 +185,7 @@ def run_session(
         print("\n" + style(f"--- turn {turn} ---", "bold", "dark_red"), flush=True)
 
         assistant_parts, tool_calls, final_text, usage = _run_turn(
-            model, SYSTEM_PROMPT, messages, TOOLS, provider
+            model, system, messages, tools, provider
         )
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
@@ -179,7 +204,7 @@ def run_session(
         tool_results = []
         for tc in tool_calls:
             session.record_tool_call(tc["name"], tc["args"])
-            result = dispatch(sandbox, tc["name"], tc["args"])
+            result = toolset.dispatch(tc["name"], tc["args"])
             session.record_tool_result(tc["name"], result.content)
 
             preview = result.content[:200] + "..." if len(result.content) > 200 else result.content
@@ -227,7 +252,7 @@ def run_session(
         session.record_turn("user", request)
 
         parts, _calls, text, usage = _run_turn(
-            model, SYSTEM_PROMPT, messages, [], provider
+            model, system, messages, [], provider
         )
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
