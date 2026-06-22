@@ -61,7 +61,8 @@ gerbil-260621-190350.patch
 ```
 
 Apply the patch(es) into your repo as real commits with `gerbil apply` (it
-`git am`s every `.gerbil/*.patch` in order):
+`git am`s every `.gerbil/*.patch` in order, skipping any that are already
+committed or out of date, so it's safe to re-run):
 ```bash
 $ gerbil apply
 ```

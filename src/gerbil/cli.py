@@ -231,8 +231,49 @@ def main() -> None:
     args.func(args)
 
 
+def _patch_id(project_dir: Path, text: str) -> str | None:
+    """The (stable) patch-id of a diff/format-patch -- a content hash that is
+    independent of commit hash, line offsets, and surrounding commits."""
+    out = subprocess.run(
+        ["git", "-C", str(project_dir), "patch-id", "--stable"],
+        input=text,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    return out[0] if out else None
+
+
+def _committed_patch_ids(project_dir: Path) -> set[str]:
+    """Patch-ids of every commit reachable from HEAD, to detect patches that have
+    already been applied (regardless of later commits that touched the area)."""
+    log = subprocess.run(
+        ["git", "-C", str(project_dir), "log", "-p", "--no-color"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    out = subprocess.run(
+        ["git", "-C", str(project_dir), "patch-id", "--stable"],
+        input=log,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return {line.split()[0] for line in out.splitlines() if line.split()}
+
+
+def _patch_applies(project_dir: Path, patch: Path) -> bool:
+    """Whether `patch` applies cleanly to the current tree."""
+    return subprocess.run(
+        ["git", "-C", str(project_dir), "apply", "--check", str(patch)],
+        capture_output=True,
+    ).returncode == 0
+
+
 def cmd_apply(args) -> None:
-    """Apply each .gerbil/gerbil-*.patch (a git format-patch) in order via git am."""
+    """Apply each .gerbil/gerbil-*.patch (a git format-patch) in order via git am.
+
+    The .gerbil/ directory may hold stale patches. Each is classified first:
+    already-committed (its patch-id is in history) => skip; applies cleanly =>
+    new (git am); otherwise out of date => skip with a warning."""
     project_dir = _resolve_at(args.at)
     if not project_dir.is_dir():
         sys.exit(f"error: {project_dir} is not a directory")
@@ -244,15 +285,36 @@ def cmd_apply(args) -> None:
     if not patches:
         sys.exit(f"no patches found in {out_dir}")
 
+    committed = _committed_patch_ids(project_dir)
+    applied = already = stale = 0
     for patch in patches:
-        print(f"{style('applying:', 'bold')} {patch.name}")
-        result = subprocess.run(["git", "am", str(patch)], cwd=project_dir)
-        if result.returncode != 0:
-            sys.exit(
-                f"git am failed on {patch.name}. Resolve and `git am --continue`, "
-                "or `git am --abort` to back out."
+        pid = _patch_id(project_dir, patch.read_text())
+        if pid and pid in committed:
+            print(f"{style('skip:', 'bold', 'gray')}     {patch.name} (already applied)")
+            already += 1
+        elif _patch_applies(project_dir, patch):
+            print(f"{style('applying:', 'bold')} {patch.name}")
+            result = subprocess.run(["git", "am", str(patch)], cwd=project_dir)
+            if result.returncode != 0:
+                sys.exit(
+                    f"git am failed on {patch.name}. Resolve and `git am --continue`, "
+                    "or `git am --abort` to back out."
+                )
+            applied += 1
+            if pid:
+                committed.add(pid)  # so a duplicate patch later also skips
+        else:
+            print(
+                f"{style('skip:', 'bold', 'yellow')}     {patch.name} "
+                "(out of date; does not apply)",
+                file=sys.stderr,
             )
-    print(style("done", "bold"))
+            stale += 1
+
+    print(style(
+        f"done -- {applied} applied, {already} already applied, {stale} out of date",
+        "bold",
+    ))
 
 
 def cmd_run(args) -> None:
