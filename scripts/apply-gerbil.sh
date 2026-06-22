@@ -1,36 +1,24 @@
 #!/usr/bin/env bash
-# Apply and commit each gerbil-produced patch in order, as a series of commits.
+# Apply each gerbil-produced patch in order, as a series of real commits.
 #
 # Usage: apply-gerbil.sh [DIR]   (DIR defaults to the current directory)
 #
-# Walks the .gerbil/gerbil-*.commit files (zero-padded, so they sort in session
-# order) and for each one:
-#   - applies the matching .patch, staging only its changes
-#   - also stages the matching .jsonl session log (committed alongside)
-#   - commits with the generated message
-#   - deletes the .patch and .commit files (the .jsonl stays, now tracked)
-# Run it from (or point it at) the Lean project repo gerbil worked on.
+# Each .gerbil/gerbil-*.patch is a `git format-patch` mbox (title + message +
+# diff), so `git am` replays it as a proper commit -- message and authorship
+# included, no separate commit-message file needed. Zero-padded numbering means
+# the glob is already in session order. Run it from (or point it at) the Lean
+# project repo gerbil worked on.
 set -euo pipefail
 
 cd "${1:-.}"
 
 shopt -s nullglob
-commits=(.gerbil/gerbil-*.commit)
-(( ${#commits[@]} )) || { echo "no .gerbil/gerbil-*.commit files found" >&2; exit 1; }
+patches=(.gerbil/gerbil-*.patch)
+(( ${#patches[@]} )) || { echo "no .gerbil/gerbil-*.patch files found" >&2; exit 1; }
 
-for commit in "${commits[@]}"; do
-    base="${commit%.commit}"
-    patch="${base}.patch"
-    jsonl="${base}.jsonl"
-    [ -f "$patch" ] || { echo "skip $commit: no matching $patch" >&2; continue; }
+for patch in "${patches[@]}"; do
     echo "applying $patch"
-    # --index stages exactly the patch's changes (no `git add -A`, so the other
-    # gerbil-* files are never swept in).
-    git apply --index "$patch"
-    [ -f "$jsonl" ] && git add "$jsonl"
-    git commit -q -F "$commit"
-    echo "  committed: $(head -1 "$commit")"
-    rm -f "$patch" "$commit"
+    git am "$patch"
 done
 
 echo "done"

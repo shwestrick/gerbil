@@ -4,18 +4,26 @@
 Usage:
     gerbil --at DIRECTORY --prompt FILE [--ralph N]
 
+The agent works on the real repository (full history) inside the container.
+Each session's changes are committed there, and the result is emitted as a
+git format-patch -- a single .patch file holding the commit title, message, and
+diff, applied on the host with `git am`.
+
 Outputs (written into a .gerbil/ directory inside the --at project):
     gerbil-TIMESTAMP.jsonl    session log (model, turns, token counts, tool calls)
-    gerbil-TIMESTAMP.patch    git diff of changes gerbil made to the Lean project
-    gerbil-TIMESTAMP.commit   generated commit title + message
+    gerbil-TIMESTAMP.patch    git format-patch of the session's commit(s)
 
 With --ralph N, N sessions run back-to-back on the same prompt (reusing the
-sandbox); each set of outputs is numbered gerbil-TIMESTAMP-NN.{jsonl,patch,commit}
-and each session is committed inside the container so the next builds on it.
+sandbox); each set of outputs is numbered gerbil-TIMESTAMP-NN.{jsonl,patch} and
+each session builds on the previous one's commit.
+
+Every session log and patch is also archived to ~/.gerbil/ (same filenames),
+regardless of what happens to the project-level copies.
 """
 
 import argparse
 import contextlib
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -81,7 +89,13 @@ def main() -> None:
         default=None,
         help="Run N sessions back-to-back on the same prompt, reusing the "
         "sandbox. Each session is committed inside the container so the next "
-        "builds on it; outputs are numbered gerbil-<ts>-NN.{jsonl,patch,commit}.",
+        "builds on it; outputs are numbered gerbil-<ts>-NN.{jsonl,patch}.",
+    )
+    parser.add_argument(
+        "--include-session",
+        action="store_true",
+        help="Include the session .jsonl log in the commit (folded in via "
+        "commit --amend before the patch is produced).",
     )
     args = parser.parse_args()
 
@@ -104,6 +118,15 @@ def main() -> None:
     # Outputs go in a .gerbil/ directory inside the project, to keep its root clean.
     out_dir = project_dir / ".gerbil"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # A user-level archive of ALL gerbil data (every session log and patch, same
+    # filenames), kept regardless of what happens to the project-level copies.
+    archive_dir = Path.home() / ".gerbil"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    def archive(path: Path) -> None:
+        if path.exists():
+            shutil.copy2(path, archive_dir / path.name)
 
     def stem(i: int) -> Path:
         # In --ralph mode, number the per-session output files; otherwise a
@@ -137,8 +160,7 @@ def main() -> None:
                         )
                     s = stem(i)
                     session_path = s.with_suffix(".jsonl")
-                    diff_path = s.with_suffix(".patch")
-                    commit_path = s.with_suffix(".commit")
+                    patch_path = s.with_suffix(".patch")
 
                     session = Session(
                         path=session_path,
@@ -149,30 +171,46 @@ def main() -> None:
                     if mcp_warning:
                         session.record_warning(mcp_warning)
 
+                    # Baseline before the session, so we can format-patch its commits.
+                    session_base = sandbox.head()
+
                     result = run_session(
                         sandbox, session, prompt, args.model, toolset,
                         max_turns=args.max_turns,
                     )
                     session.close()
                     session = None
+                    archive(session_path)  # archive the log before any deletion
 
-                    diff_path.write_text(result.diff)
-                    print(f"{style('session:', 'bold')} {session_path}")
-                    print(f"{style('diff:', 'bold')}    {diff_path}")
-
-                    # The commit message was produced as the session's final turn;
-                    # append a footer recording how this run was invoked.
+                    # Commit the agent's uncommitted changes on real HEAD, with the
+                    # generated message + a footer recording how this run was invoked.
                     if result.commit_message:
                         footer = _run_footer(args, i if args.ralph else None, iterations)
                         full = result.commit_message + "\n\n" + footer + "\n"
-                        commit_path.write_text(full)
-                        print(f"{style('commit:', 'bold')}  {commit_path}")
-                        # In --ralph mode, commit inside the container so the next
-                        # session builds on this one.
-                        if args.ralph:
-                            sandbox.commit(full)
+                        sandbox.commit(full)
+
+                    # The session "produced" something iff HEAD advanced (whether by
+                    # gerbil's commit above or commits the agent made itself).
+                    if sandbox.head() != session_base:
+                        # Optionally fold the session log into the commit, so the
+                        # format-patch carries it too.
+                        if args.include_session:
+                            sandbox.amend_with_file(
+                                f".gerbil/{session_path.name}", session_path.read_text()
+                            )
+                        patch_path.write_text(sandbox.format_patch(session_base))
+                        archive(patch_path)
+                        # The session log is now embedded in the patch; drop the
+                        # loose host copy so `git am` doesn't collide with it.
+                        if args.include_session:
+                            session_path.unlink()
+                            print(f"{style('session:', 'bold')} (embedded in patch)")
+                        else:
+                            print(f"{style('session:', 'bold')} {session_path}")
+                        print(f"{style('patch:', 'bold')}   {patch_path} (git am)")
                     else:
-                        print(f"{style('commit:', 'bold')}  (no changes; skipped)")
+                        print(f"{style('session:', 'bold')} {session_path}")
+                        print(f"{style('patch:', 'bold')}   (no changes; skipped)")
 
                     # The model can call ralph_done to end the loop early.
                     if toolset.ralph_done:
@@ -187,6 +225,7 @@ def main() -> None:
         # (if one is open), point the user at it, and exit non-zero.
         if session is not None:
             session.record_error(exc)
+            archive(session.path)  # preserve the errored session log too
         print(
             f"\n{style('error:', 'bold', 'red')} "
             f"aborted by {type(exc).__name__}: {exc}",

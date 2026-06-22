@@ -67,7 +67,7 @@ class LeanSandbox:
         )
         self._wait_running()
         self._upload_project()
-        self._init_git()
+        self._configure_git()
         if self.fetch_cache:
             self._fetch_mathlib_cache()
         return self
@@ -99,33 +99,40 @@ class LeanSandbox:
         raise TimeoutError("sandbox container did not reach running state")
 
     def _upload_project(self) -> None:
-        """Tar all git-tracked files from the host project and extract them into
-        the container workspace in one shot."""
-        result = subprocess.run(
+        """Upload the real repository into the container: the .git directory (full
+        history, so the agent can refer to past commits) plus every non-ignored
+        working file (tracked + untracked-not-ignored). Ignored paths like .lake/
+        are skipped via git's own enumeration."""
+        rels: list[str] = []
+        for args in (
             ["git", "ls-files", "-z"],
-            cwd=self.project_dir,
-            capture_output=True,
-            check=True,
-        )
-        rel_paths = [p for p in result.stdout.decode().split("\0") if p]
+            ["git", "ls-files", "-z", "--others", "--exclude-standard"],
+        ):
+            out = subprocess.run(
+                args, cwd=self.project_dir, capture_output=True, check=True
+            ).stdout
+            rels += [p for p in out.decode().split("\0") if p]
 
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
-            for rel in rel_paths:
+            for rel in rels:
                 local = self.project_dir / rel
                 if local.is_file():
                     tar.add(local, arcname=rel, filter=_own_by_sandbox)
+            gitdir = self.project_dir / ".git"
+            if gitdir.is_dir():
+                tar.add(gitdir, arcname=".git", filter=_own_by_sandbox)
         buf.seek(0)
         self._container.put_archive(WORKSPACE_DIR, buf.getvalue())
 
-    def _init_git(self) -> None:
-        """Initialize a git repo in the container and commit the uploaded files,
-        establishing a clean baseline for get_diff()."""
-        self.run("git init -b main")
+    def _configure_git(self) -> None:
+        """Set a local committer identity so gerbil can commit the agent's work.
+        The uploaded repo keeps its real history; we do not re-init."""
         self.run("git config user.email gerbil@local")
         self.run("git config user.name gerbil")
-        self.run("git add -A")
-        self.run("git commit -m initial")
+        # Uploaded .git is owned by the sandbox user (uid 1000 == container user),
+        # but add safe.directory defensively in case of ownership quirks.
+        self.run(f"git config --global --add safe.directory {WORKSPACE_DIR}")
 
     def _fetch_mathlib_cache(self) -> None:
         """Download precompiled mathlib oleans. Runs once per session."""
@@ -186,27 +193,47 @@ class LeanSandbox:
     # Output
     # ------------------------------------------------------------------
 
+    def head(self) -> str:
+        """The current HEAD commit hash."""
+        return self.run("git rev-parse HEAD").stdout.strip()
+
     def get_diff(self) -> str:
-        """Return a git patch of changes since the last commit (the session baseline)."""
+        """Return a git diff of the uncommitted working-tree changes (vs HEAD)."""
         self.run("git add -A")
         return self.run("git diff --cached").stdout
 
     def commit(self, message: str) -> bool:
-        """Commit all current changes inside the container, advancing the baseline
-        for the next get_diff(). Returns False if there was nothing to commit.
-
-        Used by --ralph to chain sessions as a series of commits.
+        """Commit all current changes inside the container on top of real HEAD.
+        Returns False if there was nothing to commit. Skips hooks (--no-verify),
+        since host hooks may assume tools that aren't in the sandbox.
         """
         self.run("git add -A")
         if self.run("git diff --cached --quiet").exit_code == 0:
             return False
         # Pass the message on stdin via a quoted heredoc so its content is taken
         # literally (no shell expansion). `command` reaches bash -c verbatim.
-        script = f"git commit -F - <<'GERBIL_MSG'\n{message}\nGERBIL_MSG\n"
+        script = f"git commit --no-verify -F - <<'GERBIL_MSG'\n{message}\nGERBIL_MSG\n"
         result = self.run(script)
         if result.exit_code != 0:
             raise RuntimeError(f"git commit failed:\n{result.stderr}")
         return True
+
+    def format_patch(self, base: str) -> str:
+        """Return an mbox patch (title + message + diff) for every commit in
+        base..HEAD, as produced by `git format-patch`. Apply on the host with
+        `git am`."""
+        return self.run(f"git format-patch {base}..HEAD --stdout", timeout=60.0).stdout
+
+    def amend_with_file(self, repo_path: str, content: str) -> None:
+        """Fold an extra file into the HEAD commit: write it into the repo, stage
+        it (force, in case its directory is gitignored), and `commit --amend`
+        without changing the message. Used by --include-session to embed the
+        session log in the commit before format_patch()."""
+        self.write_file(repo_path, content)
+        self.run(f"git add -f {_quote(repo_path)}")
+        result = self.run("git commit --amend --no-edit --no-verify")
+        if result.exit_code != 0:
+            raise RuntimeError(f"git commit --amend failed:\n{result.stderr}")
 
 
 def _own_by_sandbox(info: tarfile.TarInfo) -> tarfile.TarInfo:

@@ -29,20 +29,27 @@ Use `--prompt FILE` to pass an initial prompt.
 # run a session
 $ uv run gerbil --at /path/to/lake/project --prompt prompt.md
 
-# this produces three timestamped files in the project's .gerbil/ directory:
-# jsonl session data, and a git patch/commit
+# this produces two timestamped files in the project's .gerbil/ directory:
+# the jsonl session log, and a git format-patch of the session's commit
 $ ls /path/to/lake/project/.gerbil/
 gerbil-260621-190350.jsonl
 gerbil-260621-190350.patch
-gerbil-260621-190350.commit
 ```
 
-You can then apply and commit if desired
+The agent works on the real repository (with full history) inside the container,
+and its changes are committed there. The `.patch` is a `git format-patch` —
+title, message, and diff in one file — so you apply it with `git am`:
 ```bash
 $ cd /path/to/lake/project
-$ git apply .gerbil/gerbil-260621-190350.patch
-$ git commit -F .gerbil/gerbil-260621-190350.commit
+$ git am .gerbil/gerbil-260621-190350.patch
 ```
+
+Pass `--include-session` to fold the `.jsonl` session log into the commit itself
+(so applying the patch also records how the change was produced). In that case
+the loose `.jsonl` is dropped, since it lives in the patch.
+
+Every session log and patch is also archived to `~/.gerbil/` (same filenames),
+so you keep a full record no matter what you do with the project-level files.
 
 ### Ralph loops
 
@@ -58,11 +65,10 @@ $ uv run gerbil --at /path/to/lake/project --prompt prompt.md --ralph 5
 - After each session gerbil commits the changes *inside* the container, so the
   next session starts from the previous one's result.
 - Each session writes its own numbered output set,
-  `.gerbil/gerbil-<ts>-NN.{jsonl,patch,commit}`.
+  `.gerbil/gerbil-<ts>-NN.{jsonl,patch}`.
 
-Apply the whole series into your repo in order with the helper script — it
-applies each patch, includes that session's `.jsonl` log in the commit, and
-cleans up the `.patch`/`.commit` files:
+Apply the whole series into your repo in order with the helper script, which
+`git am`s each format-patch as a real commit:
 ```bash
 $ cd /path/to/lake/project && /path/to/gerbil/scripts/apply-gerbil.sh
 ```
