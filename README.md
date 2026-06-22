@@ -43,6 +43,11 @@ $ cd my/lake/project
 $ gerbil run --prompt prompt.md
 ```
 
+gerbil runs on top of a **clean commit**: the working tree must have no
+uncommitted changes to tracked files (`git stash` them first if needed).
+Untracked files (like your `prompt.md`) are left alone — they aren't uploaded
+into the sandbox.
+
 The agent works on the real repository (with full history) inside the container,
 and its changes are committed there. The live session log is written to
 `~/.gerbil/sessions/` (the true session file); the project's `.gerbil/` only

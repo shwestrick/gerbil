@@ -102,6 +102,24 @@ def _require_lake_project(project_dir: Path) -> None:
         )
 
 
+def _require_clean_worktree(project_dir: Path) -> None:
+    """Exit unless the working tree is clean. gerbil runs on top of a clean
+    commit -- it uploads only tracked files (== HEAD) and commits the agent's
+    changes on top. Uncommitted changes to tracked files would otherwise be
+    swept into the agent's commit. Untracked files are ignored (not uploaded)."""
+    dirty = subprocess.run(
+        ["git", "-C", str(project_dir), "status", "--porcelain", "--untracked-files=no"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if dirty:
+        sys.exit(
+            f"error: {project_dir} has uncommitted changes.\n"
+            "gerbil runs on top of a clean commit. Commit or stash them first:\n"
+            "  git stash       # then re-run gerbil, and `git stash pop` after"
+        )
+
+
 _DOCKER_PERMISSION_HELP = """\
 error: cannot connect to Docker -- permission denied.
 
@@ -248,6 +266,7 @@ def cmd_run(args) -> None:
         sys.exit(f"error: {project_dir} is not a directory")
     _require_git_repo(project_dir)
     _require_lake_project(project_dir)
+    _require_clean_worktree(project_dir)
     _require_docker()
     if not prompt_file.is_file():
         sys.exit(f"error: {prompt_file} is not a file")

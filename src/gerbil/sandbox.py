@@ -100,18 +100,17 @@ class LeanSandbox:
 
     def _upload_project(self) -> None:
         """Upload the real repository into the container: the .git directory (full
-        history, so the agent can refer to past commits) plus every non-ignored
-        working file (tracked + untracked-not-ignored). Ignored paths like .lake/
-        are skipped via git's own enumeration."""
-        rels: list[str] = []
-        for args in (
+        history, so the agent can refer to past commits) plus the tracked files.
+        The working tree is required to be clean (see the CLI preflight), so the
+        tracked files match HEAD and no untracked files are uploaded -- the agent
+        commits on top of a clean, known baseline."""
+        out = subprocess.run(
             ["git", "ls-files", "-z"],
-            ["git", "ls-files", "-z", "--others", "--exclude-standard"],
-        ):
-            out = subprocess.run(
-                args, cwd=self.project_dir, capture_output=True, check=True
-            ).stdout
-            rels += [p for p in out.decode().split("\0") if p]
+            cwd=self.project_dir,
+            capture_output=True,
+            check=True,
+        ).stdout
+        rels = [p for p in out.decode().split("\0") if p]
 
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
