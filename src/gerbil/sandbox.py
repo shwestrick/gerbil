@@ -187,9 +187,26 @@ class LeanSandbox:
     # ------------------------------------------------------------------
 
     def get_diff(self) -> str:
-        """Return a git patch of all changes made during this session."""
+        """Return a git patch of changes since the last commit (the session baseline)."""
         self.run("git add -A")
         return self.run("git diff --cached").stdout
+
+    def commit(self, message: str) -> bool:
+        """Commit all current changes inside the container, advancing the baseline
+        for the next get_diff(). Returns False if there was nothing to commit.
+
+        Used by --ralph to chain sessions as a series of commits.
+        """
+        self.run("git add -A")
+        if self.run("git diff --cached --quiet").exit_code == 0:
+            return False
+        # Pass the message on stdin via a quoted heredoc so its content is taken
+        # literally (no shell expansion). `command` reaches bash -c verbatim.
+        script = f"git commit -F - <<'GERBIL_MSG'\n{message}\nGERBIL_MSG\n"
+        result = self.run(script)
+        if result.exit_code != 0:
+            raise RuntimeError(f"git commit failed:\n{result.stderr}")
+        return True
 
 
 def _own_by_sandbox(info: tarfile.TarInfo) -> tarfile.TarInfo:

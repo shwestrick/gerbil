@@ -28,9 +28,9 @@ Use `--prompt FILE` to pass an initial prompt.
 # run a session
 $ uv run gerbil --at /path/to/lake/project --prompt prompt.md
 
-# this produces three timestamped files in the project directory:
+# this produces three timestamped files in the project's .gerbil/ directory:
 # jsonl session data, and a git patch/commit
-$ ls /path/to/lake/project/gerbil-*
+$ ls /path/to/lake/project/.gerbil/
 gerbil-260621-190350.jsonl
 gerbil-260621-190350.patch
 gerbil-260621-190350.commit
@@ -39,8 +39,16 @@ gerbil-260621-190350.commit
 You can then apply and commit if desired
 ```bash
 $ cd /path/to/lake/project
-$ git apply gerbil-260621-190350.patch
-$ git commit -F gerbil-260621-190350.commit
+$ git apply .gerbil/gerbil-260621-190350.patch
+$ git commit -F .gerbil/gerbil-260621-190350.commit
+```
+
+To run many sessions back-to-back on the same prompt (each building on the last
+as a series of commits), use `--ralph N`. Outputs are numbered per session, and
+`scripts/apply-gerbil.sh` will apply + commit them in order:
+```bash
+$ uv run gerbil --at /path/to/lake/project --prompt prompt.md --ralph 5
+$ cd /path/to/lake/project && /path/to/gerbil/scripts/apply-gerbil.sh
 ```
 
 ### Lean LSP tools (MCP)
