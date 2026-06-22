@@ -64,10 +64,39 @@ bootstrap_if_needed() {
 current_dir() { echo "$VERSIONS_DIR/$(cat "$CURRENT_FILE")"; }
 sandbox_image() { echo "lean-sandbox:$(cat "$CURRENT_FILE")"; }
 
+# Verify Docker is installed and the daemon is reachable without sudo, with
+# actionable guidance. gerbil's Python side uses the Docker SDK (direct socket),
+# which cannot use sudo, so Docker must be usable unprivileged.
+check_docker() {
+    command -v docker >/dev/null || die "docker is required (https://docs.docker.com/get-docker/)"
+    local err
+    err="$(docker ps 2>&1 >/dev/null)" && return 0
+    case "$err" in
+        *"permission denied"*)
+            die "cannot connect to Docker -- permission denied.
+
+Docker must be usable without sudo (gerbil talks to the daemon via the Docker
+SDK, which cannot use sudo). To fix:
+  - add yourself to the docker group:  sudo usermod -aG docker \$USER
+    then log out and back in (or run: newgrp docker), and verify with:
+    docker run hello-world
+  - or set up rootless Docker: https://docs.docker.com/engine/security/rootless/"
+            ;;
+        *"Cannot connect to the Docker daemon"*|*"daemon running"*)
+            die "cannot connect to the Docker daemon -- is it running?
+Start it (e.g. \`sudo systemctl start docker\`) or open Docker Desktop, then retry."
+            ;;
+        *)
+            die "Docker is not usable:
+$err"
+            ;;
+    esac
+}
+
 # Build the version-matched sandbox image if it isn't already present. The image
 # is tagged with the version's commit; its reference is recorded in versions/.
 ensure_image() {
-    command -v docker >/dev/null || die "docker is required"
+    check_docker
     local tag vdir
     tag="$(sandbox_image)"
     vdir="$(current_dir)"

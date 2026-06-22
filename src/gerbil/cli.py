@@ -88,6 +88,40 @@ def _require_lake_project(project_dir: Path) -> None:
         )
 
 
+_DOCKER_PERMISSION_HELP = """\
+error: cannot connect to Docker -- permission denied.
+
+Docker must be usable without sudo (gerbil talks to the daemon via the Docker
+SDK, which cannot use sudo). To fix:
+  - add yourself to the docker group:  sudo usermod -aG docker $USER
+    then log out and back in (or run: newgrp docker), and verify with:
+    docker run hello-world
+  - or set up rootless Docker: https://docs.docker.com/engine/security/rootless/"""
+
+_DOCKER_DAEMON_HELP = """\
+error: cannot connect to the Docker daemon -- is it running?
+Start it (e.g. `sudo systemctl start docker`) or open Docker Desktop, then \
+retry."""
+
+
+def _require_docker() -> None:
+    """Exit with actionable guidance unless the Docker daemon is reachable."""
+    import docker
+
+    try:
+        docker.from_env().ping()
+        return
+    except Exception as exc:
+        detail = str(exc)
+        msg = detail.lower()
+
+    if "permission denied" in msg:
+        sys.exit(_DOCKER_PERMISSION_HELP)
+    if "connect" in msg or "daemon" in msg:
+        sys.exit(_DOCKER_DAEMON_HELP)
+    sys.exit(f"error: Docker is not usable: {detail}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="gerbil",
@@ -200,6 +234,7 @@ def cmd_run(args) -> None:
         sys.exit(f"error: {project_dir} is not a directory")
     _require_git_repo(project_dir)
     _require_lake_project(project_dir)
+    _require_docker()
     if not prompt_file.is_file():
         sys.exit(f"error: {prompt_file} is not a file")
 

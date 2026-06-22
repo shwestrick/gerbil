@@ -23,6 +23,11 @@ The sandbox Docker image is built automatically on the first `gerbil run` (and
 rebuilt by `gerbil update`), tagged to match the gerbil version — no manual
 `docker build` needed.
 
+Docker must be usable **without sudo** (gerbil talks to the daemon via the
+Docker SDK). On Linux, add yourself to the `docker` group
+(`sudo usermod -aG docker $USER`, then re-login) or use
+[rootless Docker](https://docs.docker.com/engine/security/rootless/).
+
 Managing the launcher itself:
 ```bash
 $ gerbil --version    # current version (commit hash)
