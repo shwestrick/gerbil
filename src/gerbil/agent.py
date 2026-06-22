@@ -74,9 +74,24 @@ server sees your changes.
 """
 
 
-def build_system_prompt(has_lsp_tools: bool) -> str:
-    """The system prompt, with the LSP-tools note appended when MCP is active."""
-    return SYSTEM_PROMPT + LSP_TOOLS_NOTE if has_lsp_tools else SYSTEM_PROMPT
+# Appended to the system prompt in --ralph mode.
+RALPH_NOTE = """\
+
+You are running in a repeating loop: after this session ends, the same task \
+prompt runs again in a fresh session that builds on the changes you commit now. \
+If you determine the overall task is fully and finally complete, call the \
+ralph_done tool to stop the loop early.
+"""
+
+
+def build_system_prompt(has_lsp_tools: bool, ralph: bool = False) -> str:
+    """The system prompt, with notes appended for active features."""
+    prompt = SYSTEM_PROMPT
+    if has_lsp_tools:
+        prompt += LSP_TOOLS_NOTE
+    if ralph:
+        prompt += RALPH_NOTE
+    return prompt
 
 
 @dataclass
@@ -168,7 +183,7 @@ def run_session(
     messages = [{"role": "user", "content": prompt}]
     session.record_turn("user", prompt)
 
-    system = build_system_prompt(bool(toolset.mcp_tool_names()))
+    system = build_system_prompt(bool(toolset.mcp_tool_names()), ralph=toolset.ralph)
     tools = toolset.schemas()
 
     total = Usage()

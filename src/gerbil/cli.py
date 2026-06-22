@@ -124,7 +124,7 @@ def main() -> None:
                 mcp, mcp_warning = (
                     _start_mcp(sandbox, stack) if args.mcp else (None, None)
                 )
-                toolset = Toolset(sandbox, mcp)
+                toolset = Toolset(sandbox, mcp, ralph=bool(args.ralph))
 
                 for i in range(1, iterations + 1):
                     if args.ralph:
@@ -173,6 +173,15 @@ def main() -> None:
                             sandbox.commit(full)
                     else:
                         print(f"{style('commit:', 'bold')}  (no changes; skipped)")
+
+                    # The model can call ralph_done to end the loop early.
+                    if toolset.ralph_done:
+                        reason = toolset.ralph_done_reason or "task complete"
+                        print(
+                            "\n" + style(f"[ralph_done: {reason}]", "bold", "magenta"),
+                            flush=True,
+                        )
+                        break
     except Exception as exc:
         # Catch-all: record the failure as the in-flight session's terminal event
         # (if one is open), point the user at it, and exit non-zero.

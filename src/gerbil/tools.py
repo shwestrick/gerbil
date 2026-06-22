@@ -127,17 +127,49 @@ def dispatch(sandbox: LeanSandbox, name: str, args: dict) -> ToolResult:
         return ToolResult(f"{type(e).__name__}: {e}", is_error=True)
 
 
+# A control tool, available only in --ralph mode, that the model calls to stop
+# the repeating session loop early once the overall task is finished.
+RALPH_DONE_TOOL = {
+    "name": "ralph_done",
+    "description": (
+        "Signal that the overall task is fully and finally complete, so the "
+        "repeating session loop (ralph) stops early instead of running more "
+        "sessions. Only call this when you are certain no further work is needed."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "description": "Brief explanation of why the task is complete.",
+            },
+        },
+        "required": [],
+    },
+}
+
+
 class Toolset:
     """Unified tool registry passed to the agent loop.
 
     Combines gerbil's sandbox-bound built-in tools with optional MCP-server tools
-    (lean-lsp). Exposes a flat schema list for the provider and a single dispatch
-    entry point that routes by name. dispatch() never raises.
+    (lean-lsp), plus the ralph_done control tool in --ralph mode. Exposes a flat
+    schema list for the provider and a single dispatch entry point that routes by
+    name. dispatch() never raises.
     """
 
-    def __init__(self, sandbox: LeanSandbox, mcp: "McpClient | None" = None):
+    def __init__(
+        self,
+        sandbox: LeanSandbox,
+        mcp: "McpClient | None" = None,
+        ralph: bool = False,
+    ):
         self._sandbox = sandbox
         self._mcp = mcp
+        self.ralph = ralph
+        # Set when the model calls ralph_done; read by the cli loop to stop early.
+        self.ralph_done = False
+        self.ralph_done_reason = ""
         self._mcp_schemas: list[dict] = []
         self._mcp_names: set[str] = set()
         if mcp is not None:
@@ -149,14 +181,21 @@ class Toolset:
             self._mcp_names = {t["name"] for t in self._mcp_schemas}
 
     def schemas(self) -> list[dict]:
-        """Built-in schemas first, then MCP schemas. Flat gerbil-format list."""
-        return TOOLS + self._mcp_schemas
+        """Built-in schemas, then MCP schemas, then ralph_done (in ralph mode)."""
+        extra = [RALPH_DONE_TOOL] if self.ralph else []
+        return TOOLS + self._mcp_schemas + extra
 
     def mcp_tool_names(self) -> set[str]:
         return set(self._mcp_names)
 
     def dispatch(self, name: str, args: dict) -> ToolResult:
-        """Route to the built-in or MCP handler by name. Never raises."""
+        """Route to the built-in, MCP, or ralph_done handler. Never raises."""
+        if name == "ralph_done":
+            self.ralph_done = True
+            self.ralph_done_reason = args.get("reason", "")
+            return ToolResult(
+                "Acknowledged. The ralph loop will stop after this session."
+            )
         if name in self._mcp_names:
             try:
                 return self._mcp.call_tool(name, args)
