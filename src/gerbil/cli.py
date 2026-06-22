@@ -53,6 +53,41 @@ def _resolve_at(at: str | None) -> Path:
     return Path(base).resolve()
 
 
+def _require_git_repo(project_dir: Path) -> None:
+    """Exit with a clear message unless project_dir is the root of a git repo.
+    gerbil works on the real repository (uploads .git, commits, format-patch),
+    so the Lake project must be a git repo, and we operate from its root."""
+    result = subprocess.run(
+        ["git", "-C", str(project_dir), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        sys.exit(
+            f"error: {project_dir} is not a git repository.\n"
+            "gerbil needs the Lake project to be a git repo -- run `git init` "
+            "(and make a commit) there first."
+        )
+    toplevel = Path(result.stdout.strip()).resolve()
+    if toplevel != project_dir:
+        sys.exit(
+            f"error: {project_dir} is inside a git repo but not its root.\n"
+            f"Run gerbil from the project root instead: {toplevel}"
+        )
+
+
+def _require_lake_project(project_dir: Path) -> None:
+    """Exit unless project_dir is a Lake project root (has a lakefile)."""
+    if not (
+        (project_dir / "lakefile.toml").is_file()
+        or (project_dir / "lakefile.lean").is_file()
+    ):
+        sys.exit(
+            f"error: {project_dir} is not a Lake project "
+            "(no lakefile.toml or lakefile.lean found)."
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="gerbil",
@@ -135,6 +170,8 @@ def cmd_apply(args) -> None:
     project_dir = _resolve_at(args.at)
     if not project_dir.is_dir():
         sys.exit(f"error: {project_dir} is not a directory")
+    _require_git_repo(project_dir)
+    _require_lake_project(project_dir)
 
     out_dir = project_dir / ".gerbil"
     patches = sorted(out_dir.glob("gerbil-*.patch"))
@@ -161,6 +198,8 @@ def cmd_run(args) -> None:
 
     if not project_dir.is_dir():
         sys.exit(f"error: {project_dir} is not a directory")
+    _require_git_repo(project_dir)
+    _require_lake_project(project_dir)
     if not prompt_file.is_file():
         sys.exit(f"error: {prompt_file} is not a file")
 
