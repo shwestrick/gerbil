@@ -17,6 +17,7 @@ from pathlib import Path
 from .agent import MODEL_PRICING, run_session
 from .sandbox import LeanSandbox
 from .session import Session
+from .term import style
 
 
 DEFAULT_MODEL = "gemini-3.1-pro-preview"
@@ -83,7 +84,6 @@ def main() -> None:
         prompt_file=prompt_file,
     )
 
-    result = None
     try:
         with LeanSandbox(
             project_dir=project_dir, fetch_cache=not args.skip_cache
@@ -91,24 +91,38 @@ def main() -> None:
             result = run_session(
                 sandbox, session, prompt, args.model, max_turns=args.max_turns
             )
-    finally:
-        session.close()
+    except Exception as exc:
+        # Catch-all: record the failure as the session's terminal event, point
+        # the user at the session file, and exit non-zero.
+        session.record_error(exc)
+        print(
+            f"\n{style('error:', 'bold', 'red')} "
+            f"session aborted by {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        print(
+            f"{style('session:', 'bold')} {session_path} "
+            "(error details recorded inside)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    session.close()
 
     diff = result.diff if result else ""
     diff_path.write_text(diff)
 
-    print(f"session: {session_path}")
-    print(f"diff:    {diff_path}")
+    print(f"{style('session:', 'bold')} {session_path}")
+    print(f"{style('diff:', 'bold')}    {diff_path}")
 
     # The commit message was produced as the session's final turn; append a
     # footer recording how this run of Gerbil was invoked.
     if result and result.commit_message:
         footer = _run_footer(args)
         commit_path.write_text(result.commit_message + "\n\n" + footer + "\n")
-        print(f"commit:  {commit_path}")
-        print(f"\n{result.commit_message.splitlines()[0]}")
+        print(f"{style('commit:', 'bold')}  {commit_path}")
     else:
-        print("commit:  (no changes; skipped)")
+        print(f"{style('commit:', 'bold')}  (no changes; skipped)")
 
 
 def _run_footer(args) -> str:

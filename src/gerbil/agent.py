@@ -13,6 +13,10 @@ from dataclasses import dataclass
 from .providers import Done, TextDelta, ToolCall, Usage, _ToolMeta, stream
 from .sandbox import LeanSandbox
 from .session import Session
+from .term import style
+
+# Single accent color for every tool invocation.
+TOOL_COLOR = "cyan"
 from .tools import TOOLS, dispatch
 
 # Known models and per-million-token pricing (input, output). Best-effort
@@ -93,7 +97,11 @@ def _run_turn(model, system, messages, tools, provider):
             if current_text:
                 assistant_parts.append({"type": "text", "text": current_text})
                 current_text = ""
-            print(f"\n  -> {event.name}({event.args})", flush=True)
+            print(
+                f"\n  {style('->', TOOL_COLOR)} "
+                f"{style(event.name, 'bold', TOOL_COLOR)}({event.args})",
+                flush=True,
+            )
             tool_calls.append({
                 "name": event.name,
                 "args": event.args,
@@ -149,7 +157,7 @@ def run_session(
             break
         turn += 1
 
-        print(f"\n--- turn {turn} ---", flush=True)
+        print("\n" + style(f"--- turn {turn} ---", "bold", "dark_red"), flush=True)
 
         assistant_parts, tool_calls, final_text, usage = _run_turn(
             model, SYSTEM_PROMPT, messages, TOOLS, provider
@@ -175,7 +183,13 @@ def run_session(
             session.record_tool_result(tc["name"], result.content)
 
             preview = result.content[:200] + "..." if len(result.content) > 200 else result.content
-            print(f"  <- {preview}", flush=True)
+            result_color = "red" if result.is_error else "gray"
+            # Align continuation lines under the content (after "  <- ").
+            indented = preview.rstrip("\n").replace("\n", "\n     ")
+            print(
+                f"  {style('<-', result_color)} {style(indented, result_color)}",
+                flush=True,
+            )
 
             tr = {
                 "type": "tool_result",
@@ -191,7 +205,10 @@ def run_session(
         messages.append({"role": "user", "content": tool_results})
 
     if stopped_at_max:
-        print(f"\n[stopped: reached max_turns={max_turns}]", flush=True)
+        print(
+            "\n" + style(f"[stopped: reached max_turns={max_turns}]", "bold", "yellow"),
+            flush=True,
+        )
 
     # Final turn: ask for a commit message as a true continuation of the
     # conversation. Skipped if nothing changed, or if we bailed on max_turns
@@ -200,7 +217,10 @@ def run_session(
     commit_message = ""
     if diff.strip() and not stopped_at_max:
         turn += 1
-        print(f"\n--- turn {turn} (commit message) ---", flush=True)
+        print(
+            "\n" + style(f"--- turn {turn} (commit message) ---", "bold", "dark_red"),
+            flush=True,
+        )
 
         request = _commit_request(diff)
         messages.append({"role": "user", "content": request})
@@ -230,9 +250,9 @@ def _print_usage(model: str, turns: int, usage: Usage) -> None:
     price_in, price_out = MODEL_PRICING.get(model, DEFAULT_PRICING)
     cost = (usage.input_tokens * price_in + usage.output_tokens * price_out) / 1_000_000
     total = usage.input_tokens + usage.output_tokens
-    print(
-        f"\n--- {turns} turns, {total:,} tokens "
+    line = (
+        f"--- {turns} turns, {total:,} tokens "
         f"(in: {usage.input_tokens:,}, out: {usage.output_tokens:,}), "
-        f"~${cost:.4f} ---",
-        flush=True,
+        f"~${cost:.4f} ---"
     )
+    print("\n" + style(line, "bold"), flush=True)

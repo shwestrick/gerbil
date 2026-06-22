@@ -150,7 +150,11 @@ def _stream_gemini(model, system, messages, tools):
             usage.output_tokens = chunk.usage_metadata.candidates_token_count or 0
         if not chunk.candidates:
             continue
-        for part in chunk.candidates[0].content.parts:
+        # A final chunk may carry only a finish reason / usage, with no content.
+        content = chunk.candidates[0].content
+        if content is None or content.parts is None:
+            continue
+        for part in content.parts:
             if part.text:
                 yield TextDelta(part.text)
             elif part.function_call:

@@ -9,9 +9,11 @@ Event types:
   tool_call       — one per tool invocation sent to the sandbox
   tool_result     — one per sandbox response
   session_end     — written once at the bottom with totals
+  error           — terminal event if the session aborts with an exception
 """
 
 import json
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -75,6 +77,23 @@ class Session:
         self._append({
             "event": "session_end",
             "timestamp": _now(),
+            "total_usage": {
+                "input_tokens": self._total_input_tokens,
+                "output_tokens": self._total_output_tokens,
+            },
+        })
+
+    def record_error(self, exc: BaseException) -> None:
+        """Terminal event when the session aborts. Records the error details and
+        the usage accumulated so far; written instead of session_end."""
+        self._append({
+            "event": "error",
+            "timestamp": _now(),
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            ),
             "total_usage": {
                 "input_tokens": self._total_input_tokens,
                 "output_tokens": self._total_output_tokens,

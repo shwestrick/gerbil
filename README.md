@@ -9,7 +9,7 @@ Docker-based sandboxing and a built-in git-based workflow.
 Gerbil sessions are self-contained and sandboxed: each session is run
 in a container and produces a git commit.
 
-### Setup (only have to do this once)
+### Setup
 ```bash
 $ ... # git clone this repo, cd gerbil
 
