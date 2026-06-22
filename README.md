@@ -11,39 +11,49 @@ Gerbil sessions are self-contained and sandboxed: each session is run
 in a container and produces a git commit.
 
 ### Setup
-```bash
-$ ... # git clone this repo, cd gerbil
 
-# build the lean-sandbox Docker image (only have to do this once)
-$ docker build -t lean-sandbox:latest src/lean-sandbox
+`gerbil` is a single self-contained launcher script. Put it on your `PATH`; it
+fetches its own source from GitHub on first use (requires `git`, `docker`, and
+[`uv`](https://astral.sh/uv)):
+```bash
+$ curl -fsSL https://raw.githubusercontent.com/shwestrick/gerbil/main/bin/gerbil \
+      -o ~/.local/bin/gerbil && chmod +x ~/.local/bin/gerbil
+```
+The sandbox Docker image is built automatically on the first `gerbil run` (and
+rebuilt by `gerbil update`), tagged to match the gerbil version — no manual
+`docker build` needed.
+
+Managing the launcher itself:
+```bash
+$ gerbil --version    # current version (commit hash)
+$ gerbil update       # update to the latest commit on main (+ rebuild the image)
 ```
 
 ### Run a session
-Use `--at PATH` to specify where the Lake project is. This path
-needs to be inside of a git repo, and should be the root of the Lake
-project.
 
-Use `--prompt FILE` to pass an initial prompt.
-
+Run from inside your Lake project (a git repo); `--at` defaults to the current
+directory. Use `--prompt FILE` for the task.
 ```bash
-# run a session
-$ uv run gerbil --at /path/to/lake/project --prompt prompt.md
-
-# the live session log is written to ~/.gerbil/ (the true session file);
-# the project's .gerbil/ only gets the patch
-$ ls ~/.gerbil/                          # session log (+ a copy of the patch)
-gerbil-260621-190350.jsonl
-gerbil-260621-190350.patch
-$ ls /path/to/lake/project/.gerbil/      # patch only
-gerbil-260621-190350.patch
+$ cd my/lake/project
+$ gerbil run --prompt prompt.md
 ```
 
 The agent works on the real repository (with full history) inside the container,
-and its changes are committed there. The `.patch` is a `git format-patch` —
-title, message, and diff in one file — so you apply it with `git am`:
+and its changes are committed there. The live session log is written to
+`~/.gerbil/` (the true session file); the project's `.gerbil/` only receives the
+patch — a `git format-patch` (title, message, diff in one file):
 ```bash
-$ cd /path/to/lake/project
-$ git am .gerbil/gerbil-260621-190350.patch
+$ ls ~/.gerbil/                  # session log + a copy of every patch
+gerbil-260621-190350.jsonl
+gerbil-260621-190350.patch
+$ ls .gerbil/                    # patch only
+gerbil-260621-190350.patch
+```
+
+Apply the patch(es) into your repo as real commits with `gerbil apply` (it
+`git am`s every `.gerbil/*.patch` in order):
+```bash
+$ gerbil apply
 ```
 
 The session log stays out of your project by default. Pass `--include-session`
@@ -60,7 +70,9 @@ project-level files.
 the last as a series of commits.
 
 ```bash
-$ uv run gerbil --at /path/to/lake/project --prompt prompt.md --ralph 5
+$ cd my/lake/project
+$ gerbil run --ralph 5 --prompt prompt.md
+$ gerbil apply        # applies the whole numbered series in order
 ```
 
 - The sandbox (and the lean-lsp MCP server) is reused across
@@ -68,13 +80,7 @@ $ uv run gerbil --at /path/to/lake/project --prompt prompt.md --ralph 5
 - After each session gerbil commits the changes *inside* the container, so the
   next session starts from the previous one's result.
 - Each session writes its own numbered output set,
-  `.gerbil/gerbil-<ts>-NN.{jsonl,patch}`.
-
-Apply the whole series into your repo in order with the helper script, which
-`git am`s each format-patch as a real commit:
-```bash
-$ cd /path/to/lake/project && /path/to/gerbil/scripts/apply-gerbil.sh
-```
+  `.gerbil/gerbil-<ts>-NN.patch` (plus the log in `~/.gerbil/`).
 
 **Stopping early.** In ralph mode the agent has a `ralph_done` tool; when it
 calls it, the loop stops after that session instead of running the rest. The

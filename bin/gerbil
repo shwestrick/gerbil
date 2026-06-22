@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# gerbil -- installable launcher for the sandboxed Lean theorem-proving agent.
+#
+# Install: copy this single file onto your PATH (it is self-contained; the
+# gerbil source is fetched on first use). For example:
+#   curl -fsSL https://raw.githubusercontent.com/shwestrick/gerbil/main/bin/gerbil \
+#       -o ~/.local/bin/gerbil && chmod +x ~/.local/bin/gerbil
+#
+# Commands:
+#   gerbil run [--prompt FILE] [--at DIR] [--ralph N] ...   run a session
+#   gerbil apply [--at DIR]                                 git am the patches
+#   gerbil update                                           update to latest main
+#   gerbil --version                                        show current version
+#
+# The source is kept under ~/.gerbil/versions/<commit>/ and run with `uv`.
+# Requires: git, uv.
+set -euo pipefail
+
+GERBIL_HOME="${GERBIL_HOME:-$HOME/.gerbil}"
+REPO_URL="${GERBIL_REPO_URL:-https://github.com/shwestrick/gerbil}"
+REPO_DIR="$GERBIL_HOME/repo"            # cache clone, used for fetching
+VERSIONS_DIR="$GERBIL_HOME/versions"    # versions/<commit>/ source checkouts
+CURRENT_FILE="$GERBIL_HOME/current"     # holds the active commit hash
+
+die() { echo "gerbil: $*" >&2; exit 1; }
+
+ensure_repo() {
+    command -v git >/dev/null || die "git is required"
+    command -v uv  >/dev/null || die "uv is required (https://astral.sh/uv)"
+    if [ ! -d "$REPO_DIR/.git" ]; then
+        mkdir -p "$GERBIL_HOME"
+        git clone -q "$REPO_URL" "$REPO_DIR"
+    fi
+}
+
+# Materialize versions/<hash> as an independent checkout of the cache clone.
+ensure_version() {
+    local hash="$1" vdir="$VERSIONS_DIR/$hash"
+    if [ ! -d "$vdir" ]; then
+        mkdir -p "$VERSIONS_DIR"
+        git clone -q "$REPO_DIR" "$vdir"
+        git -C "$vdir" checkout -q "$hash"
+    fi
+}
+
+# Fetch latest main, materialize it, and make it current. Echoes the hash.
+set_current_to_main() {
+    ensure_repo
+    git -C "$REPO_DIR" fetch -q origin main
+    local hash
+    hash="$(git -C "$REPO_DIR" rev-parse origin/main)"
+    ensure_version "$hash"
+    echo "$hash" > "$CURRENT_FILE"
+    echo "$hash"
+}
+
+bootstrap_if_needed() {
+    if [ ! -s "$CURRENT_FILE" ]; then
+        echo "gerbil: first run -- fetching source from $REPO_URL" >&2
+        set_current_to_main >/dev/null
+    fi
+}
+
+current_dir() { echo "$VERSIONS_DIR/$(cat "$CURRENT_FILE")"; }
+sandbox_image() { echo "lean-sandbox:$(cat "$CURRENT_FILE")"; }
+
+# Build the version-matched sandbox image if it isn't already present. The image
+# is tagged with the version's commit; its reference is recorded in versions/.
+ensure_image() {
+    command -v docker >/dev/null || die "docker is required"
+    local tag vdir
+    tag="$(sandbox_image)"
+    vdir="$(current_dir)"
+    if ! docker image inspect "$tag" >/dev/null 2>&1; then
+        echo "gerbil: building sandbox image $tag (first time for this version)..." >&2
+        docker build -t "$tag" "$vdir/src/lean-sandbox" >&2
+        echo "$tag" > "$vdir/sandbox-image"
+    fi
+}
+
+usage() {
+    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+cmd="${1:-}"
+case "$cmd" in
+    update)
+        new="$(set_current_to_main)"
+        ensure_image
+        echo "gerbil: now at $new"
+        ;;
+    --version|-V|version)
+        bootstrap_if_needed
+        echo "gerbil $(cat "$CURRENT_FILE")"
+        ;;
+    run)
+        bootstrap_if_needed
+        ensure_image
+        shift
+        # Run from the versioned source via uv, but keep the user's cwd (the Lake
+        # project) so --at defaults to it. GERBIL_CWD carries it explicitly, and
+        # GERBIL_SANDBOX_IMAGE selects the version-matched image.
+        exec env GERBIL_CWD="$PWD" GERBIL_SANDBOX_IMAGE="$(sandbox_image)" \
+            uv run --project "$(current_dir)" python -m gerbil run "$@"
+        ;;
+    apply)
+        bootstrap_if_needed
+        shift
+        # apply is host-side (git am); no container/image needed.
+        exec env GERBIL_CWD="$PWD" uv run --project "$(current_dir)" \
+            python -m gerbil apply "$@"
+        ;;
+    ""|-h|--help|help)
+        usage
+        ;;
+    *)
+        die "unknown command '$cmd' (try: run, apply, update, --version)"
+        ;;
+esac
