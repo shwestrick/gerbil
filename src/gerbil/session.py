@@ -25,17 +25,26 @@ def _now() -> str:
 
 
 class Session:
-    def __init__(self, path: Path, model: str, project_dir: Path, prompt_file: Path):
+    def __init__(
+        self,
+        path: Path,
+        model: str,
+        project_dir: Path,
+        prompt_file: Path,
+        version: str = "unknown",
+    ):
         self.path = path
         self.model = model
         self.project_dir = project_dir
         self.prompt_file = prompt_file
+        self.version = version
         self._total_input_tokens = 0
         self._total_output_tokens = 0
 
         self._append({
             "event": "session_start",
             "timestamp": _now(),
+            "gerbil_version": version,
             "model": model,
             "project_dir": str(project_dir),
             "prompt_file": str(prompt_file),

@@ -14,13 +14,13 @@ git format-patch -- a single .patch file holding the commit title, message, and
 diff, applied on the host with `gerbil apply` (git am).
 
 Outputs:
-    ~/.gerbil/gerbil-TIMESTAMP.jsonl     the live session log (the true session
-                                         file, written as the run proceeds)
+    ~/.gerbil/sessions/gerbil-TIMESTAMP.jsonl  the live session log (the true
+                                         session file, written as the run proceeds)
     <project>/.gerbil/gerbil-TIMESTAMP.patch   git format-patch of the session's
                                          commit(s); apply with `git am`
-The patch is also copied to ~/.gerbil/, so the archive holds all gerbil data.
-The session log only reaches the --at project if --include-session is passed
-(it is folded into the commit, and thus the patch).
+The patch is also copied to ~/.gerbil/sessions/, so the archive holds all gerbil
+data. The session log only reaches the --at project if --include-session is
+passed (it is folded into the commit, and thus the patch).
 
 With --ralph N, N sessions run back-to-back on the same prompt (reusing the
 sandbox); outputs are numbered gerbil-TIMESTAMP-NN and each session builds on
@@ -257,12 +257,15 @@ def cmd_run(args) -> None:
     iterations = args.ralph if args.ralph else 1
     width = max(2, len(str(iterations)))
 
-    # The session log lives in a user-level ~/.gerbil/ archive -- this is the
-    # true, incrementally-written session file. Patches are written into the
-    # project's .gerbil/ (for applying) and also copied to the archive.
-    archive_dir = Path.home() / ".gerbil"
+    # The session log lives in the user-level ~/.gerbil/sessions/ archive -- this
+    # is the true, incrementally-written session file. Patches are written into
+    # the project's .gerbil/ (for applying) and also copied to the archive.
+    archive_dir = Path.home() / ".gerbil" / "sessions"
     archive_dir.mkdir(parents=True, exist_ok=True)
     out_dir = project_dir / ".gerbil"  # created lazily, only when a patch is written
+
+    # The running gerbil version (commit hash), supplied by the launcher.
+    version = os.environ.get("GERBIL_VERSION", "unknown")
 
     def archive(path: Path) -> None:
         if path.exists():
@@ -309,6 +312,7 @@ def cmd_run(args) -> None:
                         model=args.model,
                         project_dir=project_dir,
                         prompt_file=prompt_file,
+                        version=version,
                     )
                     if mcp_warning:
                         session.record_warning(mcp_warning)

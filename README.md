@@ -45,10 +45,10 @@ $ gerbil run --prompt prompt.md
 
 The agent works on the real repository (with full history) inside the container,
 and its changes are committed there. The live session log is written to
-`~/.gerbil/` (the true session file); the project's `.gerbil/` only receives the
-patch — a `git format-patch` (title, message, diff in one file):
+`~/.gerbil/sessions/` (the true session file); the project's `.gerbil/` only
+receives the patch — a `git format-patch` (title, message, diff in one file):
 ```bash
-$ ls ~/.gerbil/                  # session log + a copy of every patch
+$ ls ~/.gerbil/sessions/         # session log + a copy of every patch
 gerbil-260621-190350.jsonl
 gerbil-260621-190350.patch
 $ ls .gerbil/                    # patch only
@@ -65,8 +65,8 @@ The session log stays out of your project by default. Pass `--include-session`
 to fold it into the commit itself (so applying the patch also records how the
 change was produced).
 
-`~/.gerbil/` is a user-level archive of all gerbil data — the live session logs
-plus a copy of every patch — kept regardless of what you do with the
+`~/.gerbil/sessions/` is a user-level archive of all gerbil data — the live
+session logs plus a copy of every patch — kept regardless of what you do with the
 project-level files.
 
 ### Ralph loops
@@ -85,7 +85,7 @@ $ gerbil apply        # applies the whole numbered series in order
 - After each session gerbil commits the changes *inside* the container, so the
   next session starts from the previous one's result.
 - Each session writes its own numbered output set,
-  `.gerbil/gerbil-<ts>-NN.patch` (plus the log in `~/.gerbil/`).
+  `.gerbil/gerbil-<ts>-NN.patch` (plus the log in `~/.gerbil/sessions/`).
 
 **Stopping early.** In ralph mode the agent has a `ralph_done` tool; when it
 calls it, the loop stops after that session instead of running the rest. The

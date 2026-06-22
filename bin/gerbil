@@ -127,9 +127,11 @@ case "$cmd" in
         ensure_image
         shift
         # Run from the versioned source via uv, but keep the user's cwd (the Lake
-        # project) so --at defaults to it. GERBIL_CWD carries it explicitly, and
-        # GERBIL_SANDBOX_IMAGE selects the version-matched image.
+        # project) so --at defaults to it. GERBIL_CWD carries it explicitly,
+        # GERBIL_SANDBOX_IMAGE selects the version-matched image, and
+        # GERBIL_VERSION records the running version in the session log.
         exec env GERBIL_CWD="$PWD" GERBIL_SANDBOX_IMAGE="$(sandbox_image)" \
+            GERBIL_VERSION="$(cat "$CURRENT_FILE")" \
             uv run --project "$(current_dir)" python -m gerbil run "$@"
         ;;
     apply)
