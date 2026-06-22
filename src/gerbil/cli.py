@@ -74,6 +74,20 @@ def _require_git_repo(project_dir: Path) -> None:
             f"error: {project_dir} is inside a git repo but not its root.\n"
             f"Run gerbil from the project root instead: {toplevel}"
         )
+    # Require at least one commit. A freshly `git init`'d repo (e.g. what
+    # `lake new` leaves behind) has no HEAD, so gerbil has no base to diff
+    # against and would silently produce an empty patch.
+    head = subprocess.run(
+        ["git", "-C", str(project_dir), "rev-parse", "--verify", "-q", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if head.returncode != 0:
+        sys.exit(
+            f"error: the git repo at {project_dir} has no commits yet.\n"
+            "gerbil works against a base commit -- make an initial commit first:\n"
+            "  git add -A && git commit -m 'initial commit'"
+        )
 
 
 def _require_lake_project(project_dir: Path) -> None:

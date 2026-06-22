@@ -194,8 +194,12 @@ class LeanSandbox:
     # ------------------------------------------------------------------
 
     def head(self) -> str:
-        """The current HEAD commit hash."""
-        return self.run("git rev-parse HEAD").stdout.strip()
+        """The current HEAD commit hash. Raises if the repo has no commits
+        (rev-parse otherwise echoes a bogus 'HEAD' on an unborn branch)."""
+        result = self.run("git rev-parse --verify HEAD")
+        if result.exit_code != 0:
+            raise RuntimeError("repository has no commits (no HEAD)")
+        return result.stdout.strip()
 
     def get_diff(self) -> str:
         """Return a git diff of the uncommitted working-tree changes (vs HEAD)."""
