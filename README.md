@@ -1,10 +1,11 @@
 # Gerbil
 
-:warning: work-in-progress :warning
+:warning: work-in-progress :warning:
 
 A teensy tiny agent for Lean projects, inspired by
 [lea-prover](https://github.com/chinmayhegde/lea-prover), but with
-Docker-based sandboxing and a built-in git-based workflow.
+Docker-based sandboxing, a git-based workflow, and built-in support for
+Ralph loops.
 
 Gerbil sessions are self-contained and sandboxed: each session is run
 in a container and produces a git commit.
@@ -43,13 +44,33 @@ $ git apply .gerbil/gerbil-260621-190350.patch
 $ git commit -F .gerbil/gerbil-260621-190350.commit
 ```
 
-To run many sessions back-to-back on the same prompt (each building on the last
-as a series of commits), use `--ralph N`. Outputs are numbered per session, and
-`scripts/apply-gerbil.sh` will apply + commit them in order:
+### Ralph loops
+
+`--ralph N` runs N sessions back-to-back on the *same* prompt, each building on
+the last as a series of commits.
+
 ```bash
 $ uv run gerbil --at /path/to/lake/project --prompt prompt.md --ralph 5
+```
+
+- The sandbox (and the lean-lsp MCP server) is reused across
+  all sessions, so the mathlib cache is fetched only once.
+- After each session gerbil commits the changes *inside* the container, so the
+  next session starts from the previous one's result.
+- Each session writes its own numbered output set,
+  `.gerbil/gerbil-<ts>-NN.{jsonl,patch,commit}`.
+
+Apply the whole series into your repo in order with the helper script — it
+applies each patch, includes that session's `.jsonl` log in the commit, and
+cleans up the `.patch`/`.commit` files:
+```bash
 $ cd /path/to/lake/project && /path/to/gerbil/scripts/apply-gerbil.sh
 ```
+
+**Stopping early.** In ralph mode the agent has a `ralph_done` tool; when it
+calls it, the loop stops after that session instead of running the rest. The
+tool just signals "done" — your prompt should explain *when* the task counts as
+complete (e.g. "once `lake build` succeeds with no `sorry`, call ralph_done").
 
 ### Lean LSP tools (MCP)
 
