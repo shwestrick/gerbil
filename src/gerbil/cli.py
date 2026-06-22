@@ -9,16 +9,18 @@ Each session's changes are committed there, and the result is emitted as a
 git format-patch -- a single .patch file holding the commit title, message, and
 diff, applied on the host with `git am`.
 
-Outputs (written into a .gerbil/ directory inside the --at project):
-    gerbil-TIMESTAMP.jsonl    session log (model, turns, token counts, tool calls)
-    gerbil-TIMESTAMP.patch    git format-patch of the session's commit(s)
+Outputs:
+    ~/.gerbil/gerbil-TIMESTAMP.jsonl     the live session log (the true session
+                                         file, written as the run proceeds)
+    <project>/.gerbil/gerbil-TIMESTAMP.patch   git format-patch of the session's
+                                         commit(s); apply with `git am`
+The patch is also copied to ~/.gerbil/, so the archive holds all gerbil data.
+The session log only reaches the --at project if --include-session is passed
+(it is folded into the commit, and thus the patch).
 
 With --ralph N, N sessions run back-to-back on the same prompt (reusing the
-sandbox); each set of outputs is numbered gerbil-TIMESTAMP-NN.{jsonl,patch} and
-each session builds on the previous one's commit.
-
-Every session log and patch is also archived to ~/.gerbil/ (same filenames),
-regardless of what happens to the project-level copies.
+sandbox); outputs are numbered gerbil-TIMESTAMP-NN and each session builds on
+the previous one's commit.
 """
 
 import argparse
@@ -115,24 +117,20 @@ def main() -> None:
     iterations = args.ralph if args.ralph else 1
     width = max(2, len(str(iterations)))
 
-    # Outputs go in a .gerbil/ directory inside the project, to keep its root clean.
-    out_dir = project_dir / ".gerbil"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # A user-level archive of ALL gerbil data (every session log and patch, same
-    # filenames), kept regardless of what happens to the project-level copies.
+    # The session log lives in a user-level ~/.gerbil/ archive -- this is the
+    # true, incrementally-written session file. Patches are written into the
+    # project's .gerbil/ (for applying) and also copied to the archive.
     archive_dir = Path.home() / ".gerbil"
     archive_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = project_dir / ".gerbil"  # created lazily, only when a patch is written
 
     def archive(path: Path) -> None:
         if path.exists():
             shutil.copy2(path, archive_dir / path.name)
 
-    def stem(i: int) -> Path:
-        # In --ralph mode, number the per-session output files; otherwise a
-        # single unnumbered set.
-        name = f"gerbil-{timestamp}-{i:0{width}d}" if args.ralph else f"gerbil-{timestamp}"
-        return out_dir / name
+    def session_name(i: int) -> str:
+        # In --ralph mode, number the per-session output files; otherwise a single set.
+        return f"gerbil-{timestamp}-{i:0{width}d}" if args.ralph else f"gerbil-{timestamp}"
 
     session = None  # the in-flight session, for the error handler below
     try:
@@ -158,9 +156,9 @@ def main() -> None:
                             ),
                             flush=True,
                         )
-                    s = stem(i)
-                    session_path = s.with_suffix(".jsonl")
-                    patch_path = s.with_suffix(".patch")
+                    name = session_name(i)
+                    session_path = archive_dir / f"{name}.jsonl"  # live session log
+                    patch_path = out_dir / f"{name}.patch"        # project-level patch
 
                     session = Session(
                         path=session_path,
@@ -180,7 +178,6 @@ def main() -> None:
                     )
                     session.close()
                     session = None
-                    archive(session_path)  # archive the log before any deletion
 
                     # Commit the agent's uncommitted changes on real HEAD, with the
                     # generated message + a footer recording how this run was invoked.
@@ -189,27 +186,22 @@ def main() -> None:
                         full = result.commit_message + "\n\n" + footer + "\n"
                         sandbox.commit(full)
 
+                    print(f"{style('session:', 'bold')} {session_path}")
+
                     # The session "produced" something iff HEAD advanced (whether by
                     # gerbil's commit above or commits the agent made itself).
                     if sandbox.head() != session_base:
-                        # Optionally fold the session log into the commit, so the
-                        # format-patch carries it too.
+                        # Optionally fold the session log into the commit (and thus
+                        # the patch); otherwise it never reaches the --at project.
                         if args.include_session:
                             sandbox.amend_with_file(
                                 f".gerbil/{session_path.name}", session_path.read_text()
                             )
+                        out_dir.mkdir(parents=True, exist_ok=True)
                         patch_path.write_text(sandbox.format_patch(session_base))
                         archive(patch_path)
-                        # The session log is now embedded in the patch; drop the
-                        # loose host copy so `git am` doesn't collide with it.
-                        if args.include_session:
-                            session_path.unlink()
-                            print(f"{style('session:', 'bold')} (embedded in patch)")
-                        else:
-                            print(f"{style('session:', 'bold')} {session_path}")
                         print(f"{style('patch:', 'bold')}   {patch_path} (git am)")
                     else:
-                        print(f"{style('session:', 'bold')} {session_path}")
                         print(f"{style('patch:', 'bold')}   (no changes; skipped)")
 
                     # The model can call ralph_done to end the loop early.
@@ -224,8 +216,7 @@ def main() -> None:
         # Catch-all: record the failure as the in-flight session's terminal event
         # (if one is open), point the user at it, and exit non-zero.
         if session is not None:
-            session.record_error(exc)
-            archive(session.path)  # preserve the errored session log too
+            session.record_error(exc)  # the log already lives in ~/.gerbil/
         print(
             f"\n{style('error:', 'bold', 'red')} "
             f"aborted by {type(exc).__name__}: {exc}",

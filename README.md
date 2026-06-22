@@ -29,10 +29,12 @@ Use `--prompt FILE` to pass an initial prompt.
 # run a session
 $ uv run gerbil --at /path/to/lake/project --prompt prompt.md
 
-# this produces two timestamped files in the project's .gerbil/ directory:
-# the jsonl session log, and a git format-patch of the session's commit
-$ ls /path/to/lake/project/.gerbil/
+# the live session log is written to ~/.gerbil/ (the true session file);
+# the project's .gerbil/ only gets the patch
+$ ls ~/.gerbil/                          # session log (+ a copy of the patch)
 gerbil-260621-190350.jsonl
+gerbil-260621-190350.patch
+$ ls /path/to/lake/project/.gerbil/      # patch only
 gerbil-260621-190350.patch
 ```
 
@@ -44,12 +46,13 @@ $ cd /path/to/lake/project
 $ git am .gerbil/gerbil-260621-190350.patch
 ```
 
-Pass `--include-session` to fold the `.jsonl` session log into the commit itself
-(so applying the patch also records how the change was produced). In that case
-the loose `.jsonl` is dropped, since it lives in the patch.
+The session log stays out of your project by default. Pass `--include-session`
+to fold it into the commit itself (so applying the patch also records how the
+change was produced).
 
-Every session log and patch is also archived to `~/.gerbil/` (same filenames),
-so you keep a full record no matter what you do with the project-level files.
+`~/.gerbil/` is a user-level archive of all gerbil data — the live session logs
+plus a copy of every patch — kept regardless of what you do with the
+project-level files.
 
 ### Ralph loops
 
