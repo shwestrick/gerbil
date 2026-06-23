@@ -142,6 +142,15 @@ class LeanSandbox:
         buf.seek(0)
         self._container.put_archive(WORKSPACE_DIR, buf.getvalue())
 
+        # Leading directories that put_archive creates for nested entries (e.g.
+        # the Lake project's subdir, when it isn't the repo root) land owned by
+        # root, so the sandbox user can't write into them (lake creates .lake/
+        # there). Reassert ownership over the whole workspace, as root.
+        self._container.exec_run(
+            ["chown", "-R", f"{SANDBOX_UID}:{SANDBOX_GID}", WORKSPACE_DIR],
+            user="root",
+        )
+
     def _configure_git(self) -> None:
         """Set a local committer identity so gerbil can commit the agent's work.
         The uploaded repo keeps its real history; we do not re-init."""

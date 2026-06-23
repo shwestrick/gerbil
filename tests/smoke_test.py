@@ -105,6 +105,11 @@ def main() -> None:
             r = sb.run("cat /workspace/project/README.md")
             check("subdir: repo root uploaded", "# test repo" in r.stdout, repr(r.stdout))
 
+            # the subdir is writable by the sandbox user (lake creates .lake here)
+            r = sb.run("mkdir -p .lake/packages && echo ok")
+            check("subdir: writable by sandbox user", r.exit_code == 0 and "ok" in r.stdout,
+                  repr((r.exit_code, r.stderr)))
+
             # edits + diff still work; diff paths are relative to the repo root
             sb.write_file("Hello.lean", "def hello := 99\n")
             diff = sb.get_diff()
