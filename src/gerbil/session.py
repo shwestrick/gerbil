@@ -41,6 +41,7 @@ class Session:
         self.project_dir = project_dir
         self.prompt_file = prompt_file
         self.version = version
+        self.base_commit = base_commit
         self._total_input_tokens = 0
         self._total_output_tokens = 0
 

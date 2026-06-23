@@ -45,14 +45,14 @@ project. Your job is to carry out the user's task by editing files and running \
 commands in the project.
 
 You have these tools:
-  - bash: run shell commands (use `lake build` to check that the project compiles)
+  - bash: run shell commands
   - read_file: read a file's contents
   - write_file: create or overwrite a file
   - edit_file: replace an exact string in a file
 
 Guidelines:
   - Explore the project before editing: read the relevant files first.
-  - After making changes, run `lake build` and fix any errors it reports.
+  - After making changes, use `lean_build` and fix any errors it reports.
   - Do not leave `sorry` in proofs unless the task explicitly allows it.
   - When the task is complete and the project builds, stop and give a short \
 summary of what you did. Do not call any more tools once you are done.
@@ -63,6 +63,7 @@ LSP_TOOLS_NOTE = """\
 
 You also have lean_* tools backed by the Lean language server. Prefer them for \
 understanding the proof state instead of guessing:
+  - lean_build: full build of the project
   - lean_goal / lean_term_goal: the proof state at a position (line/col are 1-indexed)
   - lean_diagnostic_messages: compiler errors/warnings for a file
   - lean_hover_info: type signature and docs for an identifier
@@ -81,17 +82,40 @@ RALPH_NOTE = """\
 You are running in a repeating loop: after this session ends, the same task \
 prompt runs again in a fresh session that builds on the changes you commit now. \
 You have access to a tool called `ralph_done` to terminate this loop. DO NOT \
-USE `ralph_done` EXCEPT FOR EXACTLY HOW YOU ARE INSTRUCTED.
+USE `ralph_done` EXCEPT FOR EXACTLY HOW YOU ARE INSTRUCTED. You should not \
+attempt to terminate the loop unless you are extremely sure that it is exactly \
+what the user wants.
 """
 
 
-def build_system_prompt(has_lsp_tools: bool, ralph: bool = False) -> str:
+# Appended to the system prompt to pin down how the final state must be left.
+# gerbil reads the result purely as `git format-patch <base>..HEAD`, so the
+# agent's work must end up reachable from that range. {base} is the commit the
+# session starts on.
+GIT_STATE_NOTE = """\
+
+You are working inside of a git repository, starting from commit {base}. Before \
+you finish, ensure that all of your changes are visible via the command \
+`git format-patch {base}..HEAD`. This is the only way we will be able to see your \
+changes; anything not reachable from that range is lost. You do not need to \
+commit -- any uncommitted changes you leave in the working tree are committed for \
+you -- but do not hide or discard your work: do not run `git reset`, `git \
+checkout`/`git restore`, `git stash`, or `git init`, and do not create another \
+git repository inside this one.
+"""
+
+
+def build_system_prompt(
+    has_lsp_tools: bool, ralph: bool = False, base_commit: str = ""
+) -> str:
     """The system prompt, with notes appended for active features."""
     prompt = SYSTEM_PROMPT
     if has_lsp_tools:
         prompt += LSP_TOOLS_NOTE
     if ralph:
         prompt += RALPH_NOTE
+    if base_commit:
+        prompt += GIT_STATE_NOTE.format(base=base_commit)
     return prompt
 
 
@@ -219,7 +243,10 @@ def run_session(
         messages = [{"role": "user", "content": prompt}]
         session.record_turn("user", prompt)
 
-    system = build_system_prompt(bool(toolset.mcp_tool_names()), ralph=toolset.ralph)
+    system = build_system_prompt(
+        bool(toolset.mcp_tool_names()), ralph=toolset.ralph,
+        base_commit=session.base_commit,
+    )
     tools = toolset.schemas()
 
     total = Usage()
