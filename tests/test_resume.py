@@ -145,6 +145,29 @@ def test_ralph_metadata() -> None:
     check("non-ralph has no metadata", plain.ralph is None)
 
 
+def test_commit_message_extraction() -> None:
+    """The generated commit message is recovered from the commit-message
+    exchange; empty when the session crashed before that phase."""
+    done = parse_session(write_log([
+        START, USER,
+        {"event": "turn", "role": "assistant", "content": "did it"},
+        {"event": "turn", "role": "user",
+         "content": "The task is complete. Here is the final git diff of all your "
+                    "changes:\n\ndiff --git ..."},
+        {"event": "turn", "role": "assistant",
+         "content": "Fix the widget\n\nThe widget was broken; now it isn't."},
+    ]))
+    check("commit message recovered",
+          done.commit_message == "Fix the widget\n\nThe widget was broken; now it isn't.")
+
+    crashed = parse_session(write_log([
+        START, USER,
+        {"event": "turn", "role": "assistant", "content": "working"},
+        {"event": "tool_call", "name": "bash", "args": {"command": "ls"}},
+    ]))
+    check("no commit message when crashed early", crashed.commit_message == "")
+
+
 def test_missing_session_start() -> None:
     p = write_log([USER])
     try:
@@ -160,6 +183,7 @@ def main() -> None:
     test_already_complete()
     test_thought_signature_roundtrip()
     test_ralph_metadata()
+    test_commit_message_extraction()
     test_missing_session_start()
     print("\nAll resume parser tests passed.")
 

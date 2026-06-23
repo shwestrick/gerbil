@@ -143,6 +143,13 @@ Use `gerbil run --max-turns N` to forcibly terminate sessions after `N` turns.
 Use `gerbil run --include-session` to include the `.jsonl` session data in
 the generated patch.
 
+## Applying commits with `gerbil apply`
+
+After running sessions, `gerbil apply` looks in the project `.gerbil/` folder
+and identifies patches that can be applied at the current git `HEAD`. Stale
+and already-applied patches are ignored; these are safe to leave around
+or delete.
+
 ## Resuming a crashed session
 
 If a session dies partway through -- a transient API error ("service
@@ -181,9 +188,28 @@ that's required -- including across a resume-of-a-resume.
 Resume needs the same repository that produced the session, with the base
 commit still in its history.
 
-## Applying commits with `gerbil apply`
+### Reconstructing a patch by replaying tool calls
 
-After running sessions, `gerbil apply` looks in the project `.gerbil/` folder
-and identifies patches that can be applied at the current git `HEAD`. Stale
-and already-applied patches are ignored; these are safe to leave around
-or delete.
+Where `--resume` restores the working tree from the live `.wip.patch` snapshot,
+`gerbil reconstruct-patch` rebuilds a session's `.patch` by *actually replaying
+the session's tool calls* in a fresh sandbox -- no model involved:
+
+```console
+$ gerbil reconstruct-patch ~/.gerbil/sessions/gerbil-260623-235800.jsonl
+```
+
+gerbil recreates the session's base commit (replaying ancestor patches first for
+a ralph session), re-executes every state-mutating tool call it logged
+(`bash`, `write_file`, `edit_file`; read-only and `lean_*` calls are skipped),
+commits the result under the session's own commit message, and writes the
+corresponding `.patch`. This is useful when the original patch is missing or was
+corrupted -- for example if the agent ran `git` commands that confused gerbil's
+bookkeeping.
+
+If the target `.patch` already exists, gerbil asks before overwriting it (and
+does so up front, before the slow replay). Pass `--force` to overwrite without
+the prompt.
+
+Replay is only as deterministic as the commands themselves: `bash` that depends
+on time, the network, or randomness may not reproduce exactly.
+

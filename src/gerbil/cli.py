@@ -233,6 +233,33 @@ def main() -> None:
     )
     apply_p.set_defaults(func=cmd_apply)
 
+    recon_p = sub.add_parser(
+        "reconstruct-patch",
+        help="rebuild a session's .patch by replaying its tool calls in a sandbox",
+    )
+    recon_p.add_argument(
+        "session_file",
+        metavar="SESSION_FILE",
+        help="The session .jsonl log whose patch should be reconstructed.",
+    )
+    recon_p.add_argument(
+        "--at",
+        metavar="DIRECTORY",
+        help="Path to the Lean/Lake project (a git repo). Default: the project "
+        "recorded in the session.",
+    )
+    recon_p.add_argument(
+        "--skip-cache",
+        action="store_true",
+        help="Skip 'lake exe cache get' at startup.",
+    )
+    recon_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing .patch without asking for confirmation.",
+    )
+    recon_p.set_defaults(func=cmd_reconstruct_patch)
+
     args = parser.parse_args()
     args.func(args)
 
@@ -538,6 +565,57 @@ def _resolve_patch(name: str, dirs: list[Path]) -> Path | None:
     return None
 
 
+def _reconstruct_anchor(parsed, source_file: Path, repo_root: Path,
+                        patch_dirs: list[Path]) -> tuple[str, list[str]]:
+    """Resolve the host-reachable commit a session's base is rebuilt from, plus
+    the ancestor patch texts (a ralph chain's prior sessions) to replay on top of
+    it. A single session anchors directly on its base commit with no ancestors.
+    Exits with a clear message if the anchor is missing from the repo or an
+    ancestor patch file can't be found. Shared by --resume and reconstruct-patch."""
+    ralph = parsed.ralph
+    if ralph:
+        anchor = ralph.get("chain_base") or parsed.base_commit
+        ancestor_names = list(ralph.get("ancestors") or [])
+    else:
+        anchor = parsed.base_commit
+        ancestor_names = []
+
+    if subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "-e", f"{anchor}^{{commit}}"],
+        capture_output=True,
+    ).returncode != 0:
+        sys.exit(
+            f"error: base commit {anchor[:12]} (from {source_file.name}) is not in "
+            f"{repo_root}.\nThis needs the repository that produced the session, "
+            "with its history intact."
+        )
+
+    texts = []
+    for nm in ancestor_names:
+        p = _resolve_patch(nm, patch_dirs)
+        if p is None:
+            sys.exit(
+                f"error: ancestor patch {nm} (needed to rebuild "
+                f"{source_file.name}) was not found in {patch_dirs[0]} "
+                f"or {patch_dirs[-1]}."
+            )
+        texts.append(p.read_text())
+    return anchor, texts
+
+
+def _rebuild_base(sandbox, anchor: str, ancestor_texts: list[str]) -> None:
+    """Recreate a session's committed starting point inside the sandbox: hard
+    reset to the chain anchor, then `git am` each ancestor patch in order."""
+    sandbox.checkout_force(anchor)
+    if ancestor_texts:
+        print(style(
+            f"rebuilding chain on {anchor[:12]}: "
+            f"replaying {len(ancestor_texts)} prior session(s)", "gray",
+        ))
+        for text in ancestor_texts:
+            sandbox.git_am(text)
+
+
 def _resume_run(args) -> None:
     """Continue a crashed/incomplete session from its .jsonl log.
 
@@ -592,37 +670,14 @@ def _resume_run(args) -> None:
     # host-reachable `chain_base` and `ancestors` rebuild this session's base; for
     # a single session, its base commit is the anchor and there are no ancestors.
     ralph = parsed.ralph
+    anchor, ancestor_patches = _reconstruct_anchor(
+        parsed, resume_file, repo_root, patch_dirs
+    )
     if ralph:
-        anchor = ralph.get("chain_base") or parsed.base_commit
-        ancestor_names = list(ralph.get("ancestors") or [])
         start_iter = int(ralph.get("iteration", 1))
         total_iters = int(ralph.get("total", start_iter))
     else:
-        anchor = parsed.base_commit
-        ancestor_names = []
         start_iter = total_iters = 1
-
-    # The anchor must exist in this repo (resume rebuilds the tree from it).
-    if subprocess.run(
-        ["git", "-C", str(repo_root), "cat-file", "-e", f"{anchor}^{{commit}}"],
-        capture_output=True,
-    ).returncode != 0:
-        sys.exit(
-            f"error: base commit {anchor[:12]} (from {resume_file.name}) is not in "
-            f"{repo_root}.\nResume needs the repository that produced the session, "
-            "with its history intact."
-        )
-
-    # Read the ancestor patches up front so a missing one fails before we boot.
-    ancestor_patches = []
-    for nm in ancestor_names:
-        p = _resolve_patch(nm, patch_dirs)
-        if p is None:
-            sys.exit(
-                f"error: ancestor patch {nm} (needed to rebuild "
-                f"{resume_file.name}) was not found in {archive_dir} or {out_dir}."
-            )
-        ancestor_patches.append(p.read_text())
 
     # The live working-tree patch sits next to the session log (same stem).
     src_wip = resume_file.parent / f"{resume_file.stem}.wip.patch"
@@ -657,16 +712,8 @@ def _resume_run(args) -> None:
                 )
                 toolset = Toolset(sandbox, mcp, ralph=bool(ralph))
 
-                # Rebuild the committed history: reset to the anchor, then replay
-                # each prior-session patch as a commit.
-                sandbox.checkout_force(anchor)
-                if ancestor_patches:
-                    print(style(
-                        f"rebuilding ralph chain on {anchor[:12]}: "
-                        f"replaying {len(ancestor_patches)} prior session(s)", "gray",
-                    ))
-                    for patch_text in ancestor_patches:
-                        sandbox.git_am(patch_text)
+                # Rebuild the committed history this session started from.
+                _rebuild_base(sandbox, anchor, ancestor_patches)
 
                 # `ancestors` for the continuation: the original prior patches,
                 # then each session we (re)produce here, so the new logs stay
@@ -780,6 +827,167 @@ def _resume_run(args) -> None:
                 file=sys.stderr,
             )
         sys.exit(1)
+
+
+# The tool calls that mutate sandbox state and so must be replayed to reproduce a
+# session's working tree. read_file and the lean_* MCP tools are read-only (and
+# the search tools are rate-limited), so they are skipped.
+_REPLAY_TOOLS = {"bash", "write_file", "edit_file"}
+
+
+def _confirm(question: str) -> bool:
+    """Ask a yes/no question on the terminal. Returns False on EOF or when there
+    is no TTY, so a missing answer never counts as 'yes'."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def cmd_reconstruct_patch(args) -> None:
+    """Rebuild a session's .patch by *replaying its tool calls* in a fresh sandbox.
+
+    Unlike --resume (which restores the working tree from the live .wip.patch
+    snapshot), this re-executes every state-mutating tool call the session logged
+    -- bash, write_file, edit_file -- on top of the session's reconstructed base,
+    then commits the result and emits the patch. No LLM is involved. Useful when
+    the original patch is missing or was corrupted (e.g. the agent mangled git).
+
+    Caveat: replay is only as deterministic as the commands themselves -- bash
+    that depends on time, network, or randomness may not reproduce exactly.
+    """
+    from .resume import parse_session
+
+    session_file = Path(args.session_file).resolve()
+    if not session_file.is_file():
+        sys.exit(f"error: {session_file} is not a file")
+    try:
+        parsed = parse_session(session_file)
+    except Exception as exc:
+        sys.exit(f"error: cannot parse session {session_file.name}: {exc}")
+    if not parsed.base_commit:
+        sys.exit(
+            f"error: {session_file.name} has no recorded base commit -- it predates "
+            "base-commit tracking and cannot be reconstructed."
+        )
+
+    project_dir = _resolve_at(args.at) if args.at else Path(parsed.project_dir).resolve()
+    if not project_dir.is_dir():
+        sys.exit(f"error: {project_dir} is not a directory")
+    repo_root = _require_git_repo(project_dir)
+    _require_lake_project(project_dir)
+    _require_clean_worktree(repo_root)
+    _require_docker()
+
+    archive_dir = Path.home() / ".gerbil" / "sessions"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = project_dir / ".gerbil"
+    image = os.environ.get("GERBIL_SANDBOX_IMAGE", "lean-sandbox:latest")
+    patch_dirs = [session_file.parent, out_dir]
+
+    anchor, ancestor_patches = _reconstruct_anchor(
+        parsed, session_file, repo_root, patch_dirs
+    )
+
+    # The mutating tool calls to replay, in order.
+    calls = [
+        (e["name"], e.get("args") or {})
+        for e in parsed.events
+        if e.get("event") == "tool_call" and e.get("name") in _REPLAY_TOOLS
+    ]
+    if not calls:
+        sys.exit(f"error: {session_file.name} logged no replayable tool calls.")
+
+    patch_path = out_dir / f"{session_file.stem}.patch"
+
+    # Confirm before clobbering an existing patch -- and do it now, before the
+    # (slow) sandbox boot + replay, not after.
+    if patch_path.is_file() and patch_path.stat().st_size > 0 and not args.force:
+        if not sys.stdin.isatty():
+            sys.exit(
+                f"error: {patch_path} already exists. Re-run with --force to "
+                "overwrite (no terminal available to confirm)."
+            )
+        if not _confirm(f"{patch_path} already exists. Overwrite it?"):
+            sys.exit("aborted: existing patch left in place.")
+
+    try:
+        with LeanSandbox(
+            project_dir=project_dir, repo_root=repo_root, image=image,
+            fetch_cache=not args.skip_cache,
+        ) as sandbox:
+            # Built-in tools only; replay never needs the (read-only) MCP tools.
+            toolset = Toolset(sandbox, mcp=None, ralph=False)
+
+            _rebuild_base(sandbox, anchor, ancestor_patches)
+            base = sandbox.head()
+
+            print(style(
+                f"replaying {len(calls)} tool call(s) from {session_file.name} "
+                f"on {base[:12]}...", "gray",
+            ))
+            errors = 0
+            for n, (name, call_args) in enumerate(calls, 1):
+                print(
+                    f"  {style('->', 'cyan')} "
+                    f"{style(name, 'bold', 'cyan')}({_short_args(call_args)})",
+                    flush=True,
+                )
+                result = toolset.dispatch(name, call_args)
+                if result.is_error:
+                    errors += 1
+                    preview = result.content[:160].replace("\n", " ")
+                    print(f"     {style('<- [error]', 'yellow')} {preview}", flush=True)
+            if errors:
+                print(style(
+                    f"note: {errors} of {len(calls)} replayed tool call(s) reported "
+                    "an error (this can be normal -- the agent saw these too).",
+                    "yellow",
+                ))
+
+            # Commit whatever the replay produced (under the session's own message
+            # if it generated one), then emit the patch.
+            msg = parsed.commit_message or f"Reconstructed patch for {session_file.name}"
+            footer = f"authored by Gerbil:\n--reconstruct-patch {session_file.name}"
+            sandbox.commit(msg + "\n\n" + footer + "\n")
+
+            if sandbox.head() == base:
+                sys.exit(
+                    "error: replay produced no changes -- nothing to reconstruct. "
+                    "The session may have made no committable edits, or its bash "
+                    "commands did not reproduce outside their original run."
+                )
+            patch_text = sandbox.format_patch(base)
+            if not patch_text.strip():
+                sys.exit(
+                    f"{style('error:', 'bold', 'red')} HEAD advanced but the patch "
+                    "is empty -- the replayed commands reset or re-initialized the "
+                    "repository. No patch written."
+                )
+
+            existed = patch_path.is_file() and patch_path.stat().st_size > 0
+            out_dir.mkdir(parents=True, exist_ok=True)
+            patch_path.write_text(patch_text)
+            shutil.copy2(patch_path, archive_dir / patch_path.name)
+            note = " (overwrote existing)" if existed else ""
+            print(f"{style('patch:', 'bold')}   {patch_path} (git am){note}")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(
+            f"\n{style('error:', 'bold', 'red')} "
+            f"reconstruct-patch failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _short_args(args: dict) -> str:
+    """A compact one-line rendering of tool args for the replay log."""
+    s = ", ".join(f"{k}={v!r}" for k, v in args.items())
+    return s if len(s) <= 100 else s[:100] + "..."
 
 
 def _start_mcp(sandbox, stack):

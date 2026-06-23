@@ -9,6 +9,7 @@
 # Commands:
 #   gerbil run [--prompt FILE] [--at DIR] [--ralph N] ...   run a session
 #   gerbil apply [--at DIR]                                 git am the patches
+#   gerbil reconstruct-patch SESSION_FILE [--at DIR]        rebuild a .patch
 #   gerbil update                                           update to latest main
 #   gerbil --version                                        show current version
 #
@@ -141,10 +142,19 @@ case "$cmd" in
         exec env GERBIL_CWD="$PWD" uv run --project "$(current_dir)" \
             python -m gerbil apply "$@"
         ;;
+    reconstruct-patch)
+        bootstrap_if_needed
+        ensure_image
+        shift
+        # Replays a session's tool calls in a container, so it needs the image.
+        exec env GERBIL_CWD="$PWD" GERBIL_SANDBOX_IMAGE="$(sandbox_image)" \
+            GERBIL_VERSION="$(cat "$CURRENT_FILE")" \
+            uv run --project "$(current_dir)" python -m gerbil reconstruct-patch "$@"
+        ;;
     ""|-h|--help|help)
         usage
         ;;
     *)
-        die "unknown command '$cmd' (try: run, apply, update, --version)"
+        die "unknown command '$cmd' (try: run, apply, reconstruct-patch, update, --version)"
         ;;
 esac

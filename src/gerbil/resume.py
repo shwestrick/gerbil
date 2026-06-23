@@ -36,6 +36,12 @@ class ParsedSession:
     events: list = field(default_factory=list)  # turn/tool_call/tool_result, to replay
     complete: bool = False  # the convo already ended on the model (nothing pending)
     ralph: dict | None = None  # {iteration, total, chain_base, ancestors} in --ralph
+    commit_message: str = ""  # the message the session generated, if it got that far
+
+
+# Prefix of the message gerbil sends to request a commit message (see
+# agent._commit_request). Used to locate the generated commit message in a log.
+_COMMIT_REQUEST_PREFIX = "The task is complete. Here is the final git diff"
 
 
 def _load_events(path: Path) -> list[dict]:
@@ -163,6 +169,7 @@ def parse_session(path: Path) -> ParsedSession:
         e for e in events
         if e.get("event") in ("turn", "tool_call", "tool_result")
     ]
+    commit_message = _extract_commit_message(events)
 
     return ParsedSession(
         model=start.get("model", ""),
@@ -175,4 +182,20 @@ def parse_session(path: Path) -> ParsedSession:
         events=replay,
         complete=complete,
         ralph=start.get("ralph"),
+        commit_message=commit_message,
     )
+
+
+def _extract_commit_message(events: list[dict]) -> str:
+    """The commit message the session generated, if it reached the commit-message
+    phase: the assistant turn right after gerbil's commit-message request. Empty
+    if the session crashed earlier."""
+    for i, e in enumerate(events):
+        if (
+            e.get("event") == "turn" and e.get("role") == "user"
+            and str(e.get("content", "")).startswith(_COMMIT_REQUEST_PREFIX)
+        ):
+            for nxt in events[i + 1:]:
+                if nxt.get("event") == "turn" and nxt.get("role") == "assistant":
+                    return str(nxt.get("content", "")).strip()
+    return ""
