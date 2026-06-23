@@ -9,6 +9,7 @@ tool result to the Session as it goes.
 
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from .providers import Done, TextDelta, ToolCall, Usage, _ToolMeta, stream
 from .sandbox import LeanSandbox
@@ -165,6 +166,32 @@ def _run_turn(model, system, messages, tools, provider):
     return assistant_parts, tool_calls, text, usage
 
 
+def _thought_sig(raw_part) -> str | None:
+    """Base64 of a Gemini tool-call's thought_signature, for the session log.
+
+    raw_part is the provider's original tool-call part: a google-genai Part for
+    Gemini (which may carry a thought_signature), and None for every other
+    provider. Returns None when there is no signature to record."""
+    sig = getattr(raw_part, "thought_signature", None)
+    if not sig:
+        return None
+    import base64
+
+    return base64.b64encode(sig).decode()
+
+
+def _update_wip_patch(sandbox: LeanSandbox, path: Path | None) -> None:
+    """Refresh the live working-tree patch -- the on-the-fly snapshot that lets a
+    crashed session be resumed (or simply applied). Best-effort: a checkpoint must
+    never be the thing that crashes the session."""
+    if path is None:
+        return
+    try:
+        path.write_text(sandbox.get_diff())
+    except Exception:
+        pass
+
+
 def run_session(
     sandbox: LeanSandbox,
     session: Session,
@@ -173,15 +200,24 @@ def run_session(
     toolset: Toolset,
     provider: str | None = None,
     max_turns: int | None = None,
+    messages: list | None = None,
+    wip_patch_path: Path | None = None,
 ) -> SessionResult:
     """Run the agent loop until the model stops calling tools (or max_turns).
 
     When the model finishes the task naturally, one more turn is appended to the
     same conversation asking it to write a commit message for its diff; that turn
     is recorded and counted like any other.
+
+    `messages`, when given, is a pre-built conversation to continue from (used by
+    --resume to pick up a crashed session); the initial prompt is then assumed to
+    already live in that history and is not re-recorded. `wip_patch_path`, when
+    given, receives the working-tree diff after every turn, so a crash leaves a
+    patch that reconstructs the tree exactly.
     """
-    messages = [{"role": "user", "content": prompt}]
-    session.record_turn("user", prompt)
+    if messages is None:
+        messages = [{"role": "user", "content": prompt}]
+        session.record_turn("user", prompt)
 
     system = build_system_prompt(bool(toolset.mcp_tool_names()), ralph=toolset.ralph)
     tools = toolset.schemas()
@@ -191,7 +227,19 @@ def run_session(
     final_text = ""
     stopped_at_max = False
 
-    while True:
+    # A resumed conversation that already ends on an assistant message had no
+    # pending tool calls -- the model was done. Skip the loop (calling the model
+    # again would append a second assistant turn, which the APIs reject) and go
+    # straight to the commit-message phase.
+    done_already = messages[-1]["role"] == "assistant" if messages else False
+    if done_already:
+        final_text = "".join(
+            p.get("text", "")
+            for p in messages[-1]["content"]
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+
+    while not done_already:
         if max_turns and turn >= max_turns:
             stopped_at_max = True
             break
@@ -218,7 +266,9 @@ def run_session(
         # Execute tool calls and feed results back.
         tool_results = []
         for tc in tool_calls:
-            session.record_tool_call(tc["name"], tc["args"])
+            session.record_tool_call(
+                tc["name"], tc["args"], thought_signature=_thought_sig(tc["raw_part"])
+            )
             result = toolset.dispatch(tc["name"], tc["args"])
             # Truncate once and use the same text everywhere: the session log
             # records exactly what the model sees, no more, no less.
@@ -246,6 +296,10 @@ def run_session(
             tool_results.append(tr)
 
         messages.append({"role": "user", "content": tool_results})
+
+        # Snapshot the working tree after every turn that ran tools, so an
+        # interruption before the next turn leaves a patch that recreates it.
+        _update_wip_patch(sandbox, wip_patch_path)
 
     if stopped_at_max:
         print(

@@ -167,9 +167,16 @@ def main() -> None:
     )
     run_p.add_argument(
         "--prompt",
-        required=True,
         metavar="FILE",
-        help="Path to a file containing the task description.",
+        help="Path to a file containing the task description. "
+        "Required unless --resume is given.",
+    )
+    run_p.add_argument(
+        "--resume",
+        metavar="SESSION_FILE",
+        help="Resume a crashed/incomplete session from its .jsonl log: recreate "
+        "its git base, replay the log, and continue. Model and prompt are taken "
+        "from the log. Not compatible with --prompt or --ralph.",
     )
     run_p.add_argument(
         "--model",
@@ -319,6 +326,17 @@ def cmd_apply(args) -> None:
 
 
 def cmd_run(args) -> None:
+    if args.resume:
+        if args.prompt:
+            sys.exit("error: --resume cannot be combined with --prompt "
+                     "(the prompt is taken from the session log).")
+        if args.ralph is not None:
+            sys.exit("error: --resume cannot be combined with --ralph "
+                     "(resume continues a single session).")
+        _resume_run(args)
+        return
+    if not args.prompt:
+        sys.exit("error: --prompt is required (or use --resume SESSION_FILE).")
     if args.ralph is not None and args.ralph < 1:
         sys.exit("error: --ralph N must be >= 1")
 
@@ -389,6 +407,11 @@ def cmd_run(args) -> None:
                     name = session_name(i)
                     session_path = archive_dir / f"{name}.jsonl"  # live session log
                     patch_path = out_dir / f"{name}.patch"        # project-level patch
+                    wip_path = archive_dir / f"{name}.wip.patch"  # live resume patch
+
+                    # Baseline before the session: recorded in the log so --resume
+                    # can recreate it, and used to format-patch the session's commits.
+                    session_base = sandbox.head()
 
                     session = Session(
                         path=session_path,
@@ -396,19 +419,21 @@ def cmd_run(args) -> None:
                         project_dir=project_dir,
                         prompt_file=prompt_file,
                         version=version,
+                        base_commit=session_base,
                     )
                     if mcp_warning:
                         session.record_warning(mcp_warning)
 
-                    # Baseline before the session, so we can format-patch its commits.
-                    session_base = sandbox.head()
-
                     result = run_session(
                         sandbox, session, prompt, args.model, toolset,
-                        max_turns=args.max_turns,
+                        max_turns=args.max_turns, wip_patch_path=wip_path,
                     )
                     session.close()
                     session = None
+                    # The session finished cleanly; the live resume patch is only
+                    # useful if it had crashed, so drop it. (On a crash, the except
+                    # handler leaves it in place for `gerbil run --resume`.)
+                    wip_path.unlink(missing_ok=True)
 
                     # Commit the agent's uncommitted changes on real HEAD, with the
                     # generated message + a footer recording how this run was invoked.
@@ -448,6 +473,174 @@ def cmd_run(args) -> None:
         # (if one is open), point the user at it, and exit non-zero.
         if session is not None:
             session.record_error(exc)  # the log already lives in ~/.gerbil/
+        print(
+            f"\n{style('error:', 'bold', 'red')} "
+            f"aborted by {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        if session is not None:
+            print(
+                f"{style('session:', 'bold')} {session.path} "
+                "(error details recorded inside)",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+
+def _resume_run(args) -> None:
+    """Continue a crashed/incomplete session from its .jsonl log.
+
+    Recreate the world the session started in -- boot the sandbox, hard-reset to
+    its recorded base commit, and reapply the live working-tree patch it left
+    behind -- then replay the logged conversation and hand control back to the
+    agent loop. The continuation is written as a fresh, self-contained session
+    (the original log is left untouched) whose changes are emitted as a patch in
+    the usual way.
+    """
+    from .resume import parse_session
+
+    resume_file = Path(args.resume).resolve()
+    if not resume_file.is_file():
+        sys.exit(f"error: {resume_file} is not a file")
+    try:
+        parsed = parse_session(resume_file)
+    except Exception as exc:
+        sys.exit(f"error: cannot parse session {resume_file.name}: {exc}")
+
+    if not parsed.base_commit:
+        sys.exit(
+            f"error: {resume_file.name} has no recorded base commit -- it predates "
+            "--resume support and cannot be resumed."
+        )
+    if not parsed.model:
+        sys.exit(f"error: {resume_file.name} does not record a model; cannot resume.")
+
+    # Operate on --at if given, else the project the session ran in.
+    project_dir = _resolve_at(args.at) if args.at else Path(parsed.project_dir).resolve()
+    if not project_dir.is_dir():
+        sys.exit(f"error: {project_dir} is not a directory")
+    repo_root = _require_git_repo(project_dir)
+    _require_lake_project(project_dir)
+    _require_clean_worktree(repo_root)
+    _require_docker()
+
+    # The base commit must exist in this repo (resume rebuilds the tree from it).
+    base = parsed.base_commit
+    exists = subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "-e", f"{base}^{{commit}}"],
+        capture_output=True,
+    )
+    if exists.returncode != 0:
+        sys.exit(
+            f"error: base commit {base[:12]} (from {resume_file.name}) is not in "
+            f"{repo_root}.\nResume needs the repository that produced the session, "
+            "with its history intact."
+        )
+
+    # The live working-tree patch sits next to the session log (same stem).
+    src_wip = resume_file.parent / f"{resume_file.stem}.wip.patch"
+    working_patch = src_wip.read_text() if src_wip.is_file() else ""
+
+    archive_dir = Path.home() / ".gerbil" / "sessions"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = project_dir / ".gerbil"
+    version = os.environ.get("GERBIL_VERSION", "unknown")
+    image = os.environ.get("GERBIL_SANDBOX_IMAGE", "lean-sandbox:latest")
+
+    timestamp = datetime.now().strftime("%y%m%d-%H%M%S")
+    name = f"{resume_file.stem}-resume-{timestamp}"
+    session_path = archive_dir / f"{name}.jsonl"
+    patch_path = out_dir / f"{name}.patch"
+    wip_path = archive_dir / f"{name}.wip.patch"
+
+    if parsed.complete:
+        print(style(
+            f"note: {resume_file.name} looks already-complete (ends on the model); "
+            "resuming will just (re)generate its commit message.", "yellow",
+        ))
+
+    session = None
+    try:
+        with LeanSandbox(
+            project_dir=project_dir, repo_root=repo_root, image=image,
+            fetch_cache=not args.skip_cache,
+        ) as sandbox:
+            with contextlib.ExitStack() as stack:
+                mcp, mcp_warning = (
+                    _start_mcp(sandbox, stack) if args.mcp else (None, None)
+                )
+                toolset = Toolset(sandbox, mcp, ralph=False)
+
+                # Recreate the starting world: tree at base, then the crashed
+                # session's uncommitted edits laid back on top.
+                sandbox.checkout_force(base)
+                if working_patch.strip():
+                    try:
+                        sandbox.apply_diff(working_patch)
+                    except Exception as exc:
+                        print(
+                            f"{style('warning:', 'bold', 'yellow')} could not apply "
+                            f"the saved working-tree patch ({exc}); continuing from "
+                            "the base commit only.",
+                            file=sys.stderr,
+                        )
+
+                session = Session(
+                    path=session_path,
+                    model=parsed.model,
+                    project_dir=project_dir,
+                    prompt_file=Path(parsed.prompt_file),
+                    version=version,
+                    base_commit=base,
+                    resumed_from=resume_file.name,
+                )
+                if mcp_warning:
+                    session.record_warning(mcp_warning)
+                # Carry the pre-crash history forward so the new log is complete
+                # (and itself resumable).
+                for ev in parsed.events:
+                    session.record_replayed(ev)
+                print(style(
+                    f"resuming {resume_file.name}: base {base[:12]}, "
+                    f"{len(parsed.events)} events replayed, model {parsed.model}",
+                    "gray",
+                ))
+
+                result = run_session(
+                    sandbox, session, parsed.prompt, parsed.model, toolset,
+                    max_turns=args.max_turns, messages=parsed.messages,
+                    wip_patch_path=wip_path,
+                )
+                session.close()
+                session = None
+                wip_path.unlink(missing_ok=True)
+
+                if result.commit_message:
+                    footer = (
+                        "authored by Gerbil:\n"
+                        f"--model {parsed.model}\n"
+                        f"--resume {resume_file.name}"
+                    )
+                    full = result.commit_message + "\n\n" + footer + "\n"
+                    sandbox.commit(full)
+
+                print(f"{style('session:', 'bold')} {session_path}")
+
+                if sandbox.head() != base:
+                    if args.include_session:
+                        sandbox.amend_with_file(
+                            f".gerbil/{session_path.name}", session_path.read_text()
+                        )
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    patch_path.write_text(sandbox.format_patch(base))
+                    if patch_path.exists():
+                        shutil.copy2(patch_path, archive_dir / patch_path.name)
+                    print(f"{style('patch:', 'bold')}   {patch_path} (git am)")
+                else:
+                    print(f"{style('patch:', 'bold')}   (no changes; skipped)")
+    except Exception as exc:
+        if session is not None:
+            session.record_error(exc)
         print(
             f"\n{style('error:', 'bold', 'red')} "
             f"aborted by {type(exc).__name__}: {exc}",

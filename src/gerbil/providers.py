@@ -138,9 +138,17 @@ def _stream_gemini(model, system, messages, tools):
                     if item.get("raw_part") is not None:
                         parts.append(item["raw_part"])
                     else:
-                        parts.append(types.Part(function_call=types.FunctionCall(
+                        part = types.Part(function_call=types.FunctionCall(
                             name=item["name"], args=item["args"],
-                        )))
+                        ))
+                        # On --resume there is no raw_part, but the signature was
+                        # logged (base64); restore it so Gemini accepts the call.
+                        sig = item.get("thought_signature")
+                        if sig:
+                            import base64
+
+                            part.thought_signature = base64.b64decode(sig)
+                        parts.append(part)
             contents.append(types.Content(role="model", parts=parts))
 
     usage = Usage()

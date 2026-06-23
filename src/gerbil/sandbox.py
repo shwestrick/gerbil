@@ -232,6 +232,36 @@ class LeanSandbox:
         self.run("git add -A")
         return self.run("git diff --cached").stdout
 
+    def checkout_force(self, ref: str) -> None:
+        """Hard-reset the working tree to `ref` (detaching HEAD), discarding any
+        tracked-file changes. Untracked files -- crucially the .lake build cache
+        and fetched mathlib oleans -- are left in place, so the agent does not pay
+        to refetch them. Used by --resume to recreate a session's starting commit
+        before the saved working-tree patch is reapplied on top."""
+        result = self.run(f"git checkout -f {_quote(ref)}")
+        if result.exit_code != 0:
+            raise RuntimeError(f"git checkout {ref} failed:\n{result.stderr}")
+
+    def apply_diff(self, diff_text: str) -> None:
+        """Apply a working-tree patch (as produced by get_diff) to the current
+        tree. The patch is piped in base64-encoded to avoid any shell-quoting or
+        heredoc-delimiter hazards with arbitrary diff content. No-op for an empty
+        patch. Used by --resume to restore the uncommitted edits a crashed session
+        had made on top of its base commit."""
+        if not diff_text.strip():
+            return
+        import base64
+
+        b64 = base64.b64encode(diff_text.encode()).decode()
+        result = self.run(
+            f"printf %s {_quote(b64)} | base64 -d | git apply --whitespace=nowarn -",
+            timeout=120.0,
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"git apply failed:\n{result.stderr or result.stdout}"
+            )
+
     def commit(self, message: str) -> bool:
         """Commit all current changes inside the container on top of real HEAD.
         Returns False if there was nothing to commit. Skips hooks (--no-verify),

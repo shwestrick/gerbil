@@ -10,7 +10,7 @@ Ralph loops.
 gerbil sessions are self-contained and sandboxed: each session is run
 in a container and produces a git commit.
 
-### Example Usage
+## Example Usage
 
 Run at your Lake project root. This needs to be in a git repo, with a clean
 state (no unstaged changes). gerbil produces two files: a `.jsonl` session
@@ -69,7 +69,7 @@ recommend specifying *very precisely* under what conditions the model is
 allowed to invoke `ralph_done` (otherwise, the model might spuriously decide to
 terminate the Ralph loop).
 
-### Setup and Install
+## Setup and Install
 
 `gerbil` is a single self-contained launcher script. Put it on your `PATH`; it
 fetches its own source from GitHub on first use (requires `git`, `docker`, and
@@ -92,7 +92,7 @@ $ gerbil --version    # current version (commit hash)
 $ gerbil update       # update to the latest commit on main (+ rebuild the image)
 ```
 
-### API Keys and Backend Models
+## API Keys and Backend Models
 
 Use `gerbil run --help` to see the list of backend models. Set the appropriate
 API key for the model you wish to use:
@@ -105,7 +105,7 @@ $ export ANTHROPIC_API_KEY=...
 $ export OPENAI_API_KEY=...
 ```
 
-### The `~/.gerbil` directory
+## The `~/.gerbil` directory
 
 gerbil maintains a `$HOME/.gerbil` directory that contains an archive of
 all recent sessions and patches, and versions of the gerbil driver itself.
@@ -115,7 +115,7 @@ all archived data).
 gerbil also maintains a per-project `.gerbil/` directory inside of the
 project where it is run, to store project-specific session data and patches.
 
-### Lean LSP tools (MCP)
+## Lean LSP tools (MCP)
 
 By default, gerbil enables all
 [lean-lsp-mcp](https://github.com/oOo0oOo/lean-lsp-mcp) tools — proof state
@@ -128,22 +128,51 @@ Use `gerbil run --no-mcp` to disable it and use only the built-in tools.
 If the MCP server fails to start, gerbil warns and continues with the built-in
 tools.
 
-### Mathlib caching
+## Mathlib caching
 
 By default, gerbil assumes the Lake project includes Mathlib, and starts
 every sandbox session with `lake exe cache get`. Use `gerbil run --skip-cache`
 to disable the initial `lake exe cache get`.
 
-### Turn limits
+## Turn limits
 
 Use `gerbil run --max-turns N` to forcibly terminate sessions after `N` turns.
 
-### Include session data in commits
+## Include session data in commits
 
 Use `gerbil run --include-session` to include the `.jsonl` session data in
 the generated patch.
 
-### Applying commits with `gerbil apply`
+## Resuming a crashed session
+
+If a session dies partway through -- a transient API error ("service
+unavailable"), a lost connection, a Ctrl-C -- you can resume
+it from its session log:
+
+```console
+$ gerbil run --resume ~/.gerbil/sessions/gerbil-260623-235800.jsonl
+```
+
+gerbil boots a fresh sandbox, recreates the git state the session started
+from, replays the conversation up to the crash, and continues from there.
+The model and prompt are taken from the log, so `--resume` takes neither
+`--prompt` nor `--model` (and is not combined with `--ralph`).
+
+The working tree is recovered from a `*.wip.patch` file that is kept live
+next to the session log, refreshed after every turn. This patch is also
+a normal git patch -- if you'd rather not resume, you can just `git apply`
+it yourself. A clean finish deletes the `.wip.patch`; a crash leaves it in
+place for `--resume`.
+
+The continuation is written as its own session log and patch (named
+`...-resume-<timestamp>`), carrying the full prior history forward, so it is
+itself resumable if it too is interrupted. The original crashed log is left
+untouched.
+
+Resume needs the same repository that produced the session, with `base_commit`
+still in its history. (Multi-session `--ralph` resume is not yet supported.)
+
+## Applying commits with `gerbil apply`
 
 After running sessions, `gerbil apply` looks in the project `.gerbil/` folder
 and identifies patches that can be applied at the current git `HEAD`. Stale

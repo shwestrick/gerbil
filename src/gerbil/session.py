@@ -32,6 +32,8 @@ class Session:
         project_dir: Path,
         prompt_file: Path,
         version: str = "unknown",
+        base_commit: str = "",
+        resumed_from: str | None = None,
     ):
         self.path = path
         self.model = model
@@ -41,14 +43,21 @@ class Session:
         self._total_input_tokens = 0
         self._total_output_tokens = 0
 
-        self._append({
+        # base_commit anchors the git state this session starts from -- the HEAD
+        # the agent's changes are layered on top of. It is what `--resume` checks
+        # out to recreate the starting world before replaying the log.
+        start = {
             "event": "session_start",
             "timestamp": _now(),
             "gerbil_version": version,
             "model": model,
             "project_dir": str(project_dir),
             "prompt_file": str(prompt_file),
-        })
+            "base_commit": base_commit,
+        }
+        if resumed_from is not None:
+            start["resumed_from"] = resumed_from
+        self._append(start)
 
     def record_turn(
         self,
@@ -67,13 +76,24 @@ class Session:
             "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
         })
 
-    def record_tool_call(self, name: str, args: dict[str, Any]) -> None:
-        self._append({
+    def record_tool_call(
+        self,
+        name: str,
+        args: dict[str, Any],
+        thought_signature: str | None = None,
+    ) -> None:
+        event = {
             "event": "tool_call",
             "timestamp": _now(),
             "name": name,
             "args": args,
-        })
+        }
+        # Gemini attaches a base64 thought_signature to each function call; record
+        # it so --resume can replay the call faithfully (Gemini rejects history
+        # whose tool calls are missing their signatures).
+        if thought_signature is not None:
+            event["thought_signature"] = thought_signature
+        self._append(event)
 
     def record_tool_result(self, name: str, result: Any) -> None:
         self._append({
@@ -92,6 +112,16 @@ class Session:
                 "output_tokens": self._total_output_tokens,
             },
         })
+
+    def record_replayed(self, event: dict[str, Any]) -> None:
+        """Re-emit a prior event verbatim into this (continuation) log, tagged
+        `replayed` so it is distinguishable from live activity. Used by --resume
+        to make the new log self-contained (and itself resumable) by carrying the
+        full pre-crash history forward. Token totals are intentionally not touched
+        -- the replayed turns were already counted in the original session."""
+        e = dict(event)
+        e["replayed"] = True
+        self._append(e)
 
     def record_warning(self, message: str) -> None:
         """Non-terminal event noting a recoverable problem (e.g. MCP failed to

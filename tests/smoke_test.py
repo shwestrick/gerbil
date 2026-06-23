@@ -91,6 +91,27 @@ def main() -> None:
             check("diff shows edit", "def hello := 42" in diff, diff)
             check("diff shows new file", "Sub/New.lean" in diff, diff)
 
+            # 10. resume plumbing: the working-tree patch + base commit fully
+            # reconstruct the tree. Commit the changes, roll back to base with
+            # checkout_force, then reapply the saved patch -- exactly what
+            # `gerbil run --resume` does.
+            base = sb.head()
+            patch = sb.get_diff()          # edited Hello.lean + new Sub/New.lean
+            sb.commit("wip")
+            check("resume: commit advanced HEAD", sb.head() != base)
+
+            sb.checkout_force(base)
+            check("resume: checkout_force restores base",
+                  sb.read_file("Hello.lean") == "def hello := 1\n")
+            check("resume: checkout_force drops later file",
+                  sb.run("test -f Sub/New.lean").exit_code != 0)
+
+            sb.apply_diff(patch)
+            check("resume: apply_diff restores edit",
+                  sb.read_file("Hello.lean") == "def hello := 42\n")
+            check("resume: apply_diff restores new file",
+                  sb.read_file("Sub/New.lean") == "theorem t : True := trivial\n")
+
     # Lake project in a subdirectory of the repo (not the repo root).
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
