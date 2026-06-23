@@ -220,9 +220,12 @@ def run_session(
         for tc in tool_calls:
             session.record_tool_call(tc["name"], tc["args"])
             result = toolset.dispatch(tc["name"], tc["args"])
-            session.record_tool_result(tc["name"], result.content)
+            # Truncate once and use the same text everywhere: the session log
+            # records exactly what the model sees, no more, no less.
+            content = truncate_tool_output(result.content)
+            session.record_tool_result(tc["name"], content)
 
-            preview = result.content[:200] + "..." if len(result.content) > 200 else result.content
+            preview = content[:200] + "..." if len(content) > 200 else content
             result_color = "red" if result.is_error else "gray"
             # Align continuation lines under the content (after "  <- ").
             indented = preview.rstrip("\n").replace("\n", "\n     ")
@@ -234,7 +237,7 @@ def run_session(
             tr = {
                 "type": "tool_result",
                 "tool_name": tc["name"],
-                "content": truncate_tool_output(result.content),
+                "content": content,
             }
             # Anthropic keys on tool_use_id, OpenAI on tool_call_id; set both.
             if tc["id"]:
