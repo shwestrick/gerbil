@@ -170,6 +170,24 @@ def main() -> None:
             check("subdir: diff shows edit", "def hello := 99" in diff, diff)
             check("subdir: diff path under subdir", "lean/proof/Hello.lean" in diff, diff)
 
+            # Regression: an agent running `git init` in the Lake subdir creates a
+            # nested .git that hijacks plain git discovery. gerbil's own git is
+            # pinned to the real repo, so it must be immune (the bug was a silent
+            # 0-byte patch when format-patch ran against the nested repo).
+            real_head = sb.head()
+            sb.run("git init -q")  # the destructive command, as the agent ran it
+            check("tamper: nested .git hijacks plain git",
+                  sb.run("git rev-parse --show-toplevel").stdout.strip()
+                  .endswith("lean/proof"))
+            check("tamper: pinned head ignores nested repo", sb.head() == real_head)
+            diff = sb.get_diff()
+            check("tamper: pinned diff still sees real edit",
+                  "def hello := 99" in diff and "lean/proof/Hello.lean" in diff, diff)
+            sb.commit("real commit")
+            patch = sb.format_patch(real_head)
+            check("tamper: format_patch works against real base despite nested .git",
+                  patch.strip() != "" and "lean/proof/Hello.lean" in patch, patch[:120])
+
     print("\nAll smoke tests passed.")
 
 

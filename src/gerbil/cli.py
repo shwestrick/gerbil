@@ -349,10 +349,22 @@ def _finalize_session(
             sandbox.amend_with_file(
                 f".gerbil/{session_path.name}", session_path.read_text()
             )
+        patch_text = sandbox.format_patch(base)
+        # HEAD advanced yet base..HEAD is empty: HEAD is not a descendant of base.
+        # This means the repo was reset/re-initialized inside the sandbox (e.g. the
+        # agent ran `git reset`/`git init`). Fail loudly rather than write a
+        # misleading 0-byte "patch".
+        if not patch_text.strip():
+            print(
+                f"{style('error:', 'bold', 'red')} HEAD moved but base..HEAD is "
+                f"empty -- the repository was reset or re-initialized inside the "
+                f"sandbox. No patch written for {patch_path.name}.",
+                file=sys.stderr,
+            )
+            return None
         out_dir.mkdir(parents=True, exist_ok=True)
-        patch_path.write_text(sandbox.format_patch(base))
-        if patch_path.exists():
-            shutil.copy2(patch_path, archive_dir / patch_path.name)
+        patch_path.write_text(patch_text)
+        shutil.copy2(patch_path, archive_dir / patch_path.name)
         print(f"{style('patch:', 'bold')}   {patch_path} (git am)")
         return patch_path.name
 

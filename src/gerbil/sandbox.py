@@ -154,8 +154,8 @@ class LeanSandbox:
     def _configure_git(self) -> None:
         """Set a local committer identity so gerbil can commit the agent's work.
         The uploaded repo keeps its real history; we do not re-init."""
-        self.run("git config user.email gerbil@local")
-        self.run("git config user.name gerbil")
+        self._git("config user.email gerbil@local")
+        self._git("config user.name gerbil")
         # Uploaded .git is owned by the sandbox user (uid 1000 == container user),
         # but add safe.directory defensively in case of ownership quirks.
         self.run(f"git config --global --add safe.directory {WORKSPACE_DIR}")
@@ -215,6 +215,22 @@ class LeanSandbox:
             timeout_occurred=exit_code == 124,
         )
 
+    @property
+    def _git_env(self) -> str:
+        """Environment that pins git to gerbil's real repository, bypassing all
+        repository discovery. Without this, an agent that runs `git init` in the
+        Lake project dir creates a nested .git that shadows the real repo for
+        every later command run from there -- so gerbil's diff/commit/format-patch
+        would silently operate on the wrong repository. Setting GIT_DIR and
+        GIT_WORK_TREE explicitly makes gerbil's own git immune to that."""
+        return f"GIT_DIR={posixpath.join(WORKSPACE_DIR, '.git')} GIT_WORK_TREE={WORKSPACE_DIR}"
+
+    def _git(self, args: str, timeout: float = 60.0) -> CommandResult:
+        """Run a git command against gerbil's real repository (see _git_env). All
+        of gerbil's internal git -- never the agent's bash tool -- goes through
+        here, so the agent cannot redirect gerbil's bookkeeping to a stray repo."""
+        return self.run(f"{self._git_env} git {args}", timeout=timeout)
+
     # ------------------------------------------------------------------
     # Output
     # ------------------------------------------------------------------
@@ -222,15 +238,15 @@ class LeanSandbox:
     def head(self) -> str:
         """The current HEAD commit hash. Raises if the repo has no commits
         (rev-parse otherwise echoes a bogus 'HEAD' on an unborn branch)."""
-        result = self.run("git rev-parse --verify HEAD")
+        result = self._git("rev-parse --verify HEAD")
         if result.exit_code != 0:
             raise RuntimeError("repository has no commits (no HEAD)")
         return result.stdout.strip()
 
     def get_diff(self) -> str:
         """Return a git diff of the uncommitted working-tree changes (vs HEAD)."""
-        self.run("git add -A")
-        return self.run("git diff --cached").stdout
+        self._git("add -A")
+        return self._git("diff --cached").stdout
 
     def checkout_force(self, ref: str) -> None:
         """Hard-reset the working tree to `ref` (detaching HEAD), discarding any
@@ -238,7 +254,7 @@ class LeanSandbox:
         and fetched mathlib oleans -- are left in place, so the agent does not pay
         to refetch them. Used by --resume to recreate a session's starting commit
         before the saved working-tree patch is reapplied on top."""
-        result = self.run(f"git checkout -f {_quote(ref)}")
+        result = self._git(f"checkout -f {_quote(ref)}")
         if result.exit_code != 0:
             raise RuntimeError(f"git checkout {ref} failed:\n{result.stderr}")
 
@@ -254,7 +270,8 @@ class LeanSandbox:
 
         b64 = base64.b64encode(diff_text.encode()).decode()
         result = self.run(
-            f"printf %s {_quote(b64)} | base64 -d | git apply --whitespace=nowarn -",
+            f"printf %s {_quote(b64)} | base64 -d | "
+            f"{self._git_env} git apply --whitespace=nowarn -",
             timeout=120.0,
         )
         if result.exit_code != 0:
@@ -267,12 +284,15 @@ class LeanSandbox:
         Returns False if there was nothing to commit. Skips hooks (--no-verify),
         since host hooks may assume tools that aren't in the sandbox.
         """
-        self.run("git add -A")
-        if self.run("git diff --cached --quiet").exit_code == 0:
+        self._git("add -A")
+        if self._git("diff --cached --quiet").exit_code == 0:
             return False
         # Pass the message on stdin via a quoted heredoc so its content is taken
         # literally (no shell expansion). `command` reaches bash -c verbatim.
-        script = f"git commit --no-verify -F - <<'GERBIL_MSG'\n{message}\nGERBIL_MSG\n"
+        script = (
+            f"{self._git_env} git commit --no-verify -F - "
+            f"<<'GERBIL_MSG'\n{message}\nGERBIL_MSG\n"
+        )
         result = self.run(script)
         if result.exit_code != 0:
             raise RuntimeError(f"git commit failed:\n{result.stderr}")
@@ -290,17 +310,26 @@ class LeanSandbox:
 
         b64 = base64.b64encode(patch_text.encode()).decode()
         result = self.run(
-            f"printf %s {_quote(b64)} | base64 -d | git am", timeout=180.0
+            f"printf %s {_quote(b64)} | base64 -d | {self._git_env} git am",
+            timeout=180.0,
         )
         if result.exit_code != 0:
-            self.run("git am --abort")
+            self._git("am --abort")
             raise RuntimeError(f"git am failed:\n{result.stderr or result.stdout}")
 
     def format_patch(self, base: str) -> str:
         """Return an mbox patch (title + message + diff) for every commit in
         base..HEAD, as produced by `git format-patch`. Apply on the host with
-        `git am`."""
-        return self.run(f"git format-patch {base}..HEAD --stdout", timeout=60.0).stdout
+        `git am`. Raises if git itself fails (e.g. `base` is unknown -- which is
+        what a tampered/re-initialized repo looks like), so the caller never
+        mistakes an error for 'no changes'."""
+        result = self._git(f"format-patch {base}..HEAD --stdout", timeout=60.0)
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"git format-patch {base[:12]}..HEAD failed:\n"
+                f"{result.stderr or result.stdout}"
+            )
+        return result.stdout
 
     def amend_with_file(self, repo_path: str, content: str) -> None:
         """Fold an extra file into the HEAD commit: write it into the repo, stage
@@ -308,8 +337,8 @@ class LeanSandbox:
         without changing the message. Used by --include-session to embed the
         session log in the commit before format_patch()."""
         self.write_file(repo_path, content)
-        self.run(f"git add -f {_quote(repo_path)}")
-        result = self.run("git commit --amend --no-edit --no-verify")
+        self._git(f"add -f {_quote(repo_path)}")
+        result = self._git("commit --amend --no-edit --no-verify")
         if result.exit_code != 0:
             raise RuntimeError(f"git commit --amend failed:\n{result.stderr}")
 
