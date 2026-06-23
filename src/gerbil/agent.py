@@ -14,7 +14,7 @@ from .providers import Done, TextDelta, ToolCall, Usage, _ToolMeta, stream
 from .sandbox import LeanSandbox
 from .session import Session
 from .term import style
-from .tools import Toolset
+from .tools import Toolset, truncate_tool_output
 
 # Single accent color for every tool invocation.
 TOOL_COLOR = "cyan"
@@ -234,7 +234,7 @@ def run_session(
             tr = {
                 "type": "tool_result",
                 "tool_name": tc["name"],
-                "content": result.content,
+                "content": truncate_tool_output(result.content),
             }
             # Anthropic keys on tool_use_id, OpenAI on tool_call_id; set both.
             if tc["id"]:

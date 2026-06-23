@@ -109,6 +109,50 @@ class ToolResult:
     is_error: bool = False
 
 
+# Maximum size (in characters) of tool output fed back to the model. A single
+# tool call can produce enormous output (e.g. a build that prints megabytes of
+# logs); sending all of it can blow past the model's context window and crash
+# the session. Output larger than this is truncated, keeping the head and tail
+# (errors often land at the end) with a summary of what was omitted in between.
+MAX_TOOL_OUTPUT_CHARS = 10000
+
+
+def truncate_tool_output(content: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    """Cap oversized tool output, appending a summary of what was omitted.
+
+    Returns content unchanged if it is within `limit`. Otherwise keeps the first
+    half and last half of `limit` characters (each trimmed back to a line
+    boundary so we don't cut mid-line) and drops the middle, since the most
+    relevant lines -- especially build/test errors -- tend to be at the start or
+    end. A note giving the full size is inserted where the omission happened.
+    """
+    if len(content) <= limit:
+        return content
+    total_chars = len(content)
+    total_lines = content.count("\n") + 1
+
+    half = limit // 2
+    head = content[:half]
+    tail = content[-half:]
+    # Trim each piece to a line boundary so we don't cut mid-line.
+    nl = head.rfind("\n")
+    if nl > 0:
+        head = head[:nl]
+    nl = tail.find("\n")
+    if nl >= 0:
+        tail = tail[nl + 1:]
+
+    return (
+        f"{head}\n"
+        f"...\n"
+        f"(Output truncated. Total length of tool output: "
+        f"{total_lines} lines, {total_chars} characters. "
+        f"Showing the first and last {half} characters.)\n"
+        f"...\n"
+        f"{tail}"
+    )
+
+
 def dispatch(sandbox: LeanSandbox, name: str, args: dict) -> ToolResult:
     """Execute a tool call against the sandbox. Never raises."""
     try:
