@@ -134,7 +134,8 @@ RALPH_DONE_TOOL = {
     "description": (
         "Signal that the overall task is fully and finally complete, so the "
         "repeating session loop (ralph) stops early instead of running more "
-        "sessions. Only call this when you are certain no further work is needed."
+        "sessions. You will be given extremely precise instructions for how "
+        "to use this tool. FOLLOW THESE INSTRUCTIONS CAREFULLY."
     ),
     "input_schema": {
         "type": "object",
