@@ -169,8 +169,17 @@ The continuation is written as its own session log and patch (named
 itself resumable if it too is interrupted. The original crashed log is left
 untouched.
 
-Resume needs the same repository that produced the session, with `base_commit`
-still in its history. (Multi-session `--ralph` resume is not yet supported.)
+Ralph chains are supported. Point `--resume` at the crashed session's log
+(e.g. `gerbil-<ts>-03.jsonl`) and gerbil rebuilds that session's starting
+point by replaying the earlier sessions' patches on top of the chain's base
+commit, reapplies the crashed session's working-tree patch, and then runs the
+remaining iterations. Each ralph session's header records the chain's base
+commit and the ordered list of ancestor patches needed to rebuild it, so the
+sibling `.patch` files (found by the `gerbil-<ts>-NN` naming convention) are all
+that's required -- including across a resume-of-a-resume.
+
+Resume needs the same repository that produced the session, with the base
+commit still in its history.
 
 ## Applying commits with `gerbil apply`
 

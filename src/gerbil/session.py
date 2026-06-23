@@ -34,6 +34,7 @@ class Session:
         version: str = "unknown",
         base_commit: str = "",
         resumed_from: str | None = None,
+        ralph: dict[str, Any] | None = None,
     ):
         self.path = path
         self.model = model
@@ -57,6 +58,13 @@ class Session:
         }
         if resumed_from is not None:
             start["resumed_from"] = resumed_from
+        # In --ralph mode: {iteration, total, chain_base, ancestors}. chain_base
+        # is the host-reachable commit the whole chain layers on; ancestors lists
+        # the prior sessions' patch files, in order, that rebuild this session's
+        # base. Together they let --resume reconstruct a mid-chain session without
+        # reading any sibling logs.
+        if ralph is not None:
+            start["ralph"] = ralph
         self._append(start)
 
     def record_turn(

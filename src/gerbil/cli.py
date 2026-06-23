@@ -30,6 +30,7 @@ the previous one's commit.
 import argparse
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -325,6 +326,40 @@ def cmd_apply(args) -> None:
     ))
 
 
+def _finalize_session(
+    sandbox, base: str, result, *,
+    session_path: Path, patch_path: Path, out_dir: Path, archive_dir: Path,
+    include_session: bool, footer: str,
+) -> str | None:
+    """Commit the agent's work and emit its format-patch. Shared by `gerbil run`
+    and `--resume`. Returns the patch filename if HEAD advanced (a patch was
+    written), else None."""
+    if result.commit_message:
+        full = result.commit_message + "\n\n" + footer + "\n"
+        sandbox.commit(full)
+
+    print(f"{style('session:', 'bold')} {session_path}")
+
+    # The session "produced" something iff HEAD advanced (gerbil's commit above,
+    # or commits the agent made itself).
+    if sandbox.head() != base:
+        # Optionally fold the session log into the commit (and thus the patch);
+        # otherwise it never reaches the --at project.
+        if include_session:
+            sandbox.amend_with_file(
+                f".gerbil/{session_path.name}", session_path.read_text()
+            )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        patch_path.write_text(sandbox.format_patch(base))
+        if patch_path.exists():
+            shutil.copy2(patch_path, archive_dir / patch_path.name)
+        print(f"{style('patch:', 'bold')}   {patch_path} (git am)")
+        return patch_path.name
+
+    print(f"{style('patch:', 'bold')}   (no changes; skipped)")
+    return None
+
+
 def cmd_run(args) -> None:
     if args.resume:
         if args.prompt:
@@ -367,10 +402,6 @@ def cmd_run(args) -> None:
     # The running gerbil version (commit hash), supplied by the launcher.
     version = os.environ.get("GERBIL_VERSION", "unknown")
 
-    def archive(path: Path) -> None:
-        if path.exists():
-            shutil.copy2(path, archive_dir / path.name)
-
     def session_name(i: int) -> str:
         # In --ralph mode, number the per-session output files; otherwise a single set.
         return f"gerbil-{timestamp}-{i:0{width}d}" if args.ralph else f"gerbil-{timestamp}"
@@ -395,6 +426,12 @@ def cmd_run(args) -> None:
                 )
                 toolset = Toolset(sandbox, mcp, ralph=bool(args.ralph))
 
+                # The whole ralph chain layers on this host-reachable commit;
+                # `ancestors` accumulates each completed session's patch file, in
+                # order, so every session records exactly what rebuilds its base.
+                chain_base = sandbox.head() if args.ralph else ""
+                ancestors: list[str] = []
+
                 for i in range(1, iterations + 1):
                     if args.ralph:
                         print(
@@ -412,6 +449,10 @@ def cmd_run(args) -> None:
                     # Baseline before the session: recorded in the log so --resume
                     # can recreate it, and used to format-patch the session's commits.
                     session_base = sandbox.head()
+                    ralph_meta = {
+                        "iteration": i, "total": iterations,
+                        "chain_base": chain_base, "ancestors": list(ancestors),
+                    } if args.ralph else None
 
                     session = Session(
                         path=session_path,
@@ -420,6 +461,7 @@ def cmd_run(args) -> None:
                         prompt_file=prompt_file,
                         version=version,
                         base_commit=session_base,
+                        ralph=ralph_meta,
                     )
                     if mcp_warning:
                         session.record_warning(mcp_warning)
@@ -435,30 +477,17 @@ def cmd_run(args) -> None:
                     # handler leaves it in place for `gerbil run --resume`.)
                     wip_path.unlink(missing_ok=True)
 
-                    # Commit the agent's uncommitted changes on real HEAD, with the
-                    # generated message + a footer recording how this run was invoked.
-                    if result.commit_message:
-                        footer = _run_footer(args, i if args.ralph else None, iterations)
-                        full = result.commit_message + "\n\n" + footer + "\n"
-                        sandbox.commit(full)
-
-                    print(f"{style('session:', 'bold')} {session_path}")
-
-                    # The session "produced" something iff HEAD advanced (whether by
-                    # gerbil's commit above or commits the agent made itself).
-                    if sandbox.head() != session_base:
-                        # Optionally fold the session log into the commit (and thus
-                        # the patch); otherwise it never reaches the --at project.
-                        if args.include_session:
-                            sandbox.amend_with_file(
-                                f".gerbil/{session_path.name}", session_path.read_text()
-                            )
-                        out_dir.mkdir(parents=True, exist_ok=True)
-                        patch_path.write_text(sandbox.format_patch(session_base))
-                        archive(patch_path)
-                        print(f"{style('patch:', 'bold')}   {patch_path} (git am)")
-                    else:
-                        print(f"{style('patch:', 'bold')}   (no changes; skipped)")
+                    footer = _run_footer(args, i if args.ralph else None, iterations)
+                    patch_name = _finalize_session(
+                        sandbox, session_base, result,
+                        session_path=session_path, patch_path=patch_path,
+                        out_dir=out_dir, archive_dir=archive_dir,
+                        include_session=args.include_session, footer=footer,
+                    )
+                    # Once a session produces a commit, later sessions in the chain
+                    # build on it -- record its patch as an ancestor for resume.
+                    if patch_name and args.ralph:
+                        ancestors.append(patch_name)
 
                     # The model can call ralph_done to end the loop early.
                     if toolset.ralph_done:
@@ -487,15 +516,31 @@ def cmd_run(args) -> None:
         sys.exit(1)
 
 
+def _resolve_patch(name: str, dirs: list[Path]) -> Path | None:
+    """Find an ancestor patch file by name across candidate directories (the
+    session archive, then the project's .gerbil/)."""
+    for d in dirs:
+        cand = d / name
+        if cand.is_file():
+            return cand
+    return None
+
+
 def _resume_run(args) -> None:
     """Continue a crashed/incomplete session from its .jsonl log.
 
-    Recreate the world the session started in -- boot the sandbox, hard-reset to
-    its recorded base commit, and reapply the live working-tree patch it left
-    behind -- then replay the logged conversation and hand control back to the
-    agent loop. The continuation is written as a fresh, self-contained session
-    (the original log is left untouched) whose changes are emitted as a patch in
-    the usual way.
+    Recreate the world the session started in, then replay the logged
+    conversation and hand control back to the agent loop:
+
+      - single session: hard-reset the tree to the recorded base commit and
+        reapply the live working-tree patch the crash left behind.
+      - --ralph chain: hard-reset to the chain's host-reachable base, `git am`
+        the recorded ancestor patches (the prior sessions) to rebuild the
+        committed history, then reapply the crashed session's working-tree patch.
+        The remaining iterations of the loop run afterward, as fresh sessions.
+
+    The continuation is written as fresh, self-contained session logs/patches
+    (the original logs are left untouched), each itself resumable.
     """
     from .resume import parse_session
 
@@ -524,34 +569,63 @@ def _resume_run(args) -> None:
     _require_clean_worktree(repo_root)
     _require_docker()
 
-    # The base commit must exist in this repo (resume rebuilds the tree from it).
-    base = parsed.base_commit
-    exists = subprocess.run(
-        ["git", "-C", str(repo_root), "cat-file", "-e", f"{base}^{{commit}}"],
-        capture_output=True,
-    )
-    if exists.returncode != 0:
-        sys.exit(
-            f"error: base commit {base[:12]} (from {resume_file.name}) is not in "
-            f"{repo_root}.\nResume needs the repository that produced the session, "
-            "with its history intact."
-        )
-
-    # The live working-tree patch sits next to the session log (same stem).
-    src_wip = resume_file.parent / f"{resume_file.stem}.wip.patch"
-    working_patch = src_wip.read_text() if src_wip.is_file() else ""
-
     archive_dir = Path.home() / ".gerbil" / "sessions"
     archive_dir.mkdir(parents=True, exist_ok=True)
     out_dir = project_dir / ".gerbil"
     version = os.environ.get("GERBIL_VERSION", "unknown")
     image = os.environ.get("GERBIL_SANDBOX_IMAGE", "lean-sandbox:latest")
+    patch_dirs = [resume_file.parent, out_dir]  # where ancestor patches may live
 
+    # Resolve the reconstruction plan. For a ralph session, the chain layers on a
+    # host-reachable `chain_base` and `ancestors` rebuild this session's base; for
+    # a single session, its base commit is the anchor and there are no ancestors.
+    ralph = parsed.ralph
+    if ralph:
+        anchor = ralph.get("chain_base") or parsed.base_commit
+        ancestor_names = list(ralph.get("ancestors") or [])
+        start_iter = int(ralph.get("iteration", 1))
+        total_iters = int(ralph.get("total", start_iter))
+    else:
+        anchor = parsed.base_commit
+        ancestor_names = []
+        start_iter = total_iters = 1
+
+    # The anchor must exist in this repo (resume rebuilds the tree from it).
+    if subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "-e", f"{anchor}^{{commit}}"],
+        capture_output=True,
+    ).returncode != 0:
+        sys.exit(
+            f"error: base commit {anchor[:12]} (from {resume_file.name}) is not in "
+            f"{repo_root}.\nResume needs the repository that produced the session, "
+            "with its history intact."
+        )
+
+    # Read the ancestor patches up front so a missing one fails before we boot.
+    ancestor_patches = []
+    for nm in ancestor_names:
+        p = _resolve_patch(nm, patch_dirs)
+        if p is None:
+            sys.exit(
+                f"error: ancestor patch {nm} (needed to rebuild "
+                f"{resume_file.name}) was not found in {archive_dir} or {out_dir}."
+            )
+        ancestor_patches.append(p.read_text())
+
+    # The live working-tree patch sits next to the session log (same stem).
+    src_wip = resume_file.parent / f"{resume_file.stem}.wip.patch"
+    working_patch = src_wip.read_text() if src_wip.is_file() else ""
+
+    # Output naming. Single: "<stem>-resume-<ts>". Ralph: a fresh chain prefix
+    # "<chain>-resume-<ts>" with each session numbered by its original iteration.
     timestamp = datetime.now().strftime("%y%m%d-%H%M%S")
-    name = f"{resume_file.stem}-resume-{timestamp}"
-    session_path = archive_dir / f"{name}.jsonl"
-    patch_path = out_dir / f"{name}.patch"
-    wip_path = archive_dir / f"{name}.wip.patch"
+    chain_stem = re.sub(r"-\d+$", "", resume_file.stem) if ralph else resume_file.stem
+    iwidth = max(2, len(str(total_iters)))
+
+    def out_name(i: int) -> str:
+        if ralph:
+            return f"{chain_stem}-resume-{timestamp}-{i:0{iwidth}d}"
+        return f"{resume_file.stem}-resume-{timestamp}"
 
     if parsed.complete:
         print(style(
@@ -569,75 +643,116 @@ def _resume_run(args) -> None:
                 mcp, mcp_warning = (
                     _start_mcp(sandbox, stack) if args.mcp else (None, None)
                 )
-                toolset = Toolset(sandbox, mcp, ralph=False)
+                toolset = Toolset(sandbox, mcp, ralph=bool(ralph))
 
-                # Recreate the starting world: tree at base, then the crashed
-                # session's uncommitted edits laid back on top.
-                sandbox.checkout_force(base)
-                if working_patch.strip():
-                    try:
-                        sandbox.apply_diff(working_patch)
-                    except Exception as exc:
+                # Rebuild the committed history: reset to the anchor, then replay
+                # each prior-session patch as a commit.
+                sandbox.checkout_force(anchor)
+                if ancestor_patches:
+                    print(style(
+                        f"rebuilding ralph chain on {anchor[:12]}: "
+                        f"replaying {len(ancestor_patches)} prior session(s)", "gray",
+                    ))
+                    for patch_text in ancestor_patches:
+                        sandbox.git_am(patch_text)
+
+                # `ancestors` for the continuation: the original prior patches,
+                # then each session we (re)produce here, so the new logs stay
+                # resumable across the resume boundary.
+                running_ancestors = list(ancestor_names)
+
+                for i in range(start_iter, total_iters + 1):
+                    if ralph:
                         print(
-                            f"{style('warning:', 'bold', 'yellow')} could not apply "
-                            f"the saved working-tree patch ({exc}); continuing from "
-                            "the base commit only.",
-                            file=sys.stderr,
+                            "\n" + style(
+                                f"===== ralph session {i}/{total_iters} "
+                                "(resumed) =====", "bold", "magenta",
+                            ),
+                            flush=True,
                         )
+                    name = out_name(i)
+                    session_path = archive_dir / f"{name}.jsonl"
+                    patch_path = out_dir / f"{name}.patch"
+                    wip_path = archive_dir / f"{name}.wip.patch"
 
-                session = Session(
-                    path=session_path,
-                    model=parsed.model,
-                    project_dir=project_dir,
-                    prompt_file=Path(parsed.prompt_file),
-                    version=version,
-                    base_commit=base,
-                    resumed_from=resume_file.name,
-                )
-                if mcp_warning:
-                    session.record_warning(mcp_warning)
-                # Carry the pre-crash history forward so the new log is complete
-                # (and itself resumable).
-                for ev in parsed.events:
-                    session.record_replayed(ev)
-                print(style(
-                    f"resuming {resume_file.name}: base {base[:12]}, "
-                    f"{len(parsed.events)} events replayed, model {parsed.model}",
-                    "gray",
-                ))
+                    iter_base = sandbox.head()
+                    seeded = i == start_iter  # only the crashed session is replayed
 
-                result = run_session(
-                    sandbox, session, parsed.prompt, parsed.model, toolset,
-                    max_turns=args.max_turns, messages=parsed.messages,
-                    wip_patch_path=wip_path,
-                )
-                session.close()
-                session = None
-                wip_path.unlink(missing_ok=True)
+                    # Lay the crashed session's uncommitted edits back on top.
+                    if seeded and working_patch.strip():
+                        try:
+                            sandbox.apply_diff(working_patch)
+                        except Exception as exc:
+                            print(
+                                f"{style('warning:', 'bold', 'yellow')} could not "
+                                f"apply the saved working-tree patch ({exc}); "
+                                "continuing from the base commit only.",
+                                file=sys.stderr,
+                            )
 
-                if result.commit_message:
+                    ralph_meta = {
+                        "iteration": i, "total": total_iters,
+                        "chain_base": anchor, "ancestors": list(running_ancestors),
+                    } if ralph else None
+                    session = Session(
+                        path=session_path,
+                        model=parsed.model,
+                        project_dir=project_dir,
+                        prompt_file=Path(parsed.prompt_file),
+                        version=version,
+                        base_commit=iter_base,
+                        resumed_from=resume_file.name,
+                        ralph=ralph_meta,
+                    )
+                    if mcp_warning:
+                        session.record_warning(mcp_warning)
+
+                    if seeded:
+                        # Carry the pre-crash history forward so the new log is
+                        # complete (and itself resumable), then continue it.
+                        for ev in parsed.events:
+                            session.record_replayed(ev)
+                        print(style(
+                            f"resuming {resume_file.name}: base {iter_base[:12]}, "
+                            f"{len(parsed.events)} events replayed, "
+                            f"model {parsed.model}", "gray",
+                        ))
+                        seed_messages = parsed.messages
+                    else:
+                        seed_messages = None
+
+                    result = run_session(
+                        sandbox, session, parsed.prompt, parsed.model, toolset,
+                        max_turns=args.max_turns, messages=seed_messages,
+                        wip_patch_path=wip_path,
+                    )
+                    session.close()
+                    session = None
+                    wip_path.unlink(missing_ok=True)
+
                     footer = (
                         "authored by Gerbil:\n"
                         f"--model {parsed.model}\n"
                         f"--resume {resume_file.name}"
                     )
-                    full = result.commit_message + "\n\n" + footer + "\n"
-                    sandbox.commit(full)
+                    if ralph:
+                        footer += f"\n--ralph (session {i}/{total_iters})"
+                    patch_name = _finalize_session(
+                        sandbox, iter_base, result,
+                        session_path=session_path, patch_path=patch_path,
+                        out_dir=out_dir, archive_dir=archive_dir,
+                        include_session=args.include_session, footer=footer,
+                    )
+                    if patch_name and ralph:
+                        running_ancestors.append(patch_name)
 
-                print(f"{style('session:', 'bold')} {session_path}")
-
-                if sandbox.head() != base:
-                    if args.include_session:
-                        sandbox.amend_with_file(
-                            f".gerbil/{session_path.name}", session_path.read_text()
+                    if toolset.ralph_done:
+                        reason = toolset.ralph_done_reason or "task complete"
+                        print(
+                            "\n" + style(f"[ralph_done: {reason}]", "bold", "magenta"),
+                            flush=True,
                         )
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    patch_path.write_text(sandbox.format_patch(base))
-                    if patch_path.exists():
-                        shutil.copy2(patch_path, archive_dir / patch_path.name)
-                    print(f"{style('patch:', 'bold')}   {patch_path} (git am)")
-                else:
-                    print(f"{style('patch:', 'bold')}   (no changes; skipped)")
+                        break
     except Exception as exc:
         if session is not None:
             session.record_error(exc)

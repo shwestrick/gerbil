@@ -120,6 +120,31 @@ def test_thought_signature_roundtrip() -> None:
     check("parser carries signature", call.get("thought_signature") == sig_b64)
 
 
+def test_ralph_metadata() -> None:
+    """A ralph session's chain metadata round-trips through the parser; a plain
+    session reports no ralph metadata."""
+    ralph_start = dict(START)
+    ralph_start["ralph"] = {
+        "iteration": 3, "total": 5, "chain_base": "abc123def456",
+        "ancestors": ["gerbil-x-01.patch", "gerbil-x-02.patch"],
+    }
+    p = write_log([
+        ralph_start, USER,
+        {"event": "turn", "role": "assistant", "content": "work"},
+        {"event": "tool_call", "name": "bash", "args": {"command": "ls"}},
+        {"event": "tool_result", "name": "bash", "result": "ok"},
+    ])
+    ps = parse_session(p)
+    check("ralph metadata present", ps.ralph is not None)
+    check("ralph iteration", ps.ralph["iteration"] == 3)
+    check("ralph total", ps.ralph["total"] == 5)
+    check("ralph chain_base", ps.ralph["chain_base"] == "abc123def456")
+    check("ralph ancestors", ps.ralph["ancestors"] == ["gerbil-x-01.patch", "gerbil-x-02.patch"])
+
+    plain = parse_session(write_log([START, USER]))
+    check("non-ralph has no metadata", plain.ralph is None)
+
+
 def test_missing_session_start() -> None:
     p = write_log([USER])
     try:
@@ -134,6 +159,7 @@ def main() -> None:
     test_dangling_tool_call()
     test_already_complete()
     test_thought_signature_roundtrip()
+    test_ralph_metadata()
     test_missing_session_start()
     print("\nAll resume parser tests passed.")
 

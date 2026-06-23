@@ -35,6 +35,7 @@ class ParsedSession:
     messages: list = field(default_factory=list)
     events: list = field(default_factory=list)  # turn/tool_call/tool_result, to replay
     complete: bool = False  # the convo already ended on the model (nothing pending)
+    ralph: dict | None = None  # {iteration, total, chain_base, ancestors} in --ralph
 
 
 def _load_events(path: Path) -> list[dict]:
@@ -173,4 +174,5 @@ def parse_session(path: Path) -> ParsedSession:
         messages=messages,
         events=replay,
         complete=complete,
+        ralph=start.get("ralph"),
     )

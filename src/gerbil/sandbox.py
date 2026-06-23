@@ -278,6 +278,24 @@ class LeanSandbox:
             raise RuntimeError(f"git commit failed:\n{result.stderr}")
         return True
 
+    def git_am(self, patch_text: str) -> None:
+        """Apply a format-patch (mbox) as a commit via `git am` -- the same way
+        the host `gerbil apply` does. Used by --resume to replay a ralph chain's
+        prior-session patches in order, rebuilding the committed history a
+        mid-chain session started from. The patch is piped in base64-encoded to
+        sidestep shell-quoting hazards. Aborts and raises on failure."""
+        if not patch_text.strip():
+            return
+        import base64
+
+        b64 = base64.b64encode(patch_text.encode()).decode()
+        result = self.run(
+            f"printf %s {_quote(b64)} | base64 -d | git am", timeout=180.0
+        )
+        if result.exit_code != 0:
+            self.run("git am --abort")
+            raise RuntimeError(f"git am failed:\n{result.stderr or result.stdout}")
+
     def format_patch(self, base: str) -> str:
         """Return an mbox patch (title + message + diff) for every commit in
         base..HEAD, as produced by `git format-patch`. Apply on the host with

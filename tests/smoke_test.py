@@ -112,6 +112,39 @@ def main() -> None:
             check("resume: apply_diff restores new file",
                   sb.read_file("Sub/New.lean") == "theorem t : True := trivial\n")
 
+            # 11. ralph-resume plumbing: a chain rebuilds from a host-reachable
+            # base by replaying each prior session's format-patch via git_am --
+            # exactly how `--resume` reconstructs a mid-chain session's base.
+            sb.commit("chain base")
+            chain_base = sb.head()
+
+            sb.write_file("Hello.lean", "def hello := 100\n")  # "session 1"
+            sb.commit("c1")
+            patch1 = sb.format_patch(chain_base)
+            mid = sb.head()
+
+            sb.write_file("Two.lean", "def two := 2\n")          # "session 2"
+            sb.commit("c2")
+            patch2 = sb.format_patch(mid)
+            orig_tree = sb.run("git rev-parse HEAD^{tree}").stdout.strip()
+
+            sb.checkout_force(chain_base)
+            check("ralph: rolled back to chain base",
+                  sb.read_file("Hello.lean") == "def hello := 42\n"
+                  and sb.run("test -f Two.lean").exit_code != 0)
+
+            sb.git_am(patch1)
+            sb.git_am(patch2)
+            check("ralph: git_am replays session 1",
+                  sb.read_file("Hello.lean") == "def hello := 100\n")
+            check("ralph: git_am replays session 2",
+                  sb.read_file("Two.lean") == "def two := 2\n")
+            # The replayed history reproduces the exact tree (commit shas differ,
+            # which is fine -- gerbil format-patches the tree, not the shas).
+            replayed_tree = sb.run("git rev-parse HEAD^{tree}").stdout.strip()
+            check("ralph: replayed tree matches original",
+                  replayed_tree == orig_tree, f"{replayed_tree} != {orig_tree}")
+
     # Lake project in a subdirectory of the repo (not the repo root).
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
