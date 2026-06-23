@@ -13,9 +13,13 @@ from gerbil import tools
 from gerbil.sandbox import LeanSandbox
 
 
-def make_project(root: Path) -> None:
-    (root / "Hello.lean").write_text("def hello := 1\n")
-    (root / "README.md").write_text("# test project\n")
+def make_project(root: Path, subdir: str = "") -> Path:
+    """Create a git repo at `root` with a (tiny) Lake-ish project at root/subdir.
+    Returns the project directory. When subdir is "", the project is the repo root."""
+    proj = root / subdir if subdir else root
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / "Hello.lean").write_text("def hello := 1\n")
+    (root / "README.md").write_text("# test repo\n")
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "add", "-A"], cwd=root, check=True)
     subprocess.run(
@@ -23,6 +27,7 @@ def make_project(root: Path) -> None:
         cwd=root,
         check=True,
     )
+    return proj
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
@@ -85,6 +90,26 @@ def main() -> None:
             diff = sb.get_diff()
             check("diff shows edit", "def hello := 42" in diff, diff)
             check("diff shows new file", "Sub/New.lean" in diff, diff)
+
+    # Lake project in a subdirectory of the repo (not the repo root).
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        proj = make_project(root, subdir="lean/proof")
+
+        with LeanSandbox(project_dir=proj, repo_root=root) as sb:
+            # file ops are relative to the Lake project (the subdir)
+            r = sb.read_file("Hello.lean")
+            check("subdir: read project file", r == "def hello := 1\n", repr(r))
+
+            # the rest of the repo came along (uploaded from repo root)
+            r = sb.run("cat /workspace/project/README.md")
+            check("subdir: repo root uploaded", "# test repo" in r.stdout, repr(r.stdout))
+
+            # edits + diff still work; diff paths are relative to the repo root
+            sb.write_file("Hello.lean", "def hello := 99\n")
+            diff = sb.get_diff()
+            check("subdir: diff shows edit", "def hello := 99" in diff, diff)
+            check("subdir: diff path under subdir", "lean/proof/Hello.lean" in diff, diff)
 
     print("\nAll smoke tests passed.")
 

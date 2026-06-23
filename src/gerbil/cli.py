@@ -53,10 +53,11 @@ def _resolve_at(at: str | None) -> Path:
     return Path(base).resolve()
 
 
-def _require_git_repo(project_dir: Path) -> None:
-    """Exit with a clear message unless project_dir is the root of a git repo.
-    gerbil works on the real repository (uploads .git, commits, format-patch),
-    so the Lake project must be a git repo, and we operate from its root."""
+def _require_git_repo(project_dir: Path) -> Path:
+    """Exit with a clear message unless project_dir is inside a git repo, and
+    return the repo's toplevel directory. gerbil works on the real repository
+    (uploads .git, commits, format-patch); the Lake project may live anywhere
+    inside it, not just at the root."""
     result = subprocess.run(
         ["git", "-C", str(project_dir), "rev-parse", "--show-toplevel"],
         capture_output=True,
@@ -64,16 +65,11 @@ def _require_git_repo(project_dir: Path) -> None:
     )
     if result.returncode != 0:
         sys.exit(
-            f"error: {project_dir} is not a git repository.\n"
-            "gerbil needs the Lake project to be a git repo -- run `git init` "
-            "(and make a commit) there first."
+            f"error: {project_dir} is not inside a git repository.\n"
+            "gerbil needs the Lake project to live in a git repo -- run "
+            "`git init` (and make a commit) first."
         )
     toplevel = Path(result.stdout.strip()).resolve()
-    if toplevel != project_dir:
-        sys.exit(
-            f"error: {project_dir} is inside a git repo but not its root.\n"
-            f"Run gerbil from the project root instead: {toplevel}"
-        )
     # Require at least one commit. A freshly `git init`'d repo (e.g. what
     # `lake new` leaves behind) has no HEAD, so gerbil has no base to diff
     # against and would silently produce an empty patch.
@@ -84,10 +80,11 @@ def _require_git_repo(project_dir: Path) -> None:
     )
     if head.returncode != 0:
         sys.exit(
-            f"error: the git repo at {project_dir} has no commits yet.\n"
+            f"error: the git repo at {toplevel} has no commits yet.\n"
             "gerbil works against a base commit -- make an initial commit first:\n"
             "  git add -A && git commit -m 'initial commit'"
         )
+    return toplevel
 
 
 def _require_lake_project(project_dir: Path) -> None:
@@ -102,19 +99,20 @@ def _require_lake_project(project_dir: Path) -> None:
         )
 
 
-def _require_clean_worktree(project_dir: Path) -> None:
+def _require_clean_worktree(repo_root: Path) -> None:
     """Exit unless the working tree is clean. gerbil runs on top of a clean
     commit -- it uploads only tracked files (== HEAD) and commits the agent's
     changes on top. Uncommitted changes to tracked files would otherwise be
-    swept into the agent's commit. Untracked files are ignored (not uploaded)."""
+    swept into the agent's commit. Untracked files are ignored (not uploaded).
+    Checked across the whole repo, since gerbil uploads and commits the repo."""
     dirty = subprocess.run(
-        ["git", "-C", str(project_dir), "status", "--porcelain", "--untracked-files=no"],
+        ["git", "-C", str(repo_root), "status", "--porcelain", "--untracked-files=no"],
         capture_output=True,
         text=True,
     ).stdout.strip()
     if dirty:
         sys.exit(
-            f"error: {project_dir} has uncommitted changes.\n"
+            f"error: {repo_root} has uncommitted changes.\n"
             "gerbil runs on top of a clean commit. Commit or stash them first:\n"
             "  git stash       # then re-run gerbil, and `git stash pop` after"
         )
@@ -231,11 +229,11 @@ def main() -> None:
     args.func(args)
 
 
-def _patch_id(project_dir: Path, text: str) -> str | None:
+def _patch_id(repo_dir: Path, text: str) -> str | None:
     """The (stable) patch-id of a diff/format-patch -- a content hash that is
     independent of commit hash, line offsets, and surrounding commits."""
     out = subprocess.run(
-        ["git", "-C", str(project_dir), "patch-id", "--stable"],
+        ["git", "-C", str(repo_dir), "patch-id", "--stable"],
         input=text,
         capture_output=True,
         text=True,
@@ -243,16 +241,16 @@ def _patch_id(project_dir: Path, text: str) -> str | None:
     return out[0] if out else None
 
 
-def _committed_patch_ids(project_dir: Path) -> set[str]:
+def _committed_patch_ids(repo_dir: Path) -> set[str]:
     """Patch-ids of every commit reachable from HEAD, to detect patches that have
     already been applied (regardless of later commits that touched the area)."""
     log = subprocess.run(
-        ["git", "-C", str(project_dir), "log", "-p", "--no-color"],
+        ["git", "-C", str(repo_dir), "log", "-p", "--no-color"],
         capture_output=True,
         text=True,
     ).stdout
     out = subprocess.run(
-        ["git", "-C", str(project_dir), "patch-id", "--stable"],
+        ["git", "-C", str(repo_dir), "patch-id", "--stable"],
         input=log,
         capture_output=True,
         text=True,
@@ -260,10 +258,11 @@ def _committed_patch_ids(project_dir: Path) -> set[str]:
     return {line.split()[0] for line in out.splitlines() if line.split()}
 
 
-def _patch_applies(project_dir: Path, patch: Path) -> bool:
-    """Whether `patch` applies cleanly to the current tree."""
+def _patch_applies(repo_dir: Path, patch: Path) -> bool:
+    """Whether `patch` applies cleanly to the current tree. Run from the repo
+    root, since format-patch paths are relative to it."""
     return subprocess.run(
-        ["git", "-C", str(project_dir), "apply", "--check", str(patch)],
+        ["git", "-C", str(repo_dir), "apply", "--check", str(patch)],
         capture_output=True,
     ).returncode == 0
 
@@ -277,24 +276,26 @@ def cmd_apply(args) -> None:
     project_dir = _resolve_at(args.at)
     if not project_dir.is_dir():
         sys.exit(f"error: {project_dir} is not a directory")
-    _require_git_repo(project_dir)
+    repo_root = _require_git_repo(project_dir)
     _require_lake_project(project_dir)
 
+    # Patches are stored next to the Lake project, but their paths are relative to
+    # the repo root, so all git operations run from there.
     out_dir = project_dir / ".gerbil"
     patches = sorted(out_dir.glob("gerbil-*.patch"))
     if not patches:
         sys.exit(f"no patches found in {out_dir}")
 
-    committed = _committed_patch_ids(project_dir)
+    committed = _committed_patch_ids(repo_root)
     applied = already = stale = 0
     for patch in patches:
-        pid = _patch_id(project_dir, patch.read_text())
+        pid = _patch_id(repo_root, patch.read_text())
         if pid and pid in committed:
             print(f"{style('skip:', 'bold', 'gray')}     {patch.name} (already applied)")
             already += 1
-        elif _patch_applies(project_dir, patch):
+        elif _patch_applies(repo_root, patch):
             print(f"{style('applying:', 'bold')} {patch.name}")
-            result = subprocess.run(["git", "am", str(patch)], cwd=project_dir)
+            result = subprocess.run(["git", "am", str(patch)], cwd=repo_root)
             if result.returncode != 0:
                 sys.exit(
                     f"git am failed on {patch.name}. Resolve and `git am --continue`, "
@@ -326,9 +327,9 @@ def cmd_run(args) -> None:
 
     if not project_dir.is_dir():
         sys.exit(f"error: {project_dir} is not a directory")
-    _require_git_repo(project_dir)
+    repo_root = _require_git_repo(project_dir)
     _require_lake_project(project_dir)
-    _require_clean_worktree(project_dir)
+    _require_clean_worktree(repo_root)
     _require_docker()
     if not prompt_file.is_file():
         sys.exit(f"error: {prompt_file} is not a file")
@@ -363,7 +364,8 @@ def cmd_run(args) -> None:
     session = None  # the in-flight session, for the error handler below
     try:
         with LeanSandbox(
-            project_dir=project_dir, image=image, fetch_cache=not args.skip_cache
+            project_dir=project_dir, repo_root=repo_root, image=image,
+            fetch_cache=not args.skip_cache,
         ) as sandbox:
             # The MCP server runs inside the container, so it must be started
             # after the sandbox is ready and torn down before it (ExitStack
@@ -471,7 +473,7 @@ def _start_mcp(sandbox, stack):
     try:
         from .mcp_client import McpClient
 
-        mcp = stack.enter_context(McpClient(sandbox))
+        mcp = stack.enter_context(McpClient(sandbox, project_path=sandbox.project_path))
         print(
             style(f"[mcp: {len(mcp.list_tools())} lean tools available]", "gray"),
             flush=True,

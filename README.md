@@ -36,15 +36,17 @@ $ gerbil update       # update to the latest commit on main (+ rebuild the image
 
 ### Run a session
 
-Run from inside your Lake project (a git repo); `--at` defaults to the current
-directory. Use `--prompt FILE` for the task.
+Run from your Lake project's root; `--at` defaults to the current directory. The
+Lake project must live inside a git repo, but need not be the repo root — it can
+be a subdirectory. Use `--prompt FILE` for the task.
 ```bash
 $ cd my/lake/project
 $ gerbil run --prompt prompt.md
 ```
 
 gerbil runs on top of a **clean commit**: the working tree must have no
-uncommitted changes to tracked files (`git stash` them first if needed).
+uncommitted changes to tracked files anywhere in the repo (`git stash` them
+first if needed).
 Untracked files (like your `prompt.md`) are left alone — they aren't uploaded
 into the sandbox.
 

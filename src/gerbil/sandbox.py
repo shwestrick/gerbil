@@ -33,13 +33,18 @@ class LeanSandbox:
     Isolation is provided entirely by Docker. We talk to the container directly
     via the Docker SDK: exec_run for commands, put_archive/cat for file I/O.
 
+    The Lake project need not be the git repo root: we upload the whole repo
+    (rooted at repo_root) into WORKSPACE_DIR, and operate on the Lake project at
+    WORKSPACE_DIR/<subdir>, where subdir is project_dir relative to repo_root.
+
     At startup:
-      - Uploads all git-tracked files from project_dir into the container.
-      - Makes an initial git commit so get_diff() can produce a clean patch.
+      - Uploads all git-tracked files from repo_root into the container, plus the
+        .git directory (full history, for format-patch and past-commit lookups).
+      - Configures a committer identity so gerbil can commit the agent's work.
       - Runs lake exe cache get to fetch precompiled mathlib oleans.
 
     Usage:
-        with LeanSandbox(project_dir="/path/to/lean-project") as sandbox:
+        with LeanSandbox(project_dir="/repo/sub/lean-project") as sandbox:
             sandbox.write_file("MyProof.lean", content)
             result = sandbox.lake_build()
             diff = sandbox.get_diff()
@@ -50,12 +55,24 @@ class LeanSandbox:
         project_dir: str | Path,
         image: str = "lean-sandbox:latest",
         fetch_cache: bool = True,
+        repo_root: str | Path | None = None,
     ):
         self.project_dir = Path(project_dir).resolve()
+        self.repo_root = Path(repo_root).resolve() if repo_root else self.project_dir
+        # The Lake project's path relative to the repo root ("" when they coincide).
+        rel = self.project_dir.relative_to(self.repo_root).as_posix()
+        self._subdir = "" if rel == "." else rel
         self.image = image
         self.fetch_cache = fetch_cache
         self._docker = docker.from_env()
         self._container = None
+
+    @property
+    def project_path(self) -> str:
+        """Container path of the Lake project root: WORKSPACE_DIR (the repo root)
+        or a subdirectory of it. All Lake/agent/MCP operations run here; git
+        commands work too, since git resolves .git up the tree."""
+        return posixpath.join(WORKSPACE_DIR, self._subdir) if self._subdir else WORKSPACE_DIR
 
     def __enter__(self) -> "LeanSandbox":
         self._container = self._docker.containers.run(
@@ -101,12 +118,13 @@ class LeanSandbox:
     def _upload_project(self) -> None:
         """Upload the real repository into the container: the .git directory (full
         history, so the agent can refer to past commits) plus the tracked files.
-        The working tree is required to be clean (see the CLI preflight), so the
+        Rooted at repo_root, which may be an ancestor of the Lake project. The
+        working tree is required to be clean (see the CLI preflight), so the
         tracked files match HEAD and no untracked files are uploaded -- the agent
         commits on top of a clean, known baseline."""
         out = subprocess.run(
             ["git", "ls-files", "-z"],
-            cwd=self.project_dir,
+            cwd=self.repo_root,
             capture_output=True,
             check=True,
         ).stdout
@@ -115,10 +133,10 @@ class LeanSandbox:
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
             for rel in rels:
-                local = self.project_dir / rel
+                local = self.repo_root / rel
                 if local.is_file():
                     tar.add(local, arcname=rel, filter=_own_by_sandbox)
-            gitdir = self.project_dir / ".git"
+            gitdir = self.repo_root / ".git"
             if gitdir.is_dir():
                 tar.add(gitdir, arcname=".git", filter=_own_by_sandbox)
         buf.seek(0)
@@ -154,7 +172,7 @@ class LeanSandbox:
     def write_file(self, path: str, content: str) -> None:
         """Write (or overwrite) a file in the sandbox. Path is relative to the
         project dir; parent directories are created as needed."""
-        abs_path = posixpath.join(WORKSPACE_DIR, path)
+        abs_path = posixpath.join(self.project_path, path)
         parent = posixpath.dirname(abs_path)
         self.run(f"mkdir -p {_quote(parent)}")
 
@@ -178,7 +196,7 @@ class LeanSandbox:
         """Run a shell command in the sandbox workspace directory."""
         wrapped = ["timeout", str(int(timeout)), "bash", "-c", command]
         exit_code, (stdout, stderr) = self._container.exec_run(
-            wrapped, workdir=WORKSPACE_DIR, demux=True
+            wrapped, workdir=self.project_path, demux=True
         )
         return CommandResult(
             command=command,
