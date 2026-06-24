@@ -158,6 +158,22 @@ def test_ralph_done_script_roundtrip() -> None:
     check("no ralph_done script when unused", plain.ralph_done_script is None)
 
 
+def test_include_session_roundtrip() -> None:
+    """--include-session is recovered from the log so a resume inherits it.
+    Defaults to False for an absent field (older logs / runs without the flag)."""
+    on = dict(START)
+    on["include_session"] = True
+    check("include_session recovered", parse_session(write_log([on, USER])).include_session is True)
+
+    off = dict(START)
+    off["include_session"] = False
+    check("include_session false honored", parse_session(write_log([off, USER])).include_session is False)
+
+    # An older log without the field parses as False (no crash).
+    check("include_session defaults False when absent",
+          parse_session(write_log([START, USER])).include_session is False)
+
+
 def test_commit_message_extraction() -> None:
     """The generated commit message is recovered from the commit-message
     exchange; empty when the session crashed before that phase."""
@@ -197,6 +213,7 @@ def main() -> None:
     test_thought_signature_roundtrip()
     test_ralph_metadata()
     test_ralph_done_script_roundtrip()
+    test_include_session_roundtrip()
     test_commit_message_extraction()
     test_missing_session_start()
     print("\nAll resume parser tests passed.")

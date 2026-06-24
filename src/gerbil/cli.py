@@ -271,8 +271,8 @@ def main() -> None:
     resume_p.add_argument(
         "--include-session",
         action="store_true",
-        help="Include the session .jsonl log in the commit (folded in via "
-        "commit --amend before the patch is produced).",
+        help="Include the session .jsonl log in the commit. Inherited from the "
+        "resumed session's log if it used --include-session; this flag forces it on.",
     )
     resume_p.set_defaults(func=cmd_resume)
 
@@ -758,6 +758,7 @@ def cmd_run(args) -> None:
                         base_commit=session_base,
                         ralph=ralph_meta,
                         ralph_done_script=ralph_done_script,
+                        include_session=args.include_session,
                     )
                     if mcp_warning:
                         session.record_warning(mcp_warning)
@@ -926,6 +927,13 @@ def cmd_resume(args) -> None:
         print(style(
             f"using --ralph_done check recorded in {resume_file.name}", "gray",
         ), flush=True)
+    # --include-session survives a resume: inherit the setting recorded in the log,
+    # and let `gerbil resume --include-session` still force it on.
+    include_session = parsed.include_session or args.include_session
+    if parsed.include_session and not args.include_session:
+        print(style(
+            f"using --include-session recorded in {resume_file.name}", "gray",
+        ), flush=True)
     anchor, ancestor_patches = _reconstruct_anchor(
         parsed, resume_file, repo_root, patch_dirs
     )
@@ -1023,6 +1031,7 @@ def cmd_resume(args) -> None:
                         resumed_from=resume_file.name,
                         ralph=ralph_meta,
                         ralph_done_script=ralph_done_script,
+                        include_session=include_session,
                     )
                     if mcp_warning:
                         session.record_warning(mcp_warning)
@@ -1061,7 +1070,7 @@ def cmd_resume(args) -> None:
                         sandbox, iter_base, result,
                         session_path=session_path, patch_path=patch_path,
                         out_dir=out_dir, archive_dir=archive_dir,
-                        include_session=args.include_session, footer=footer,
+                        include_session=include_session, footer=footer,
                     )
                     if patch_name and ralph:
                         running_ancestors.append(patch_name)

@@ -229,6 +229,10 @@ that's required -- including across a resume-of-a-resume. If the chain used a
 chain keeps the same termination check automatically (pass `--ralph_done` again
 to override it).
 
+`--include-session` is likewise inherited: if the resumed session's run recorded
+it, the continuation also folds its log into the commit (pass `--include-session`
+to force it on).
+
 Resume needs the same repository that produced the session, with the base
 commit still in its history.
 
