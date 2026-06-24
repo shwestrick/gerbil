@@ -564,11 +564,13 @@ def run_session(
         )
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
+        total.thinking_tokens += usage.thinking_tokens
         last_usage = usage
 
         messages.append({"role": "assistant", "content": assistant_parts})
         session.record_turn(
-            "assistant", final_text, usage.input_tokens, usage.output_tokens
+            "assistant", final_text, usage.input_tokens, usage.output_tokens,
+            usage.thinking_tokens,
         )
 
         # No tool calls => the model is done with the task.
@@ -647,11 +649,13 @@ def run_session(
         )
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
+        total.thinking_tokens += usage.thinking_tokens
         last_usage = usage
 
         messages.append({"role": "assistant", "content": parts})
         session.record_turn(
-            "assistant", text, usage.input_tokens, usage.output_tokens
+            "assistant", text, usage.input_tokens, usage.output_tokens,
+            usage.thinking_tokens,
         )
         commit_message = text.strip()
         print(flush=True)
@@ -685,9 +689,13 @@ def _print_usage(model: str, turns: int, usage: Usage) -> None:
     price_in, price_out = MODEL_PRICING.get(model, DEFAULT_PRICING)
     cost = (usage.input_tokens * price_in + usage.output_tokens * price_out) / 1_000_000
     total = usage.input_tokens + usage.output_tokens
+    # thinking_tokens is a subset of output_tokens, so show it as a breakdown.
+    out = f"out: {usage.output_tokens:,}"
+    if usage.thinking_tokens:
+        out += f" incl. {usage.thinking_tokens:,} thinking"
     line = (
         f"--- {turns} turns, {total:,} tokens "
-        f"(in: {usage.input_tokens:,}, out: {usage.output_tokens:,}), "
+        f"(in: {usage.input_tokens:,}, {out}), "
         f"~${cost:.4f} ---"
     )
     print("\n" + style(line, "bold"), flush=True)

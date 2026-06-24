@@ -64,6 +64,11 @@ def get_context_window(model: str, provider: str | None = None) -> int | None:
 class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
+    # Reasoning/thinking tokens. A SUBSET of output_tokens (which stays the
+    # inclusive, output-rate-billed total) -- tracked separately for reporting.
+    # Populated only for providers/models that expose the breakdown; 0 otherwise,
+    # in which case any thinking is silently folded into output_tokens.
+    thinking_tokens: int = 0
 
 
 @dataclass
@@ -187,8 +192,19 @@ def _stream_gemini(model, system, messages, tools):
     usage = Usage()
     for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
         if chunk.usage_metadata:
-            usage.input_tokens = chunk.usage_metadata.prompt_token_count or 0
-            usage.output_tokens = chunk.usage_metadata.candidates_token_count or 0
+            um = chunk.usage_metadata
+            usage.input_tokens = um.prompt_token_count or 0
+            # Gemini reports thinking tokens SEPARATELY from the visible output:
+            # total = prompt + candidates + tool_use_prompt + thoughts, so
+            # candidates_token_count does NOT include them. Thinking tokens bill at
+            # the output rate, so fold them into output_tokens (keeping that the
+            # inclusive total) and record the breakdown in thinking_tokens --
+            # otherwise a thinking model (e.g. the default gemini-*-pro)
+            # undercounts cost.
+            usage.thinking_tokens = um.thoughts_token_count or 0
+            usage.output_tokens = (
+                (um.candidates_token_count or 0) + usage.thinking_tokens
+            )
         if not chunk.candidates:
             continue
         # A final chunk may carry only a finish reason / usage, with no content.
@@ -291,7 +307,15 @@ def _stream_anthropic(model, system, messages, tools):
                     current_tool_id = None
             elif event.type == "message_delta":
                 if hasattr(event, "usage") and event.usage:
+                    # output_tokens is the inclusive billing total -- extended
+                    # thinking tokens are already counted in it; the details
+                    # object breaks out the thinking subset (when present).
                     usage.output_tokens = event.usage.output_tokens
+                    details = getattr(event.usage, "output_tokens_details", None)
+                    if details is not None:
+                        usage.thinking_tokens = (
+                            getattr(details, "thinking_tokens", 0) or 0
+                        )
             elif event.type == "message_start":
                 if hasattr(event.message, "usage") and event.message.usage:
                     usage.input_tokens = event.message.usage.input_tokens
@@ -376,7 +400,12 @@ def _stream_openai(model, system, messages, tools):
     for chunk in response:
         if chunk.usage:
             usage.input_tokens = chunk.usage.prompt_tokens or 0
+            # completion_tokens already includes reasoning tokens (they are a
+            # breakdown of it, billed at the output rate); surface that subset.
             usage.output_tokens = chunk.usage.completion_tokens or 0
+            details = getattr(chunk.usage, "completion_tokens_details", None)
+            if details is not None:
+                usage.thinking_tokens = getattr(details, "reasoning_tokens", 0) or 0
 
         if not chunk.choices:
             continue
@@ -506,6 +535,12 @@ def _stream_openai_responses(model, system, messages, tools):
             u = getattr(resp, "usage", None) if resp is not None else None
             if u is not None:
                 usage.input_tokens = getattr(u, "input_tokens", 0) or 0
+                # output_tokens already includes reasoning tokens (a breakdown of
+                # it), so it is the correct output-rate total for these models;
+                # surface the reasoning subset from the details breakdown.
                 usage.output_tokens = getattr(u, "output_tokens", 0) or 0
+                details = getattr(u, "output_tokens_details", None)
+                if details is not None:
+                    usage.thinking_tokens = getattr(details, "reasoning_tokens", 0) or 0
 
     yield Done(usage)

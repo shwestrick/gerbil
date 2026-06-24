@@ -154,14 +154,22 @@ $ gerbil summarize
 gerbil summary -- 28 session(s) in /path/to/project/.gerbil
 
 Tokens
-  input:   141,094,502
-  output:      367,974
-  total:   141,462,476
+  input:     141,094,502
+  output:        367,974
+  thinking:      201,830  (of output)
+  total:     141,462,476
 
 Estimated cost
   ~$180.0479
 ...
 ```
+
+`thinking` is the reasoning/thinking-token portion of `output` (broken out for
+the models that report it -- e.g. Gemini's "thoughts", OpenAI's reasoning
+tokens). Thinking tokens bill at the output rate and are already included in
+`output` (and in the cost), so they are shown as a sub-total, not added on top.
+For models that don't expose the breakdown, thinking is silently counted within
+`output`.
 
 Session logs are only included in the project `.gerbil/` when
 `gerbil run --include-session` is used; otherwise they live in

@@ -47,6 +47,7 @@ class Session:
         self.ralph_done_script = ralph_done_script
         self._total_input_tokens = 0
         self._total_output_tokens = 0
+        self._total_thinking_tokens = 0
 
         # base_commit anchors the git state this session starts from -- the HEAD
         # the agent's changes are layered on top of. It is what `--resume` checks
@@ -82,15 +83,23 @@ class Session:
         content: str,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        thinking_tokens: int = 0,
     ) -> None:
         self._total_input_tokens += input_tokens
         self._total_output_tokens += output_tokens
+        self._total_thinking_tokens += thinking_tokens
+        # thinking_tokens is a subset of output_tokens (the inclusive,
+        # output-rate-billed total), recorded for reporting.
         self._append({
             "event": "turn",
             "timestamp": _now(),
             "role": role,
             "content": content,
-            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "thinking_tokens": thinking_tokens,
+            },
         })
 
     def record_tool_call(
@@ -127,6 +136,7 @@ class Session:
             "total_usage": {
                 "input_tokens": self._total_input_tokens,
                 "output_tokens": self._total_output_tokens,
+                "thinking_tokens": self._total_thinking_tokens,
             },
         })
 
@@ -163,6 +173,7 @@ class Session:
             "total_usage": {
                 "input_tokens": self._total_input_tokens,
                 "output_tokens": self._total_output_tokens,
+                "thinking_tokens": self._total_thinking_tokens,
             },
         })
 

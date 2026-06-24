@@ -424,11 +424,12 @@ def _scan_session(path: Path) -> dict:
     prior log by --resume) are skipped so a resumed chain isn't double-counted --
     this mirrors how Session accumulates totals only from live turns.
 
-    Returns: {model, input_tokens, output_tokens, turns, tool_calls (Counter),
-    status} where status is 'completed' | 'errored' | 'incomplete'. A garbled log
-    yields a sentinel with status 'unreadable' and zero usage."""
+    Returns: {model, input_tokens, output_tokens, thinking_tokens, turns,
+    tool_calls (Counter), status} where status is 'completed' | 'errored' |
+    'incomplete', and thinking_tokens is the reasoning subset of output_tokens. A
+    garbled log yields a sentinel with status 'unreadable' and zero usage."""
     model = "unknown"
-    input_tokens = output_tokens = turns = 0
+    input_tokens = output_tokens = thinking_tokens = turns = 0
     tool_calls: collections.Counter = collections.Counter()
     status = "incomplete"  # no session_end/error recorded => crashed mid-run
 
@@ -436,7 +437,8 @@ def _scan_session(path: Path) -> dict:
         lines = path.read_text().splitlines()
     except OSError:
         return {"model": model, "input_tokens": 0, "output_tokens": 0,
-                "turns": 0, "tool_calls": tool_calls, "status": "unreadable"}
+                "thinking_tokens": 0, "turns": 0, "tool_calls": tool_calls,
+                "status": "unreadable"}
 
     for line in lines:
         line = line.strip()
@@ -457,6 +459,7 @@ def _scan_session(path: Path) -> dict:
             usage = e.get("usage") or {}
             input_tokens += usage.get("input_tokens", 0)
             output_tokens += usage.get("output_tokens", 0)
+            thinking_tokens += usage.get("thinking_tokens", 0)
             turns += 1
         elif event == "tool_call":
             tool_calls[e.get("name", "?")] += 1
@@ -466,8 +469,8 @@ def _scan_session(path: Path) -> dict:
             status = "errored"
 
     return {"model": model, "input_tokens": input_tokens,
-            "output_tokens": output_tokens, "turns": turns,
-            "tool_calls": tool_calls, "status": status}
+            "output_tokens": output_tokens, "thinking_tokens": thinking_tokens,
+            "turns": turns, "tool_calls": tool_calls, "status": status}
 
 
 def _cost(model: str, input_tokens: int, output_tokens: int) -> float:
@@ -501,6 +504,7 @@ def cmd_summarize(args) -> None:
 
     total_in = sum(s["input_tokens"] for s in stats)
     total_out = sum(s["output_tokens"] for s in stats)
+    total_thinking = sum(s["thinking_tokens"] for s in stats)
     total_turns = sum(s["turns"] for s in stats)
     total_cost = sum(
         _cost(s["model"], s["input_tokens"], s["output_tokens"]) for s in stats
@@ -516,11 +520,13 @@ def cmd_summarize(args) -> None:
     by_model: dict[str, dict] = {}
     for s in stats:
         m = by_model.setdefault(
-            s["model"], {"sessions": 0, "input": 0, "output": 0, "cost": 0.0}
+            s["model"],
+            {"sessions": 0, "input": 0, "output": 0, "thinking": 0, "cost": 0.0},
         )
         m["sessions"] += 1
         m["input"] += s["input_tokens"]
         m["output"] += s["output_tokens"]
+        m["thinking"] += s["thinking_tokens"]
         m["cost"] += _cost(s["model"], s["input_tokens"], s["output_tokens"])
 
     bold = lambda t: style(t, "bold")
@@ -528,9 +534,13 @@ def cmd_summarize(args) -> None:
     print()
 
     print(bold("Tokens"))
-    print(f"  input:  {total_in:>12,}")
-    print(f"  output: {total_out:>12,}")
-    print(f"  total:  {total_in + total_out:>12,}")
+    print(f"  input:    {total_in:>12,}")
+    print(f"  output:   {total_out:>12,}")
+    # thinking is a subset of output (billed at the output rate), so list it as a
+    # breakdown beneath output rather than adding it into the total.
+    if total_thinking:
+        print(f"  thinking: {total_thinking:>12,}  {style('(of output)', 'gray')}")
+    print(f"  total:    {total_in + total_out:>12,}")
     print()
 
     print(bold("Estimated cost"))
@@ -560,10 +570,13 @@ def cmd_summarize(args) -> None:
     print(bold("By model"))
     for model, m in sorted(by_model.items(), key=lambda kv: -kv[1]["cost"]):
         known = "" if model in MODEL_PRICING else style(" (est. pricing)", "gray")
+        thinking = (
+            style(f" ({m['thinking']:,} thinking)", "gray") if m["thinking"] else ""
+        )
         print(
             f"  {style(model, 'cyan')}{known}: "
             f"{m['sessions']} session(s), "
-            f"{m['input'] + m['output']:,} tokens, ~${m['cost']:,.4f}"
+            f"{m['input'] + m['output']:,} tokens{thinking}, ~${m['cost']:,.4f}"
         )
 
 
