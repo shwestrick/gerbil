@@ -522,6 +522,9 @@ def run_session(
     turn = 0
     final_text = ""
     stopped_at_max = False
+    # The most recent turn's usage, shown in the next turn's header so it reflects
+    # how full the context is *entering* the turn. None until the first turn lands.
+    last_usage: Usage | None = None
 
     # In a ralph loop, tag every turn header with the session counter so it stays
     # visible while scrolling, not just in the once-per-session banner.
@@ -548,22 +551,20 @@ def run_session(
             break
         turn += 1
 
-        print(
-            "\n" + style(f"--- {ralph_tag}turn {turn} ---", "bold", "dark_red"),
-            flush=True,
-        )
+        header = style(f"--- {ralph_tag}turn {turn} ---", "bold", "dark_red")
+        print("\n" + header + _context_suffix(max_context, last_usage), flush=True)
 
         assistant_parts, tool_calls, final_text, usage = _run_turn(
             model, system, messages, tools, provider, sandbox.read_file
         )
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
+        last_usage = usage
 
         messages.append({"role": "assistant", "content": assistant_parts})
         session.record_turn(
             "assistant", final_text, usage.input_tokens, usage.output_tokens
         )
-        _print_context(max_context, usage)
 
         # No tool calls => the model is done with the task.
         if not tool_calls:
@@ -626,13 +627,10 @@ def run_session(
     commit_message = ""
     if diff.strip() and not stopped_at_max:
         turn += 1
-        print(
-            "\n" + style(
-                f"--- {ralph_tag}turn {turn} (commit message) ---",
-                "bold", "dark_red",
-            ),
-            flush=True,
+        header = style(
+            f"--- {ralph_tag}turn {turn} (commit message) ---", "bold", "dark_red"
         )
+        print("\n" + header + _context_suffix(max_context, last_usage), flush=True)
 
         request = _commit_request(diff)
         messages.append({"role": "user", "content": request})
@@ -643,12 +641,12 @@ def run_session(
         )
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
+        last_usage = usage
 
         messages.append({"role": "assistant", "content": parts})
         session.record_turn(
             "assistant", text, usage.input_tokens, usage.output_tokens
         )
-        _print_context(max_context, usage)
         commit_message = text.strip()
         print(flush=True)
 
@@ -658,22 +656,22 @@ def run_session(
     )
 
 
-def _print_context(max_context: int | None, usage: Usage) -> None:
-    """Report how full the context window is after a turn. `usage.input_tokens`
-    is the whole conversation fed to the model this turn and `output_tokens` what
-    it generated -- together, the tokens that had to fit in the window at once.
-    When the window is known, show the percentage (color escalating toward the
-    limit); when it isn't (provider doesn't report it), show the raw total."""
+def _context_suffix(max_context: int | None, usage: Usage | None) -> str:
+    """A ' [context: ...]' fragment appended to a turn header, showing how full
+    the window is entering the turn. `usage` is the previous turn's usage: its
+    `input_tokens` is the whole conversation fed to the model and `output_tokens`
+    what it generated -- together, the tokens that had to fit in the window at
+    once. Empty before the first turn lands (no measurement yet). When the window
+    is known, show the percentage (color escalating toward the limit); when it
+    isn't (provider doesn't report it), show the raw total."""
+    if usage is None:
+        return ""
     used = usage.input_tokens + usage.output_tokens
     if not max_context:
-        print(style(f"  [context: {used:,} tokens]", "gray"), flush=True)
-        return
+        return style(f"  [context: {used:,} tokens]", "gray")
     pct = used / max_context * 100
     color = "red" if pct >= 80 else "yellow" if pct >= 50 else "gray"
-    print(
-        style(f"  [context: {used:,} / {max_context:,} tokens ({pct:.1f}%)]", color),
-        flush=True,
-    )
+    return style(f"  [context: {used:,} / {max_context:,} ({pct:.1f}%)]", color)
 
 
 def _print_usage(model: str, turns: int, usage: Usage) -> None:
