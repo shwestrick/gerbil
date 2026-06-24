@@ -144,6 +144,31 @@ Use `gerbil run --max-turns N` to forcibly terminate sessions after `N` turns.
 Use `gerbil run --include-session` to include the `.jsonl` session data in
 the generated patch.
 
+## Summarizing usage with `gerbil summarize`
+
+`gerbil summarize` scans the project's `.gerbil/*.jsonl` session logs and reports
+total token usage, an estimated cost (from the per-model pricing table), and
+breakdowns by session status, tool call, and model:
+
+```
+$ gerbil summarize
+gerbil summary -- 28 session(s) in /path/to/project/.gerbil
+
+Tokens
+  input:   141,094,502
+  output:      367,974
+  total:   141,462,476
+
+Estimated cost
+  ~$180.0479
+...
+```
+
+Session logs are only included in the project `.gerbil/` when
+`gerbil run --include-session` is used; otherwise they live in
+`~/.gerbil/sessions/` (and `summarize` points you there if the project has
+none).
+
 ## Committing patches with `gerbil commit`
 
 After running sessions, `gerbil commit` looks in the project `.gerbil/` folder

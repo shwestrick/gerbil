@@ -29,7 +29,9 @@ the previous one's commit.
 """
 
 import argparse
+import collections
 import contextlib
+import json
 import os
 import re
 import shutil
@@ -38,7 +40,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from .agent import MODEL_PRICING, run_session
+from .agent import DEFAULT_PRICING, MODEL_PRICING, run_session
 from .sandbox import LeanSandbox
 from .session import Session
 from .term import style
@@ -234,6 +236,18 @@ def main() -> None:
     )
     commit_p.set_defaults(func=cmd_commit)
 
+    summ_p = sub.add_parser(
+        "summarize",
+        help="report token usage, estimated cost, and tool stats across the "
+        "project's .gerbil/*.jsonl session logs",
+    )
+    summ_p.add_argument(
+        "--at",
+        metavar="DIRECTORY",
+        help="Path to the Lean/Lake project (a git repo). Default: current dir.",
+    )
+    summ_p.set_defaults(func=cmd_summarize)
+
     recon_p = sub.add_parser(
         "reconstruct-patch",
         help="rebuild a session's .patch by replaying its tool calls in a sandbox",
@@ -353,6 +367,154 @@ def cmd_commit(args) -> None:
         f"{stale} out of date",
         "bold",
     ))
+
+
+def _scan_session(path: Path) -> dict:
+    """Tally one session log into a stats dict. Replayed events (re-emitted from a
+    prior log by --resume) are skipped so a resumed chain isn't double-counted --
+    this mirrors how Session accumulates totals only from live turns.
+
+    Returns: {model, input_tokens, output_tokens, turns, tool_calls (Counter),
+    status} where status is 'completed' | 'errored' | 'incomplete'. A garbled log
+    yields a sentinel with status 'unreadable' and zero usage."""
+    model = "unknown"
+    input_tokens = output_tokens = turns = 0
+    tool_calls: collections.Counter = collections.Counter()
+    status = "incomplete"  # no session_end/error recorded => crashed mid-run
+
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return {"model": model, "input_tokens": 0, "output_tokens": 0,
+                "turns": 0, "tool_calls": tool_calls, "status": "unreadable"}
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            # A partial trailing line from an interrupted write; ignore it.
+            continue
+        # Replayed events were already counted in the original session's log.
+        if e.get("replayed"):
+            continue
+        event = e.get("event")
+        if event == "session_start":
+            model = e.get("model", model)
+        elif event == "turn":
+            usage = e.get("usage") or {}
+            input_tokens += usage.get("input_tokens", 0)
+            output_tokens += usage.get("output_tokens", 0)
+            turns += 1
+        elif event == "tool_call":
+            tool_calls[e.get("name", "?")] += 1
+        elif event == "session_end":
+            status = "completed"
+        elif event == "error":
+            status = "errored"
+
+    return {"model": model, "input_tokens": input_tokens,
+            "output_tokens": output_tokens, "turns": turns,
+            "tool_calls": tool_calls, "status": status}
+
+
+def _cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Estimated USD cost from per-million-token pricing (falls back to DEFAULT)."""
+    price_in, price_out = MODEL_PRICING.get(model, DEFAULT_PRICING)
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+
+def cmd_summarize(args) -> None:
+    """Aggregate token usage, estimated cost, and tool-call stats across all
+    .gerbil/*.jsonl session logs in the project."""
+    project_dir = _resolve_at(args.at)
+    if not project_dir.is_dir():
+        sys.exit(f"error: {project_dir} is not a directory")
+
+    out_dir = project_dir / ".gerbil"
+    logs = sorted(out_dir.glob("*.jsonl"))
+    if not logs:
+        # By default the live session log lands in ~/.gerbil/sessions/, not the
+        # project; it only reaches the project when `run --include-session` is used.
+        archive = Path.home() / ".gerbil" / "sessions"
+        msg = f"no session logs (*.jsonl) found in {out_dir}"
+        if archive.is_dir() and any(archive.glob("*.jsonl")):
+            msg += (
+                f"\nnote: session logs are archived in {archive} -- pass "
+                "`run --include-session` to also keep them in the project."
+            )
+        sys.exit(msg)
+
+    stats = [_scan_session(p) for p in logs]
+
+    total_in = sum(s["input_tokens"] for s in stats)
+    total_out = sum(s["output_tokens"] for s in stats)
+    total_turns = sum(s["turns"] for s in stats)
+    total_cost = sum(
+        _cost(s["model"], s["input_tokens"], s["output_tokens"]) for s in stats
+    )
+
+    tools: collections.Counter = collections.Counter()
+    for s in stats:
+        tools.update(s["tool_calls"])
+
+    status_counts = collections.Counter(s["status"] for s in stats)
+
+    # Per-model rollup of tokens + cost.
+    by_model: dict[str, dict] = {}
+    for s in stats:
+        m = by_model.setdefault(
+            s["model"], {"sessions": 0, "input": 0, "output": 0, "cost": 0.0}
+        )
+        m["sessions"] += 1
+        m["input"] += s["input_tokens"]
+        m["output"] += s["output_tokens"]
+        m["cost"] += _cost(s["model"], s["input_tokens"], s["output_tokens"])
+
+    bold = lambda t: style(t, "bold")
+    print(bold(f"gerbil summary -- {len(logs)} session(s) in {out_dir}"))
+    print()
+
+    print(bold("Tokens"))
+    print(f"  input:  {total_in:>12,}")
+    print(f"  output: {total_out:>12,}")
+    print(f"  total:  {total_in + total_out:>12,}")
+    print()
+
+    print(bold("Estimated cost"))
+    print(f"  ~${total_cost:,.4f}")
+    print()
+
+    print(bold("Sessions"))
+    parts = []
+    for label, color in (("completed", "green"), ("errored", "red"),
+                         ("incomplete", "yellow"), ("unreadable", "gray")):
+        n = status_counts.get(label, 0)
+        if n:
+            parts.append(f"{style(str(n), 'bold', color)} {label}")
+    print("  " + ", ".join(parts) if parts else "  (none)")
+    print(f"  turns: {total_turns:,}")
+    print()
+
+    print(bold("Tool calls") + f"  ({sum(tools.values()):,} total)")
+    if tools:
+        width = max(len(name) for name in tools)
+        for name, n in tools.most_common():
+            print(f"  {name:<{width}}  {n:>6,}")
+    else:
+        print("  (none)")
+    print()
+
+    print(bold("By model"))
+    for model, m in sorted(by_model.items(), key=lambda kv: -kv[1]["cost"]):
+        known = "" if model in MODEL_PRICING else style(" (est. pricing)", "gray")
+        print(
+            f"  {style(model, 'cyan')}{known}: "
+            f"{m['sessions']} session(s), "
+            f"{m['input'] + m['output']:,} tokens, ~${m['cost']:,.4f}"
+        )
 
 
 def _finalize_session(
