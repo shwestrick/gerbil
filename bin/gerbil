@@ -9,6 +9,7 @@
 # Commands:
 #   gerbil run [--prompt FILE] [--at DIR] [--ralph N] ...   run a session
 #   gerbil commit [--at DIR]                                git am the patches
+#   gerbil summarize [--at DIR]                             token/cost/tool stats
 #   gerbil reconstruct-patch SESSION_FILE [--at DIR]        rebuild a .patch
 #   gerbil update                                           update to latest main (+ self)
 #   gerbil --version                                        show current version
@@ -146,7 +147,7 @@ ensure_image() {
 }
 
 usage() {
-    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 cmd="${1:-}"
@@ -180,6 +181,13 @@ case "$cmd" in
         exec env GERBIL_CWD="$PWD" uv run --project "$(current_dir)" \
             python -m gerbil commit "$@"
         ;;
+    summarize)
+        bootstrap_if_needed
+        shift
+        # summarize just reads the project's .gerbil/*.jsonl logs; no container.
+        exec env GERBIL_CWD="$PWD" uv run --project "$(current_dir)" \
+            python -m gerbil summarize "$@"
+        ;;
     reconstruct-patch)
         bootstrap_if_needed
         ensure_image
@@ -193,6 +201,6 @@ case "$cmd" in
         usage
         ;;
     *)
-        die "unknown command '$cmd' (try: run, commit, reconstruct-patch, update, --version)"
+        die "unknown command '$cmd' (try: run, commit, summarize, reconstruct-patch, update, --version)"
         ;;
 esac
