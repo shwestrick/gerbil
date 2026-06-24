@@ -143,6 +143,30 @@ def test_lean_goal_fallbacks() -> None:
     check("term_goal also rendered", "X.lean:1:1" in out3 and "^" in out3, out3)
 
 
+def test_lean_build() -> None:
+    plain = _format_tool_call(
+        "lean_build", {"fetch_cache": False, "output_lines": 20, "clean": False}
+    )
+    check("plain build is just the name", plain.strip() == "-> lean_build", plain)
+    check("clean flag shown",
+          _format_tool_call("lean_build", {"clean": True}).strip()
+          == "-> lean_build (clean)")
+    check("both flags shown",
+          _format_tool_call("lean_build", {"clean": True, "fetch_cache": True}).strip()
+          == "-> lean_build (clean, fetch cache)")
+
+
+def test_lean_diagnostic_messages() -> None:
+    out = _format_tool_call("lean_diagnostic_messages", {"file_path": "Foo.lean"})
+    check("diagnostics shows just the path",
+          out.strip() == "-> lean_diagnostic_messages Foo.lean", out)
+    out2 = _format_tool_call(
+        "lean_diagnostic_messages", {"file_path": "Foo.lean", "line": 10}
+    )
+    check("diagnostics appends extra args",
+          out2.strip() == "-> lean_diagnostic_messages Foo.lean (line=10)", out2)
+
+
 def test_other_tool_unchanged() -> None:
     out = _format_tool_call("bash", {"command": "lake build"})
     check("bash keeps name(args)", out.strip() == "-> bash({'command': 'lake build'})", out)
@@ -158,6 +182,8 @@ def main() -> None:
     test_lean_run_code()
     test_lean_goal_position()
     test_lean_goal_fallbacks()
+    test_lean_build()
+    test_lean_diagnostic_messages()
     test_other_tool_unchanged()
     print("\nAll render tests passed.")
 

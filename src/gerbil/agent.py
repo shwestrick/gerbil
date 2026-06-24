@@ -198,6 +198,11 @@ def _format_tool_call(name: str, args: dict, read_file=None) -> str:
         return f"{head} {_render_lean_run_code(args)}"
     if name in _POSITION_TOOLS:
         return f"{head} {_render_position(args, read_file)}"
+    if name == "lean_build":
+        extra = _render_lean_build(args)
+        return f"{head} {extra}" if extra else head
+    if name == "lean_diagnostic_messages" and isinstance(args.get("file_path"), str):
+        return f"{head} {_render_path_with_extras(args)}"
     return f"{head}({args})"
 
 
@@ -295,6 +300,28 @@ def _render_lean_multi_attempt(args: dict) -> str:
     if len(snippets) != 1:
         head += " " + style(f"({len(snippets)} snippets)", "gray")
     return "\n".join([head] + [_render_snippet(i, str(s)) for i, s in enumerate(snippets, 1)])
+
+
+def _render_path_with_extras(args: dict) -> str:
+    """Show a tool's file_path prominently, with any other args appended compactly
+    (e.g. a line range) -- instead of echoing a full args dict."""
+    out = style(str(args["file_path"]), TOOL_COLOR)
+    extras = [f"{k}={v}" for k, v in args.items() if k != "file_path"]
+    if extras:
+        out += " " + style(f"({', '.join(extras)})", "gray")
+    return out
+
+
+def _render_lean_build(args: dict) -> str:
+    """lean_build just builds the project; its args are mostly default booleans
+    (output_lines is only a display cap). Surface the flags that are actually on,
+    or nothing for a plain build -- no need to echo a dict of defaults."""
+    flags = []
+    if args.get("clean"):
+        flags.append("clean")
+    if args.get("fetch_cache"):
+        flags.append("fetch cache")
+    return style(f"({', '.join(flags)})", "gray") if flags else ""
 
 
 def _render_position(args: dict, read_file=None) -> str:
