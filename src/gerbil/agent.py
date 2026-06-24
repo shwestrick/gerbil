@@ -518,6 +518,11 @@ def run_session(
 
     total = Usage()
     turn = 0
+    # Continue the turn counter across a resume: the seeded history already holds
+    # this many assistant turns, so the displayed count picks up where it left off
+    # instead of restarting at 1. It's display-only -- the max_turns budget below
+    # still counts just this run's new turns. Zero for a fresh (non-resumed) run.
+    turn_offset = sum(1 for m in messages if m.get("role") == "assistant")
     final_text = ""
     stopped_at_max = False
     # The most recent turn's usage, shown in the next turn's header so it reflects
@@ -549,7 +554,9 @@ def run_session(
             break
         turn += 1
 
-        header = style(f"--- {ralph_tag}turn {turn} ---", "bold", "dark_red")
+        header = style(
+            f"--- {ralph_tag}turn {turn + turn_offset} ---", "bold", "dark_red"
+        )
         print("\n" + header + _context_suffix(max_context, last_usage), flush=True)
 
         assistant_parts, tool_calls, final_text, usage = _run_turn(
@@ -626,7 +633,8 @@ def run_session(
     if diff.strip() and not stopped_at_max:
         turn += 1
         header = style(
-            f"--- {ralph_tag}turn {turn} (commit message) ---", "bold", "dark_red"
+            f"--- {ralph_tag}turn {turn + turn_offset} (commit message) ---",
+            "bold", "dark_red",
         )
         print("\n" + header + _context_suffix(max_context, last_usage), flush=True)
 
@@ -648,7 +656,7 @@ def run_session(
         commit_message = text.strip()
         print(flush=True)
 
-    _print_usage(model, turn, total)
+    _print_usage(model, turn + turn_offset, total)
     return SessionResult(
         final_text=final_text, diff=diff, commit_message=commit_message
     )
