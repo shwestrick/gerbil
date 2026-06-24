@@ -850,6 +850,10 @@ def _resume_run(args) -> None:
     anchor, ancestor_patches = _reconstruct_anchor(
         parsed, resume_file, repo_root, patch_dirs
     )
+    # The ancestor patch *names* (this chain's prior sessions). _reconstruct_anchor
+    # resolves their contents; the names come straight from the ralph metadata and
+    # seed `running_ancestors` so the continuation chain stays resumable.
+    ancestor_names = list(ralph.get("ancestors") or []) if ralph else []
     if ralph:
         start_iter = int(ralph.get("iteration", 1))
         total_iters = int(ralph.get("total", start_iter))
