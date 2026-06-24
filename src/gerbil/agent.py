@@ -87,6 +87,9 @@ understanding the proof state instead of guessing:
   - lean_run_code: run a code snippet without needing to write it to a file
   - lean_local_search: search the LOCAL Lean/mathlib source for declarations and \
 lemmas (ripgrep-backed) -- use it before guessing a lemma name
+  - reset_lean_server: restart the language server if the lean_* tools start \
+timing out or acting stuck/hung; the next lean_* call re-initializes it (and may \
+be slow). It does not touch your files.
 The lean_* tools never modify files; keep using edit_file / write_file for changes. \
 After editing a file, re-run lean_build (or a diagnostics call) so the language \
 server sees your changes.

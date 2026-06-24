@@ -171,6 +171,23 @@ def dispatch(sandbox: LeanSandbox, name: str, args: dict) -> ToolResult:
         return ToolResult(f"{type(e).__name__}: {e}", is_error=True)
 
 
+# A gerbil-provided tool (not from the sandbox or the MCP server) that restarts
+# the lean-lsp language server. Offered to the agent only when MCP is enabled, and
+# handled directly by the Toolset (see _reset_lean_server).
+RESET_LEAN_SERVER_TOOL = {
+    "name": "reset_lean_server",
+    "description": (
+        "Restart the Lean language server that backs the lean_* tools. Use this if "
+        "the lean_* tools start timing out or behave as if the server is stuck or "
+        "hung. It tears the server down (clearing any stuck Lean processes) and "
+        "starts a fresh one; the next lean_* call re-initializes it, which may be "
+        "slow. This does not touch your files or your edits -- it only restarts the "
+        "server."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+
 class Toolset:
     """Unified tool registry passed to the agent loop.
 
@@ -203,20 +220,43 @@ class Toolset:
             self._mcp_names = {t["name"] for t in self._mcp_schemas}
 
     def schemas(self) -> list[dict]:
-        """Built-in schemas, then MCP schemas."""
-        return TOOLS + self._mcp_schemas
+        """Built-in schemas, the reset tool (only when MCP is on), then MCP schemas."""
+        reset = [RESET_LEAN_SERVER_TOOL] if self._mcp is not None else []
+        return TOOLS + reset + self._mcp_schemas
 
     def mcp_tool_names(self) -> set[str]:
         return set(self._mcp_names)
 
     def dispatch(self, name: str, args: dict) -> ToolResult:
-        """Route to the built-in or MCP handler. Never raises."""
+        """Route to the reset tool, a built-in, or an MCP handler. Never raises."""
+        if name == "reset_lean_server":
+            return self._reset_lean_server()
         if name in self._mcp_names:
             try:
                 return self._mcp.call_tool(name, args)
             except Exception as e:
                 return ToolResult(f"{type(e).__name__}: {e}", is_error=True)
         return dispatch(self._sandbox, name, args)
+
+    def _reset_lean_server(self) -> ToolResult:
+        """Restart the lean-lsp server (see RESET_LEAN_SERVER_TOOL). Never raises."""
+        if self._mcp is None:
+            return ToolResult(
+                "the Lean language server is not enabled (running without MCP); "
+                "there is nothing to restart",
+                is_error=True,
+            )
+        try:
+            n = self._mcp.restart()
+            return ToolResult(
+                f"restarted the Lean language server; {n} lean tools available "
+                "again. The next lean_* call will re-initialize it (may be slow)."
+            )
+        except Exception as e:
+            return ToolResult(
+                f"failed to restart the Lean language server: {type(e).__name__}: {e}",
+                is_error=True,
+            )
 
 
 def _bash(sandbox: LeanSandbox, command: str) -> ToolResult:

@@ -9,16 +9,25 @@ It exposes two tools:
   - quick: returns immediately, so the test can confirm the session is still
            usable after a cancellation.
 
-Run as: python mock_mcp_server.py <marker_path>   (stdio transport)
+Run as: python mock_mcp_server.py <marker_path> [pidfile]   (stdio transport)
+
+If a pidfile is given, this process appends its PID to it at startup -- so a test
+can prove a restart spawned a genuinely new server process.
 """
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 MARKER = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/tmp/mock-mcp-marker")
+
+# Record this process's PID so the reset test can see a new one after a restart.
+if len(sys.argv) > 2:
+    with open(sys.argv[2], "a") as f:
+        f.write(f"{os.getpid()}\n")
 
 mcp = FastMCP("mock")
 

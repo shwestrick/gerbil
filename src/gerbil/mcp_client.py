@@ -98,6 +98,8 @@ class McpClient:
             # for the rest of gerbil (PATH, DOCKER_HOST, contexts, ...).
             env=dict(os.environ),
         )
+        # Kept so restart() can sweep orphaned Lean processes in the container.
+        self._sandbox = sandbox
         # The MCP server logs to stderr; keep it out of gerbil's clean output.
         self._errlog = open(os.devnull, "w")
 
@@ -123,19 +125,66 @@ class McpClient:
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=INIT_TIMEOUT):
-            self.close()
+            self._stop_loop()  # leave errlog open so the client can be retried
             raise TimeoutError("lean-lsp-mcp did not initialize in time")
         if self._startup_error is not None:
-            self.close()
+            self._stop_loop()
             raise self._startup_error
 
-    def close(self) -> None:
+    def _stop_loop(self) -> None:
+        """Signal the background loop to exit and join its thread, leaving the
+        client able to start() again. Does NOT close errlog (close() does that)."""
         if self._loop and self._stop and not self._loop.is_closed():
             self._loop.call_soon_threadsafe(self._stop.set)
         if self._thread:
             self._thread.join(timeout=15)
+        self._thread = None
+        self._loop = None
+        self._session = None
+        self._stop = None
+
+    def close(self) -> None:
+        self._stop_loop()
         try:
             self._errlog.close()
+        except Exception:
+            pass
+
+    def restart(self) -> int:
+        """Tear down and restart the lean-lsp-mcp server -- the recovery valve for
+        a wedged language server (calls timing out, server unresponsive). Stops the
+        current connection, sweeps orphaned Lean processes the dead server may have
+        left behind (so a stuck worker stops pegging the container), then starts a
+        fresh server. Returns the number of tools available afterward. Raises if the
+        fresh server fails to come up."""
+        self._stop_loop()
+        self._sweep_orphans()
+        # Fresh per-connection state for start().
+        self._ready = threading.Event()
+        self._startup_error = None
+        self._schemas = []
+        self._disabled = []
+        self.start()
+        return len(self._schemas)
+
+    def _sweep_orphans(self) -> None:
+        """Best-effort: kill Lean processes left running in the container. When the
+        MCP server is killed, its child `lake serve`/REPL and the `lean` file
+        workers it spawned can be orphaned (the container's PID 1 is `sleep`, which
+        doesn't reap them) and keep pegging CPU. Match on /proc/<pid>/comm (the
+        image has no pkill/ps) for exactly `lean`/`lake`/`repl`, so the sweep can't
+        hit gerbil's git, the shell, or the container's init. Nothing else of
+        gerbil's runs concurrently at restart time, so this is safe."""
+        if self._sandbox is None:
+            return
+        script = (
+            "for d in /proc/[0-9]*; do "
+            "c=$(cat \"$d/comm\" 2>/dev/null) || continue; "
+            "case \"$c\" in lean|lake|repl) kill -9 \"${d##*/}\" 2>/dev/null;; esac; "
+            "done; true"
+        )
+        try:
+            self._sandbox.run(script, timeout=15)
         except Exception:
             pass
 
