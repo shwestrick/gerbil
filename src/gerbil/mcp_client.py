@@ -13,6 +13,7 @@ gerbil session (lean-lsp-mcp wraps `lake serve` and is stateful + slow to init).
 
 import asyncio
 import os
+import re
 import threading
 
 from mcp import ClientSession, StdioServerParameters
@@ -52,6 +53,17 @@ TOOL_TIMEOUTS = {
     "lean_build": 300.0,
     "lean_profile_proof": 180.0,
 }
+
+# A standalone `import Mathlib` (the whole library) on its own line. Loading all
+# of Mathlib from scratch in a snippet is the heavy operation that hangs the LSP,
+# so we reject it in lean_run_code. A specific import (e.g. `import
+# Mathlib.Data.Nat.Basic`) is NOT matched -- the trailing `.Foo` fails `\s`.
+_BARE_MATHLIB_IMPORT = re.compile(r"^\s*import\s+Mathlib\s*(--.*)?$")
+
+
+def _has_bare_mathlib_import(code: str) -> bool:
+    """Whether any line of `code` is a standalone `import Mathlib`."""
+    return any(_BARE_MATHLIB_IMPORT.match(line) for line in code.splitlines())
 
 
 class McpClient:
@@ -194,6 +206,21 @@ class McpClient:
             return ToolResult(
                 f"[{name} is disabled: it requires external network access, which "
                 "is not allowed inside the sandbox]",
+                is_error=True,
+            )
+        if name == "lean_run_code" and _has_bare_mathlib_import(
+            str(args.get("code", ""))
+        ):
+            # `import Mathlib` loads the whole library from scratch in the snippet,
+            # which routinely hangs the LSP. Reject it outright so the agent gets a
+            # clear, immediate error instead of a 60s timeout (and a wedged server).
+            return ToolResult(
+                "[`import Mathlib` is not allowed in lean_run_code: importing the "
+                "whole library loads it from scratch and hangs the sandbox. Import "
+                "only the specific modules you need (e.g. "
+                "`import Mathlib.Data.Nat.Basic`), or edit a project file -- which "
+                "already has Mathlib built -- and check it with "
+                "lean_diagnostic_messages.]",
                 is_error=True,
             )
         if self._session is None or self._loop is None:
