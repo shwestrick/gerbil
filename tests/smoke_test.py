@@ -145,6 +145,30 @@ def main() -> None:
             check("ralph: replayed tree matches original",
                   replayed_tree == orig_tree, f"{replayed_tree} != {orig_tree}")
 
+            # 12. large patches: git_am / apply_diff must stage the patch as a
+            # file, not inline it on the command line (a single exec arg is capped
+            # at ~128 KiB; real session patches exceed it -- the reported bug).
+            pre_big = sb.head()
+            big = "-- big\n" + ("abcdefgh " * 30_000) + "\n"  # ~270 KB
+            sb.write_file("Big.lean", big)
+            sb.commit("big file")
+            big_patch = sb.format_patch(pre_big)
+            check("big: format-patch exceeds the exec arg limit",
+                  len(big_patch) > 200_000, str(len(big_patch)))
+
+            sb.checkout_force(pre_big)
+            check("big: rolled back", sb.run("test -f Big.lean").exit_code != 0)
+            sb.git_am(big_patch)  # would raise "argument list too long" if inlined
+            check("big: git_am applies a large patch", sb.read_file("Big.lean") == big)
+
+            sb.checkout_force(pre_big)
+            sb.write_file("Big.lean", big)
+            big_diff = sb.get_diff()
+            sb.checkout_force(pre_big)
+            sb.apply_diff(big_diff)
+            check("big: apply_diff applies a large patch",
+                  sb.read_file("Big.lean") == big)
+
     # Lake project in a subdirectory of the repo (not the repo root).
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

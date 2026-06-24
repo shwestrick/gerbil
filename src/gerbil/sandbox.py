@@ -258,21 +258,25 @@ class LeanSandbox:
         if result.exit_code != 0:
             raise RuntimeError(f"git checkout {ref} failed:\n{result.stderr}")
 
+    def _stage_patch(self, text: str) -> str:
+        """Write patch text to a temp file inside the container and return its
+        path. Patches are uploaded as a tar stream (put_archive), not passed on
+        the command line -- a single exec argument is capped at ~128 KiB, which
+        real session patches blow past. Lives in /tmp, outside the work tree, so
+        it never shows up in a diff."""
+        path = "/tmp/gerbil-patch.mbox"
+        self.write_file(path, text)
+        return path
+
     def apply_diff(self, diff_text: str) -> None:
         """Apply a working-tree patch (as produced by get_diff) to the current
-        tree. The patch is piped in base64-encoded to avoid any shell-quoting or
-        heredoc-delimiter hazards with arbitrary diff content. No-op for an empty
-        patch. Used by --resume to restore the uncommitted edits a crashed session
-        had made on top of its base commit."""
+        tree. No-op for an empty patch. Used by --resume to restore the
+        uncommitted edits a crashed session had made on top of its base commit."""
         if not diff_text.strip():
             return
-        import base64
-
-        b64 = base64.b64encode(diff_text.encode()).decode()
-        result = self.run(
-            f"printf %s {_quote(b64)} | base64 -d | "
-            f"{self._git_env} git apply --whitespace=nowarn -",
-            timeout=120.0,
+        path = self._stage_patch(diff_text)
+        result = self._git(
+            f"apply --whitespace=nowarn {_quote(path)}", timeout=120.0
         )
         if result.exit_code != 0:
             raise RuntimeError(
@@ -302,17 +306,11 @@ class LeanSandbox:
         """Apply a format-patch (mbox) as a commit via `git am` -- the same way
         the host `gerbil apply` does. Used by --resume to replay a ralph chain's
         prior-session patches in order, rebuilding the committed history a
-        mid-chain session started from. The patch is piped in base64-encoded to
-        sidestep shell-quoting hazards. Aborts and raises on failure."""
+        mid-chain session started from. Aborts and raises on failure."""
         if not patch_text.strip():
             return
-        import base64
-
-        b64 = base64.b64encode(patch_text.encode()).decode()
-        result = self.run(
-            f"printf %s {_quote(b64)} | base64 -d | {self._git_env} git am",
-            timeout=180.0,
-        )
+        path = self._stage_patch(patch_text)
+        result = self._git(f"am {_quote(path)}", timeout=180.0)
         if result.exit_code != 0:
             self._git("am --abort")
             raise RuntimeError(f"git am failed:\n{result.stderr or result.stdout}")
