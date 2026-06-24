@@ -248,6 +248,27 @@ class LeanSandbox:
         self._git("add -A")
         return self._git("diff --cached").stdout
 
+    def wip_patch(self, base: str) -> str:
+        """A live `git format-patch` from `base` to the current state -- every
+        commit the agent made itself, plus a snapshot of the uncommitted working
+        tree -- produced WITHOUT moving HEAD or touching the working tree.
+
+        This is the resume snapshot, refreshed each turn. Unlike `git diff HEAD`
+        it does not lose changes the agent committed internally: the index is
+        captured as a throwaway commit (via write-tree + commit-tree) parented on
+        HEAD, so format-patch sees base..HEAD plus the uncommitted delta. Applying
+        the result onto a clean `base` (git apply / git am) reproduces the full
+        tree. Returns "" when nothing differs from base."""
+        self._git("add -A")
+        tree = self._git("write-tree").stdout.strip()
+        if not tree:
+            return ""
+        wip = self._git(f"commit-tree {tree} -p HEAD -m gerbil-wip").stdout.strip()
+        if not wip or self._git(f"diff --quiet {base} {wip}").exit_code == 0:
+            return ""  # identical to base -> nothing to snapshot
+        result = self._git(f"format-patch {base}..{wip} --stdout", timeout=60.0)
+        return result.stdout if result.exit_code == 0 else ""
+
     def checkout_force(self, ref: str) -> None:
         """Hard-reset the working tree to `ref` (detaching HEAD), discarding any
         tracked-file changes. Untracked files -- crucially the .lake build cache

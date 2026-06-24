@@ -298,14 +298,15 @@ def _thought_sig(raw_part) -> str | None:
     return base64.b64encode(sig).decode()
 
 
-def _update_wip_patch(sandbox: LeanSandbox, path: Path | None) -> None:
-    """Refresh the live working-tree patch -- the on-the-fly snapshot that lets a
-    crashed session be resumed (or simply applied). Best-effort: a checkpoint must
-    never be the thing that crashes the session."""
+def _update_wip_patch(sandbox: LeanSandbox, path: Path | None, base: str) -> None:
+    """Refresh the live resume snapshot -- a format-patch from `base` to the
+    current state (committed + uncommitted), so a crash can be resumed or the
+    patch applied directly. Best-effort: a checkpoint must never be the thing that
+    crashes the session."""
     if path is None:
         return
     try:
-        path.write_text(sandbox.get_diff())
+        path.write_text(sandbox.wip_patch(base))
     except Exception:
         pass
 
@@ -430,7 +431,7 @@ def run_session(
 
         # Snapshot the working tree after every turn that ran tools, so an
         # interruption before the next turn leaves a patch that recreates it.
-        _update_wip_patch(sandbox, wip_patch_path)
+        _update_wip_patch(sandbox, wip_patch_path, session.base_commit)
 
     if stopped_at_max:
         print(

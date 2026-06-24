@@ -166,10 +166,12 @@ The model and prompt are taken from the log, so `--resume` takes neither
 `--prompt` nor `--model` (and is not combined with `--ralph`).
 
 The working tree is recovered from a `*.wip.patch` file that is kept live
-next to the session log, refreshed after every turn. This patch is also
-a normal git patch -- if you'd rather not resume, you can just `git apply`
-it yourself. A clean finish deletes the `.wip.patch`; a crash leaves it in
-place for `--resume`.
+next to the session log, refreshed after every turn. It is a `git
+format-patch` from the session's base to the current state -- including any
+commits the agent made itself, not just uncommitted changes -- so it never
+loses work. It is a normal git patch: if you'd rather not resume, you can
+just `git apply` it yourself. A clean finish deletes the `.wip.patch`; a
+crash leaves it in place for `--resume`.
 
 The continuation is written as its own session log and patch (named
 `...-resume-<timestamp>`), carrying the full prior history forward, so it is

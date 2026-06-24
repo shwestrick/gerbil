@@ -212,6 +212,39 @@ def main() -> None:
             check("tamper: format_patch works against real base despite nested .git",
                   patch.strip() != "" and "lean/proof/Hello.lean" in patch, patch[:120])
 
+    # The live resume snapshot (wip_patch) must capture changes the agent
+    # committed itself, not just uncommitted ones -- the reported bug was that it
+    # diffed against HEAD and silently dropped the agent's own commits.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        make_project(root)
+        with LeanSandbox(project_dir=root) as sb:
+            base = sb.head()
+            # The agent makes an INTERNAL commit...
+            sb.write_file("Committed.lean", "def c := 1\n")
+            sb.run("git add -A && git -c user.email=a@a -c user.name=a "
+                   "commit -qm 'agent internal commit'")
+            head_after_commit = sb.head()
+            # ...and also leaves uncommitted + untracked changes.
+            sb.write_file("Hello.lean", "def hello := 999\n")
+            sb.write_file("Untracked.lean", "def u := 2\n")
+
+            wip = sb.wip_patch(base)
+            check("wip: snapshot is non-empty", wip.strip() != "")
+            check("wip: snapshot did not move HEAD", sb.head() == head_after_commit)
+
+            # Reconstruct from a clean base, exactly as --resume does (git apply).
+            sb.checkout_force(base)
+            check("wip: rollback drops the internal commit",
+                  sb.run("test -f Committed.lean").exit_code != 0)
+            sb.apply_diff(wip)
+            check("wip: restores internally-committed file",
+                  sb.read_file("Committed.lean") == "def c := 1\n")
+            check("wip: restores uncommitted edit",
+                  sb.read_file("Hello.lean") == "def hello := 999\n")
+            check("wip: restores untracked file",
+                  sb.read_file("Untracked.lean") == "def u := 2\n")
+
     print("\nAll smoke tests passed.")
 
 
