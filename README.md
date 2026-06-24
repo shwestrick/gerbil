@@ -89,7 +89,8 @@ Docker SDK). On Linux, add yourself to the `docker` group
 Managing the launcher itself:
 ```console
 $ gerbil --version    # current version (commit hash)
-$ gerbil update       # update to the latest commit on main (+ rebuild the image)
+$ gerbil update       # update to latest main: refreshes the source, rebuilds the
+                      # image, and overwrites this launcher script in place
 ```
 
 ## API Keys and Backend Models

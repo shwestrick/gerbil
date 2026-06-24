@@ -10,7 +10,7 @@
 #   gerbil run [--prompt FILE] [--at DIR] [--ralph N] ...   run a session
 #   gerbil commit [--at DIR]                                git am the patches
 #   gerbil reconstruct-patch SESSION_FILE [--at DIR]        rebuild a .patch
-#   gerbil update                                           update to latest main
+#   gerbil update                                           update to latest main (+ self)
 #   gerbil --version                                        show current version
 #
 # The source is kept under ~/.gerbil/versions/<commit>/ and run with `uv`.
@@ -65,6 +65,43 @@ bootstrap_if_needed() {
 current_dir() { echo "$VERSIONS_DIR/$(cat "$CURRENT_FILE")"; }
 sandbox_image() { echo "lean-sandbox:$(cat "$CURRENT_FILE")"; }
 
+# Absolute path of this running launcher, following symlinks (portably -- macOS
+# readlink has no -f). This is what `gerbil update` overwrites in place.
+resolve_self() {
+    local src="${BASH_SOURCE[0]}" dir
+    while [ -h "$src" ]; do
+        dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+        src="$(readlink "$src")"
+        case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+    done
+    dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+    printf '%s/%s\n' "$dir" "$(basename "$src")"
+}
+
+# Overwrite the installed launcher with the freshly-fetched one, if it differs.
+# Replaces via a temp file + atomic rename so the currently-running script (which
+# still holds the old inode open) keeps executing safely.
+self_update() {
+    local self new tmp
+    self="$(resolve_self)"
+    new="$(current_dir)/bin/gerbil"
+    [ -f "$new" ] || return 0
+    # Skip internal copies (e.g. running the versioned source directly); only the
+    # user's installed launcher, outside GERBIL_HOME, is worth updating in place.
+    case "$self" in "$GERBIL_HOME"/*) return 0 ;; esac
+    [ "$self" = "$new" ] && return 0
+    cmp -s "$self" "$new" && return 0
+    tmp="$self.gerbil-update.$$"
+    if cp "$new" "$tmp" 2>/dev/null && chmod +x "$tmp" 2>/dev/null \
+            && mv "$tmp" "$self" 2>/dev/null; then
+        echo "gerbil: updated launcher at $self" >&2
+    else
+        rm -f "$tmp" 2>/dev/null
+        echo "gerbil: could not overwrite launcher at $self -- update it by hand:" >&2
+        echo "  cp '$new' '$self'" >&2
+    fi
+}
+
 # Verify Docker is installed and the daemon is reachable without sudo, with
 # actionable guidance. gerbil's Python side uses the Docker SDK (direct socket),
 # which cannot use sudo, so Docker must be usable unprivileged.
@@ -117,6 +154,7 @@ case "$cmd" in
     update)
         new="$(set_current_to_main)"
         ensure_image
+        self_update
         echo "gerbil: now at $new"
         ;;
     --version|-V|version)
