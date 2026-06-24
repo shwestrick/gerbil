@@ -189,6 +189,18 @@ def main() -> None:
             check("subdir: writable by sandbox user", r.exit_code == 0 and "ok" in r.stdout,
                   repr((r.exit_code, r.stderr)))
 
+            # The --ralph_done check (run_script) must execute from the Lake
+            # project dir -- the matching subdir, where `gerbil run` operates and
+            # the agent's bash tool runs -- NOT the repo root. The script reports
+            # its CWD and probes for Hello.lean, which exists only in the subdir
+            # (the repo root has README.md instead), so a wrong CWD fails the probe.
+            r = sb.run_script("#!/bin/sh\npwd\ntest -f Hello.lean\n")
+            check("ralph_done: script CWD is the Lake project subdir",
+                  r.stdout.strip().splitlines()[:1] == ["/workspace/project/lean/proof"],
+                  repr(r.stdout))
+            check("ralph_done: subdir is CWD, sees project-local Hello.lean",
+                  r.exit_code == 0, repr((r.exit_code, r.stdout, r.stderr)))
+
             # edits + diff still work; diff paths are relative to the repo root
             sb.write_file("Hello.lean", "def hello := 99\n")
             diff = sb.get_diff()
