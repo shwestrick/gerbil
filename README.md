@@ -31,7 +31,7 @@ $ ls .gerbil
 gerbil-260623-235800.jsonl
 gerbil-260623-235800.patch
 
-$ gerbil apply
+$ gerbil commit
 
 $ git push
 ```
@@ -39,7 +39,7 @@ $ git push
 
 You can also run a multi-session Ralph loop, applying the same prompt
 repeatedly. The option `--ralph N` runs at most `N` sessions. This produces
-session logs and patches for every session. Run `gerbil apply` a single
+session logs and patches for every session. Running `gerbil commit` a single
 time will commit each of these.
 
 ```console
@@ -58,7 +58,7 @@ gerbil-260623-235900-02.patch
 gerbil-260623-235900-03.jsonl
 gerbil-260623-235900-03.patch
 
-$ gerbil apply
+$ gerbil commit
 
 $ git push
 ```
@@ -143,11 +143,11 @@ Use `gerbil run --max-turns N` to forcibly terminate sessions after `N` turns.
 Use `gerbil run --include-session` to include the `.jsonl` session data in
 the generated patch.
 
-## Applying commits with `gerbil apply`
+## Committing patches with `gerbil commit`
 
-After running sessions, `gerbil apply` looks in the project `.gerbil/` folder
+After running sessions, `gerbil commit` looks in the project `.gerbil/` folder
 and identifies patches that can be applied at the current git `HEAD`. Stale
-and already-applied patches are ignored; these are safe to leave around
+and already-committed patches are ignored; these are safe to leave around
 or delete.
 
 ## Resuming a crashed session

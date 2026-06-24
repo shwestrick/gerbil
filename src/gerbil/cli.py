@@ -3,7 +3,7 @@
 
 Usage:
     gerbil run [--prompt FILE] [--at DIRECTORY] [--ralph N] ...
-    gerbil apply [--at DIRECTORY]
+    gerbil commit [--at DIRECTORY]
 
 (Normally invoked through the `gerbil` launcher, which also provides `update`
 and `--version`. --at defaults to the current directory.)
@@ -11,7 +11,7 @@ and `--version`. --at defaults to the current directory.)
 The agent works on the real repository (full history) inside the container.
 Each session's changes are committed there, and the result is emitted as a
 git format-patch -- a single .patch file holding the commit title, message, and
-diff, applied on the host with `gerbil apply` (git am).
+diff, committed on the host with `gerbil commit` (git am).
 
 Outputs:
     ~/.gerbil/sessions/gerbil-TIMESTAMP.jsonl  the live session log (the true
@@ -223,15 +223,15 @@ def main() -> None:
     )
     run_p.set_defaults(func=cmd_run)
 
-    apply_p = sub.add_parser(
-        "apply", help="git am the patches gerbil produced, in order"
+    commit_p = sub.add_parser(
+        "commit", help="git am the patches gerbil produced into the repo, in order"
     )
-    apply_p.add_argument(
+    commit_p.add_argument(
         "--at",
         metavar="DIRECTORY",
         help="Path to the Lean/Lake project (a git repo). Default: current dir.",
     )
-    apply_p.set_defaults(func=cmd_apply)
+    commit_p.set_defaults(func=cmd_commit)
 
     recon_p = sub.add_parser(
         "reconstruct-patch",
@@ -302,8 +302,8 @@ def _patch_applies(repo_dir: Path, patch: Path) -> bool:
     ).returncode == 0
 
 
-def cmd_apply(args) -> None:
-    """Apply each .gerbil/gerbil-*.patch (a git format-patch) in order via git am.
+def cmd_commit(args) -> None:
+    """Commit each .gerbil/gerbil-*.patch (a git format-patch) in order via git am.
 
     The .gerbil/ directory may hold stale patches. Each is classified first:
     already-committed (its patch-id is in history) => skip; applies cleanly =>
@@ -326,10 +326,10 @@ def cmd_apply(args) -> None:
     for patch in patches:
         pid = _patch_id(repo_root, patch.read_text())
         if pid and pid in committed:
-            print(f"{style('skip:', 'bold', 'gray')}     {patch.name} (already applied)")
+            print(f"{style('skip:', 'bold', 'gray')}      {patch.name} (already committed)")
             already += 1
         elif _patch_applies(repo_root, patch):
-            print(f"{style('applying:', 'bold')} {patch.name}")
+            print(f"{style('committing:', 'bold')} {patch.name}")
             result = subprocess.run(["git", "am", str(patch)], cwd=repo_root)
             if result.returncode != 0:
                 sys.exit(
@@ -341,14 +341,15 @@ def cmd_apply(args) -> None:
                 committed.add(pid)  # so a duplicate patch later also skips
         else:
             print(
-                f"{style('skip:', 'bold', 'yellow')}     {patch.name} "
+                f"{style('skip:', 'bold', 'yellow')}      {patch.name} "
                 "(out of date; does not apply)",
                 file=sys.stderr,
             )
             stale += 1
 
     print(style(
-        f"done -- {applied} applied, {already} already applied, {stale} out of date",
+        f"done -- {applied} committed, {already} already committed, "
+        f"{stale} out of date",
         "bold",
     ))
 

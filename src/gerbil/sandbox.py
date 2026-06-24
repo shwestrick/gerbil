@@ -304,7 +304,7 @@ class LeanSandbox:
 
     def git_am(self, patch_text: str) -> None:
         """Apply a format-patch (mbox) as a commit via `git am` -- the same way
-        the host `gerbil apply` does. Used by --resume to replay a ralph chain's
+        the host `gerbil commit` does. Used by --resume to replay a ralph chain's
         prior-session patches in order, rebuilding the committed history a
         mid-chain session started from. Aborts and raises on failure."""
         if not patch_text.strip():

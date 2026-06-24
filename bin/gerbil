@@ -8,7 +8,7 @@
 #
 # Commands:
 #   gerbil run [--prompt FILE] [--at DIR] [--ralph N] ...   run a session
-#   gerbil apply [--at DIR]                                 git am the patches
+#   gerbil commit [--at DIR]                                git am the patches
 #   gerbil reconstruct-patch SESSION_FILE [--at DIR]        rebuild a .patch
 #   gerbil update                                           update to latest main
 #   gerbil --version                                        show current version
@@ -135,12 +135,12 @@ case "$cmd" in
             GERBIL_VERSION="$(cat "$CURRENT_FILE")" \
             uv run --project "$(current_dir)" python -m gerbil run "$@"
         ;;
-    apply)
+    commit)
         bootstrap_if_needed
         shift
-        # apply is host-side (git am); no container/image needed.
+        # commit is host-side (git am); no container/image needed.
         exec env GERBIL_CWD="$PWD" uv run --project "$(current_dir)" \
-            python -m gerbil apply "$@"
+            python -m gerbil commit "$@"
         ;;
     reconstruct-patch)
         bootstrap_if_needed
@@ -155,6 +155,6 @@ case "$cmd" in
         usage
         ;;
     *)
-        die "unknown command '$cmd' (try: run, apply, reconstruct-patch, update, --version)"
+        die "unknown command '$cmd' (try: run, commit, reconstruct-patch, update, --version)"
         ;;
 esac
