@@ -229,6 +229,15 @@ class LeanSandbox:
         """Run lake build and return stdout, stderr, and exit_code."""
         return self.run("lake build", timeout=timeout)
 
+    def run_script(self, script: str, timeout: float = 300.0) -> CommandResult:
+        """Upload `script` and run it (via bash) on the current working tree, from
+        the Lake project directory. Used for the --ralph_done termination check;
+        its exit code is the signal, and stdout/stderr are returned for display.
+        Lives in /tmp, outside the work tree, so it never shows up in a diff."""
+        path = "/tmp/gerbil-ralph-done-check"
+        self.write_file(path, script)
+        return self.run(f"bash {_quote(path)}", timeout=timeout)
+
     def run(self, command: str, timeout: float = 60.0) -> CommandResult:
         """Run a shell command in the sandbox workspace directory."""
         wrapped = ["timeout", str(int(timeout)), "bash", "-c", command]

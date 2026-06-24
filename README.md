@@ -63,11 +63,21 @@ $ gerbil commit
 $ git push
 ```
 
-In Ralph mode, gerbil has access to an additional tool called `ralph_done`,
-which can be used to terminate the Ralph loop early. In the prompt, we
-recommend specifying *very precisely* under what conditions the model is
-allowed to invoke `ralph_done` (otherwise, the model might spuriously decide to
-terminate the Ralph loop).
+To terminate the Ralph loop early, pass `--ralph_done SCRIPT`. After each
+session completes, gerbil runs that script inside the container on the session's
+committed working tree (from the project directory). If it exits `0`, the loop
+stops; any non-zero exit means keep going. This puts the stop condition in a
+deterministic check you control, rather than asking the model to decide.
+
+```console
+$ cat done-check.sh
+#!/usr/bin/env bash
+# Stop once the project builds with no remaining `sorry`s.
+lake build || exit 1
+! grep -rq --include='*.lean' '\bsorry\b' .
+
+$ gerbil run --prompt ralph-prompt.md --ralph 10 --ralph_done done-check.sh
+```
 
 ## Setup and Install
 

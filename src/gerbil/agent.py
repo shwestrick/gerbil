@@ -98,10 +98,8 @@ RALPH_NOTE = """\
 
 You are running in a repeating loop: after this session ends, the same task \
 prompt runs again in a fresh session that builds on the changes you commit now. \
-You have access to a tool called `ralph_done` to terminate this loop. DO NOT \
-USE `ralph_done` EXCEPT FOR EXACTLY HOW YOU ARE INSTRUCTED. You should not \
-attempt to terminate the loop unless you are extremely sure that it is exactly \
-what the user wants.
+Focus on solid, incremental progress that the next session can build on; do not \
+try to do everything at once.
 """
 
 

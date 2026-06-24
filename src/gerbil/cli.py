@@ -219,6 +219,14 @@ def main() -> None:
         "builds on it; outputs are numbered gerbil-<ts>-NN.{jsonl,patch}.",
     )
     run_p.add_argument(
+        "--ralph_done",
+        metavar="SCRIPT",
+        help="Path to a script run inside the container after each --ralph "
+        "session (on that session's committed working tree, from the project "
+        "dir). Exit code 0 ends the ralph loop; non-zero continues. Requires "
+        "--ralph.",
+    )
+    run_p.add_argument(
         "--include-session",
         action="store_true",
         help="Include the session .jsonl log in the commit (folded in via "
@@ -568,6 +576,9 @@ def cmd_run(args) -> None:
         sys.exit("error: --prompt is required (or use --resume SESSION_FILE).")
     if args.ralph is not None and args.ralph < 1:
         sys.exit("error: --ralph N must be >= 1")
+    ralph_done_script = _load_ralph_done_script(
+        args.ralph_done, have_ralph=args.ralph is not None
+    )
 
     project_dir = _resolve_at(args.at)
     prompt_file = Path(args.prompt).resolve()
@@ -683,14 +694,13 @@ def cmd_run(args) -> None:
                     if patch_name and args.ralph:
                         ancestors.append(patch_name)
 
-                    # The model can call ralph_done to end the loop early.
-                    if toolset.ralph_done:
-                        reason = toolset.ralph_done_reason or "task complete"
-                        print(
-                            "\n" + style(f"[ralph_done: {reason}]", "bold", "magenta"),
-                            flush=True,
-                        )
-                        break
+                    # Optionally run the user's termination check on this session's
+                    # committed tree. Skip it on the final iteration (nothing left
+                    # to skip) -- the loop ends anyway.
+                    if ralph_done_script and i < iterations:
+                        print(flush=True)
+                        if _ralph_done(sandbox, ralph_done_script):
+                            break
     except Exception as exc:
         # Catch-all: record the failure as the in-flight session's terminal event
         # (if one is open), point the user at it, and exit non-zero.
@@ -825,6 +835,9 @@ def _resume_run(args) -> None:
     # host-reachable `chain_base` and `ancestors` rebuild this session's base; for
     # a single session, its base commit is the anchor and there are no ancestors.
     ralph = parsed.ralph
+    ralph_done_script = _load_ralph_done_script(
+        args.ralph_done, have_ralph=bool(ralph)
+    )
     anchor, ancestor_patches = _reconstruct_anchor(
         parsed, resume_file, repo_root, patch_dirs
     )
@@ -960,13 +973,11 @@ def _resume_run(args) -> None:
                     if patch_name and ralph:
                         running_ancestors.append(patch_name)
 
-                    if toolset.ralph_done:
-                        reason = toolset.ralph_done_reason or "task complete"
-                        print(
-                            "\n" + style(f"[ralph_done: {reason}]", "bold", "magenta"),
-                            flush=True,
-                        )
-                        break
+                    # Same termination check as a fresh run; skip on the last iter.
+                    if ralph_done_script and i < total_iters:
+                        print(flush=True)
+                        if _ralph_done(sandbox, ralph_done_script):
+                            break
     except Exception as exc:
         if session is not None:
             session.record_error(exc)
@@ -1163,6 +1174,39 @@ def _start_mcp(sandbox, stack):
             file=sys.stderr,
         )
         return None, warning
+
+
+def _load_ralph_done_script(path_str: str | None, *, have_ralph: bool) -> str | None:
+    """Read the --ralph_done check script, or return None if not requested. Exits
+    with a clear message if it's given without --ralph or the file is missing."""
+    if not path_str:
+        return None
+    if not have_ralph:
+        sys.exit("error: --ralph_done only applies to a --ralph session.")
+    p = Path(path_str)
+    if not p.is_file():
+        sys.exit(f"error: --ralph_done script {p} is not a file")
+    return p.read_text()
+
+
+def _ralph_done(sandbox, script: str) -> bool:
+    """Run the --ralph_done check inside the container on the session's committed
+    tree. Exit code 0 means the loop is finished (return True to stop); any other
+    code means keep going. The script's output is shown either way."""
+    print(style("running --ralph_done check...", "bold", "magenta"), flush=True)
+    result = sandbox.run_script(script)
+    out = (result.stdout + result.stderr).strip()
+    if out:
+        print(style(out.replace("\n", "\n  "), "gray"), flush=True)
+    if result.exit_code == 0:
+        print(style("[ralph_done: check passed (exit 0) -- stopping loop]",
+                    "bold", "magenta"), flush=True)
+        return True
+    print(style(
+        f"[ralph_done: check did not pass (exit {result.exit_code}) -- continuing]",
+        "gray",
+    ), flush=True)
+    return False
 
 
 def _run_footer(args, iteration=None, total=None) -> str:
