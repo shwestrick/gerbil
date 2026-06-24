@@ -10,6 +10,7 @@ tool result to the Session as it goes.
 import difflib
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -452,6 +453,80 @@ def _run_turn(model, system, messages, tools, provider, read_file=None):
     return assistant_parts, tool_calls, text, usage
 
 
+# How long to wait between retries of a transient provider failure.
+RETRY_DELAY_SECONDS = 5
+
+# HTTP status codes (and Google RPC status names) that mark a transient, retryable
+# provider failure -- the service is up but momentarily can't serve us.
+_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+_RETRYABLE_STATUS_NAMES = {
+    "unavailable", "resource_exhausted", "internal", "aborted",
+    "deadline_exceeded", "cancelled",
+}
+# Phrases (lowercased) that mark a transient failure when no status is exposed.
+# Kept specific so genuinely permanent errors (bad request, auth, context length)
+# are NOT matched and still abort the run.
+_TRANSIENT_MARKERS = (
+    "unavailable", "overloaded", "rate limit", "ratelimit",
+    "resource exhausted", "too many requests", "try again",
+    "temporarily", "internal error", "internal server error",
+    "bad gateway", "gateway timeout", "service is currently",
+    "connection reset", "connection aborted", "connection error",
+    "server disconnected", "remote end closed", "timed out", "timeout",
+)
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """Whether `exc` is a transient provider failure worth retrying (503/
+    UNAVAILABLE, rate limits, 5xx, dropped connections). Conservative: anything
+    not recognized returns False so permanent errors still abort the run."""
+    for attr in ("status_code", "code", "http_status"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, bool):  # bool is an int subclass; never a status code
+            continue
+        if isinstance(val, int) and val in _RETRYABLE_STATUS_CODES:
+            return True
+        if isinstance(val, str) and val.strip().isdigit() and int(val) in _RETRYABLE_STATUS_CODES:
+            return True
+    code = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(code, int) and code in _RETRYABLE_STATUS_CODES:
+        return True
+    status = getattr(exc, "status", None)
+    if isinstance(status, str) and status.strip().lower() in _RETRYABLE_STATUS_NAMES:
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(m in text for m in _TRANSIENT_MARKERS)
+
+
+def _run_turn_with_retry(
+    model, system, messages, tools, provider, read_file=None, session=None
+):
+    """Run one streamed turn, retrying transient provider failures every
+    RETRY_DELAY_SECONDS until the call succeeds. Everything stays warm across the
+    wait -- the session, the sandbox, and the conversation are untouched; only this
+    one model call is repeated (from the same `messages`, so no state is lost).
+    Non-transient errors propagate immediately, so the run still aborts (and stays
+    resumable) on a real failure. A Ctrl-C during the wait aborts cleanly (it is a
+    BaseException, not caught here)."""
+    attempt = 0
+    while True:
+        try:
+            return _run_turn(model, system, messages, tools, provider, read_file)
+        except Exception as exc:
+            if not _is_transient_error(exc):
+                raise
+            attempt += 1
+            detail = _clip(f"{type(exc).__name__}: {exc}", 200)
+            msg = (
+                f"[provider unavailable: {detail}; retrying in "
+                f"{RETRY_DELAY_SECONDS}s (attempt {attempt})]"
+            )
+            print("\n" + style(msg, "bold", "yellow"), flush=True)
+            if session is not None:
+                session.record_warning(msg)
+            time.sleep(RETRY_DELAY_SECONDS)
+
+
 def _thought_sig(raw_part) -> str | None:
     """Base64 of a Gemini tool-call's thought_signature, for the session log.
 
@@ -565,8 +640,8 @@ def run_session(
         )
         print("\n" + header + _context_suffix(max_context, last_usage), flush=True)
 
-        assistant_parts, tool_calls, final_text, usage = _run_turn(
-            model, system, messages, tools, provider, sandbox.read_file
+        assistant_parts, tool_calls, final_text, usage = _run_turn_with_retry(
+            model, system, messages, tools, provider, sandbox.read_file, session
         )
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
@@ -650,8 +725,8 @@ def run_session(
         messages.append({"role": "user", "content": request})
         session.record_turn("user", request)
 
-        parts, _calls, text, usage = _run_turn(
-            model, system, messages, [], provider
+        parts, _calls, text, usage = _run_turn_with_retry(
+            model, system, messages, [], provider, session=session
         )
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
