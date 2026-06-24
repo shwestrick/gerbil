@@ -254,6 +254,13 @@ def run_session(
     final_text = ""
     stopped_at_max = False
 
+    # In a ralph loop, tag every turn header with the session counter so it stays
+    # visible while scrolling, not just in the once-per-session banner.
+    ralph_tag = (
+        f"[ralph {session.ralph['iteration']}/{session.ralph['total']}] "
+        if session.ralph else ""
+    )
+
     # A resumed conversation that already ends on an assistant message had no
     # pending tool calls -- the model was done. Skip the loop (calling the model
     # again would append a second assistant turn, which the APIs reject) and go
@@ -272,7 +279,10 @@ def run_session(
             break
         turn += 1
 
-        print("\n" + style(f"--- turn {turn} ---", "bold", "dark_red"), flush=True)
+        print(
+            "\n" + style(f"--- {ralph_tag}turn {turn} ---", "bold", "dark_red"),
+            flush=True,
+        )
 
         assistant_parts, tool_calls, final_text, usage = _run_turn(
             model, system, messages, tools, provider
@@ -342,7 +352,10 @@ def run_session(
     if diff.strip() and not stopped_at_max:
         turn += 1
         print(
-            "\n" + style(f"--- turn {turn} (commit message) ---", "bold", "dark_red"),
+            "\n" + style(
+                f"--- {ralph_tag}turn {turn} (commit message) ---",
+                "bold", "dark_red",
+            ),
             flush=True,
         )
 
