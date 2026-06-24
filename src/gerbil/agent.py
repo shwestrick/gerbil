@@ -69,6 +69,9 @@ Guidelines:
   - Do not leave `sorry` in proofs unless the task explicitly allows it.
   - When the task is complete and the project builds, stop and give a short \
 summary of what you did. Do not call any more tools once you are done.
+  - NEVER DO `import Mathlib`. This is extremely expensive and causes the \
+whole system to hang. If you need to import something, only import exactly \
+what you need, and no more.
 """
 
 # Appended to the system prompt when lean-lsp (MCP) tools are available.

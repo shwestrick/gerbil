@@ -14,10 +14,14 @@ gerbil session (lean-lsp-mcp wraps `lake serve` and is stateful + slow to init).
 import asyncio
 import os
 import threading
-from concurrent.futures import TimeoutError as FuturesTimeout
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.types import (
+    CancelledNotification,
+    CancelledNotificationParams,
+    ClientNotification,
+)
 
 from .sandbox import WORKSPACE_DIR
 from .tools import ToolResult
@@ -60,8 +64,15 @@ class McpClient:
             result = mcp.call_tool(name, args)   # -> ToolResult
     """
 
-    def __init__(self, sandbox, project_path: str = WORKSPACE_DIR):
-        self._params = StdioServerParameters(
+    def __init__(
+        self,
+        sandbox,
+        project_path: str = WORKSPACE_DIR,
+        server_params: StdioServerParameters | None = None,
+    ):
+        # server_params lets tests point the client at a local mock MCP server
+        # over stdio; production always connects to lean-lsp-mcp in the container.
+        self._params = server_params or StdioServerParameters(
             command="docker",
             args=[
                 "exec",
@@ -169,7 +180,13 @@ class McpClient:
         return self._disabled
 
     def call_tool(self, name: str, args: dict) -> ToolResult:
-        """Invoke an MCP tool. Never raises -- failures become error ToolResults."""
+        """Invoke an MCP tool. Never raises -- failures become error ToolResults.
+
+        On timeout we don't just abandon the call: the timeout is enforced inside
+        the event loop (asyncio.wait_for cancels the in-flight request) and we send
+        the server an MCP `notifications/cancelled` for that request, so a heavy
+        job it is still running (e.g. a Lean worker loading Mathlib) is actually
+        torn down instead of lingering and starving later tool calls."""
         if name in NETWORK_TOOLS:
             # Defense in depth: these are filtered out of the advertised schemas,
             # so the agent should never reach here -- but refuse outright if it
@@ -182,11 +199,18 @@ class McpClient:
         if self._session is None or self._loop is None:
             return ToolResult("mcp session is not available", is_error=True)
         timeout = TOOL_TIMEOUTS.get(name, DEFAULT_TIMEOUT)
-        coro = self._session.call_tool(name, arguments=args)
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        fut = asyncio.run_coroutine_threadsafe(
+            self._call_with_cancel(name, args, timeout), self._loop
+        )
         try:
-            result = fut.result(timeout=timeout)
-        except FuturesTimeout:
+            # The inner wait_for bounds the call at `timeout`; allow a little extra
+            # for the cancellation round-trip before we abandon the future itself.
+            result = fut.result(timeout=timeout + 10)
+        except TimeoutError:
+            # asyncio.TimeoutError (inner wait_for) and concurrent.futures'
+            # TimeoutError are both builtins.TimeoutError on 3.11+. Either way the
+            # call timed out; _call_with_cancel has already asked the server to
+            # cancel. Drop the future defensively and report the timeout.
             fut.cancel()
             return ToolResult(
                 f"[mcp tool {name} timed out after {timeout:.0f}s]", is_error=True
@@ -194,6 +218,42 @@ class McpClient:
         except Exception as e:
             return ToolResult(f"{type(e).__name__}: {e}", is_error=True)
         return _to_result(result)
+
+    async def _call_with_cancel(self, name: str, args: dict, timeout: float):
+        """Run one tool call bounded by `timeout` (runs on the loop thread). On
+        timeout, asyncio.wait_for cancels the local request; we then notify the
+        server to cancel it too, so its work actually stops."""
+        # The request id the SDK will assign to this call. gerbil issues one tool
+        # call at a time, so the next send_request -- call_tool's -- uses this id.
+        req_id = getattr(self._session, "_request_id", None)
+        try:
+            return await asyncio.wait_for(
+                self._session.call_tool(name, arguments=args), timeout
+            )
+        except asyncio.TimeoutError:
+            if req_id is not None:
+                await self._cancel_request(
+                    req_id, f"gerbil client timeout after {timeout:.0f}s"
+                )
+            raise
+
+    async def _cancel_request(self, req_id, reason: str) -> None:
+        """Send the server an MCP `notifications/cancelled` for `req_id` so it
+        aborts the in-flight request and frees its work. Best effort -- a failure
+        here must not mask the timeout the caller is already handling."""
+        try:
+            await self._session.send_notification(
+                ClientNotification(
+                    CancelledNotification(
+                        method="notifications/cancelled",
+                        params=CancelledNotificationParams(
+                            requestId=req_id, reason=reason
+                        ),
+                    )
+                )
+            )
+        except Exception:
+            pass
 
 
 def _to_schema(tool) -> dict:
