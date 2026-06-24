@@ -65,16 +65,20 @@ LSP_TOOLS_NOTE = """\
 
 You also have lean_* tools backed by the Lean language server. Prefer them for \
 understanding the proof state instead of guessing:
-  - lean_build: full build of the project
+  - lean_build: full build of the project, refreshes .olean files
   - lean_goal / lean_term_goal: the proof state at a position (line/col are 1-indexed)
   - lean_diagnostic_messages: compiler errors/warnings for a file
   - lean_hover_info: type signature and docs for an identifier
   - lean_multi_attempt: try candidate tactics at a position WITHOUT editing the file
+  - lean_run_code: run a code snippet without needing to write it to a file
   - search tools (lean_leansearch, lean_loogle, lean_local_search, ...): find \
 mathlib lemmas -- these are RATE-LIMITED, so use them sparingly
 The lean_* tools never modify files; keep using edit_file / write_file for changes. \
 After editing a file, re-run lean_build (or a diagnostics call) so the language \
 server sees your changes.
+
+If you can, prefer using `lean_build` instead of running the bash command \
+`lake build`.
 """
 
 
@@ -147,8 +151,15 @@ def _commit_request(diff: str) -> str:
 WRITE_FILE_INLINE_MAX_LINES = 10     # show contents inline at/below this
 WRITE_FILE_INLINE_MAX_CHARS = 2000   # ...and only if not too large overall
 EDIT_FILE_DIFF_MAX_LINES = 30        # show the diff at/below this; else summarize
+SNIPPET_INLINE_MAX_LINES = 12        # lean_multi_attempt: show a snippet inline below this
+SNIPPET_INLINE_MAX_CHARS = 800       # ...and only if not too large overall
+POSITION_CONTEXT_LINES = 2           # lines of context shown around a queried position
 _BODY_INDENT = "     "               # aligns body lines under "  -> "
 _LINE_CLIP = 200                     # max width of a shown content/diff line
+
+# lean_* tools that query the language server at a (file_path, line, column) and
+# read nicely with the source line + a caret at the column.
+_POSITION_TOOLS = {"lean_goal", "lean_term_goal", "lean_hover_info"}
 
 
 def _clip(s: str, width: int = _LINE_CLIP) -> str:
@@ -178,6 +189,12 @@ def _format_tool_call(name: str, args: dict, read_file=None) -> str:
         and isinstance(args.get("new_string"), str)
     ):
         return f"{head} {_render_edit_file(args, read_file)}"
+    if name == "lean_multi_attempt" and isinstance(args.get("snippets"), list):
+        return f"{head} {_render_lean_multi_attempt(args)}"
+    if name == "lean_run_code" and isinstance(args.get("code"), str):
+        return f"{head} {_render_lean_run_code(args)}"
+    if name in _POSITION_TOOLS:
+        return f"{head} {_render_position(args, read_file)}"
     return f"{head}({args})"
 
 
@@ -260,6 +277,87 @@ def _render_edit_file(args: dict, read_file=None) -> str:
             old_ln += 1
             new_ln += 1
     return f"{path}\n" + "\n".join(rendered)
+
+
+def _render_lean_multi_attempt(args: dict) -> str:
+    """lean_multi_attempt tries candidate snippets (often many lines of Lean) at a
+    position. Show file:line:col and each snippet -- inline when short, summarized
+    when long -- instead of dumping the whole snippets list."""
+    loc = str(args.get("file_path", "?"))
+    line, col = args.get("line"), args.get("column")
+    if line is not None:
+        loc += f":{line}" + (f":{col}" if col is not None else "")
+    head = style(loc, TOOL_COLOR)
+    snippets = args.get("snippets") or []
+    if len(snippets) != 1:
+        head += " " + style(f"({len(snippets)} snippets)", "gray")
+    return "\n".join([head] + [_render_snippet(i, str(s)) for i, s in enumerate(snippets, 1)])
+
+
+def _render_position(args: dict, read_file=None) -> str:
+    """For a position-query lean_* tool: show file:line:col, then the source line
+    at that position (with a few lines of context) and a caret under the column.
+    Falls back to just the location when the file can't be read."""
+    path = str(args.get("file_path", "?"))
+    line, col = args.get("line"), args.get("column")
+    loc = path
+    if isinstance(line, int):
+        loc += f":{line}" + (f":{col}" if isinstance(col, int) else "")
+    loc = style(loc, TOOL_COLOR)
+    if read_file is None or not isinstance(line, int):
+        return loc
+    try:
+        lines = read_file(path).splitlines()
+    except Exception:
+        return loc
+    if not 1 <= line <= len(lines):
+        return loc
+    out = [loc]
+    lo = max(1, line - POSITION_CONTEXT_LINES)
+    hi = min(len(lines), line + POSITION_CONTEXT_LINES)
+    for n in range(lo, hi + 1):
+        text = _clip(lines[n - 1])
+        out.append(_BODY_INDENT + _gutter(n) + style(text, "bold" if n == line else "gray"))
+        if n == line and isinstance(col, int) and col >= 1:
+            pad = " " * (min(col, len(text) + 1) - 1)
+            out.append(_BODY_INDENT + _gutter(None) + pad + style("^", TOOL_COLOR))
+    return "\n".join(out)
+
+
+def _render_lean_run_code(args: dict) -> str:
+    """lean_run_code runs a standalone Lean snippet. Show the code (with a
+    line-number gutter) when short, or a summary when long, instead of dumping
+    the whole `code` string."""
+    code = args["code"]
+    lines = code.splitlines()
+    if not lines:
+        return style("(empty)", "gray")
+    if len(lines) == 1:
+        return style(_clip(lines[0]), "gray")
+    if len(lines) <= SNIPPET_INLINE_MAX_LINES and len(code) <= SNIPPET_INLINE_MAX_CHARS:
+        body = "\n".join(
+            _BODY_INDENT + _gutter(i) + style(_clip(ln), "gray")
+            for i, ln in enumerate(lines, 1)
+        )
+        return f"{style(f'({len(lines)} lines)', 'dim')}\n{body}"
+    first = next((ln for ln in lines if ln.strip()), lines[0])
+    summary = f"({len(lines)} lines, {len(code)} chars)"
+    return f"{style(summary, 'dim')} {style(_clip(first), 'gray')}"
+
+
+def _render_snippet(i: int, snip: str) -> str:
+    label = style(f"[{i}]", "dim")
+    lines = snip.splitlines()
+    if not lines:
+        return f"{_BODY_INDENT}{label} {style('(empty)', 'gray')}"
+    if len(lines) == 1:
+        return f"{_BODY_INDENT}{label} {style(_clip(lines[0]), 'gray')}"
+    if len(lines) <= SNIPPET_INLINE_MAX_LINES and len(snip) <= SNIPPET_INLINE_MAX_CHARS:
+        inner = "\n".join(_BODY_INDENT + "    " + style(_clip(ln), "gray") for ln in lines)
+        return f"{_BODY_INDENT}{label} {style(f'({len(lines)} lines)', 'dim')}\n{inner}"
+    first = next((ln for ln in lines if ln.strip()), lines[0])
+    summary = f"({len(lines)} lines, {len(snip)} chars)"
+    return f"{_BODY_INDENT}{label} {style(summary, 'dim')} {style(_clip(first), 'gray')}"
 
 
 def _run_turn(model, system, messages, tools, provider, read_file=None):
