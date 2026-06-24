@@ -7,6 +7,8 @@ and the sandbox tools (tools.dispatch), recording every turn, tool call, and
 tool result to the Session as it goes.
 """
 
+import difflib
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -139,6 +141,102 @@ def _commit_request(diff: str) -> str:
     )
 
 
+# Cosmetic limits for rendering write_file / edit_file tool calls in the
+# terminal. Display-only: they never affect what is written, dispatched, or
+# recorded to the session log.
+WRITE_FILE_INLINE_MAX_LINES = 10     # show contents inline at/below this
+WRITE_FILE_INLINE_MAX_CHARS = 2000   # ...and only if not too large overall
+EDIT_FILE_DIFF_MAX_LINES = 30        # show the diff at/below this; else summarize
+_BODY_INDENT = "     "               # aligns body lines under "  -> "
+_LINE_CLIP = 200                     # max width of a shown content/diff line
+
+
+def _clip(s: str, width: int = _LINE_CLIP) -> str:
+    return s if len(s) <= width else s[: width - 3] + "..."
+
+
+def _gutter(n: int | None) -> str:
+    """A right-aligned, dim line-number gutter (blank when n is None)."""
+    return style(f"{'' if n is None else n:>4} ", "dim")
+
+
+def _format_tool_call(name: str, args: dict) -> str:
+    """A pretty, single- or multi-line rendering of a tool call for the terminal.
+
+    Purely cosmetic: write_file shows its contents (when small) or a summary, and
+    edit_file shows a diff (or a summary). Every other tool keeps the plain
+    `name(args)` form. The dict passed to the tool and recorded to the session is
+    unaffected -- this only changes what is printed."""
+    arrow = style("->", TOOL_COLOR)
+    label = style(name, "bold", TOOL_COLOR)
+    head = f"  {arrow} {label}"
+    if name == "write_file" and isinstance(args.get("content"), str):
+        return f"{head} {_render_write_file(args)}"
+    if (
+        name == "edit_file"
+        and isinstance(args.get("old_string"), str)
+        and isinstance(args.get("new_string"), str)
+    ):
+        return f"{head} {_render_edit_file(args)}"
+    return f"{head}({args})"
+
+
+def _render_write_file(args: dict) -> str:
+    path = style(str(args.get("path", "?")), TOOL_COLOR)
+    content = args["content"]
+    lines = content.splitlines()
+    if not lines:
+        return f"{path} {style('(empty)', 'gray')}"
+    if len(lines) <= WRITE_FILE_INLINE_MAX_LINES and len(content) <= WRITE_FILE_INLINE_MAX_CHARS:
+        body = "\n".join(
+            _BODY_INDENT + _gutter(i) + style(_clip(ln), "gray")
+            for i, ln in enumerate(lines, 1)
+        )
+        return f"{path}\n{body}"
+    n = len(lines)
+    summary = f"({n} line{'' if n == 1 else 's'}, " \
+              f"{len(content.encode('utf-8', 'replace'))} bytes)"
+    return f"{path} {style(summary, 'gray')}"
+
+
+def _render_edit_file(args: dict) -> str:
+    path = style(str(args.get("path", "?")), TOOL_COLOR)
+    diff = [
+        d for d in difflib.unified_diff(
+            args["old_string"].splitlines(), args["new_string"].splitlines(),
+            lineterm="", n=2,
+        )
+        if not d.startswith(("---", "+++"))
+    ]
+    if not diff:
+        return f"{path} {style('(no textual change)', 'gray')}"
+    if len(diff) > EDIT_FILE_DIFF_MAX_LINES:
+        adds = sum(1 for d in diff if d.startswith("+"))
+        dels = sum(1 for d in diff if d.startswith("-"))
+        return f"{path} {style(f'(+{adds} -{dels} lines)', 'gray')}"
+    # Track line numbers from each hunk header: removed lines show their position
+    # in the original, added lines their position in the new text.
+    rendered = []
+    old_ln = new_ln = 0
+    for d in diff:
+        if d.startswith("@@"):
+            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", d)
+            if m:
+                old_ln, new_ln = int(m.group(1)), int(m.group(2))
+            rendered.append(_BODY_INDENT + _gutter(None) + style(d, "dim"))
+        elif d.startswith("-"):
+            rendered.append(_BODY_INDENT + _gutter(old_ln) + style(_clip(d), "red"))
+            old_ln += 1
+        elif d.startswith("+"):
+            rendered.append(_BODY_INDENT + _gutter(new_ln) + style(_clip(d), "green"))
+            new_ln += 1
+        else:  # context line (leading space)
+            rendered.append(_BODY_INDENT + _gutter(new_ln) + style(_clip(d), "gray"))
+            old_ln += 1
+            new_ln += 1
+    return f"{path}\n" + "\n".join(rendered)
+
+
 def _run_turn(model, system, messages, tools, provider):
     """Stream a single turn, printing text and tool calls live.
 
@@ -158,11 +256,7 @@ def _run_turn(model, system, messages, tools, provider):
             if current_text:
                 assistant_parts.append({"type": "text", "text": current_text})
                 current_text = ""
-            print(
-                f"\n  {style('->', TOOL_COLOR)} "
-                f"{style(event.name, 'bold', TOOL_COLOR)}({event.args})",
-                flush=True,
-            )
+            print("\n" + _format_tool_call(event.name, event.args), flush=True)
             tool_calls.append({
                 "name": event.name,
                 "args": event.args,
