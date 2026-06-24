@@ -1,4 +1,5 @@
 import io
+import os
 import posixpath
 import subprocess
 import tarfile
@@ -9,6 +10,28 @@ from pathlib import Path
 import docker
 
 WORKSPACE_DIR = "/workspace/project"
+
+
+def _host_timezone() -> str | None:
+    """The host's IANA timezone name (e.g. "America/New_York"), so the container
+    can be pinned to it. Without this the container runs in UTC, and every git
+    commit the agent (or gerbil's squash) makes inside it is timestamped in UTC
+    with a +0000 offset -- hours off from the user's wall clock.
+
+    Prefers an explicit TZ env var, then the target of the /etc/localtime symlink
+    (the everywhere-on-Unix convention, including macOS). Returns None if neither
+    is available, leaving the container at its default (UTC)."""
+    tz = os.environ.get("TZ")
+    if tz:
+        return tz
+    try:
+        target = os.readlink("/etc/localtime")
+    except OSError:
+        return None
+    # .../zoneinfo/America/New_York -> America/New_York
+    marker = "zoneinfo/"
+    idx = target.rfind(marker)
+    return target[idx + len(marker):] if idx != -1 else None
 
 # Must match the uid/gid of the user created in the Dockerfile, so files we
 # upload land owned by that user and git operations don't hit ownership errors.
@@ -75,12 +98,17 @@ class LeanSandbox:
         return posixpath.join(WORKSPACE_DIR, self._subdir) if self._subdir else WORKSPACE_DIR
 
     def __enter__(self) -> "LeanSandbox":
+        # Pin the container to the host's timezone so git commit dates (and any
+        # `date` the agent runs) match the user's wall clock instead of UTC. The
+        # image ships full tzdata, so the IANA name resolves inside the container.
+        tz = _host_timezone()
         self._container = self._docker.containers.run(
             self.image,
             command="sleep infinity",
             detach=True,
             auto_remove=True,
             working_dir=WORKSPACE_DIR,
+            environment={"TZ": tz} if tz else None,
         )
         self._wait_running()
         self._upload_project()
