@@ -230,15 +230,41 @@ class LeanSandbox:
         return self.run("lake build", timeout=timeout)
 
     def run_script(self, script: str, timeout: float = 300.0) -> CommandResult:
-        """Upload `script`, make it executable, and run it on the current working
-        tree from the Lake project directory. Invoked by path so a `#!` shebang is
-        honored (and the shell falls back to running it as a shell script when
-        there is none). Used for the --ralph_done termination check: its exit code
-        is the signal, and stdout/stderr are returned for display. Lives in /tmp,
-        outside the work tree, so it never shows up in a diff."""
-        path = "/tmp/gerbil-ralph-done-check"
-        self.write_file(path, script)
-        return self.run(f"chmod +x {_quote(path)} && {_quote(path)}", timeout=timeout)
+        """Upload `script` INTO the Lake project directory and run it there, so it
+        behaves exactly as if the user had invoked it from the project root: the
+        CWD is the project, and the script file itself lives in the project, so
+        `$0`, `dirname "$0"`, and any sibling-relative paths resolve into the
+        project. Running it from /tmp instead silently breaks the common
+        `cd "$(dirname "$0")"` idiom -- the script lands in /tmp, where (among
+        other things) elan can't find the project's lean-toolchain and reports
+        "no default toolchain configured".
+
+        Invoked by path so a `#!` shebang is honored (and the shell falls back to
+        a shell script when there is none). Used for the --ralph_done termination
+        check: its exit code is the signal, and stdout/stderr are returned for
+        display. The uploaded file is removed afterward -- and the check only runs
+        after the session's patch is produced -- so it never shows up in a diff."""
+        # Pick a unique filename via mktemp so we never collide with (or clobber)
+        # an existing file in the project. run()'s workdir is the project dir, and
+        # a bare (slashless) template makes mktemp create the file there and print
+        # its project-relative name -- exactly where we want the script to live.
+        mk = self.run("mktemp .gerbil-ralph-done-check.XXXXXX")
+        name = mk.stdout.strip()
+        if mk.exit_code != 0 or not name:
+            raise RuntimeError(
+                "could not create a temp file for the --ralph_done script:\n"
+                f"{mk.stderr or mk.stdout}"
+            )
+        # mktemp made an empty file; overwrite it with the script contents.
+        self.write_file(name, script)
+        try:
+            return self.run(
+                f"chmod +x {_quote(name)} && {_quote('./' + name)}", timeout=timeout
+            )
+        finally:
+            # Best-effort cleanup so the check script never lingers in the tree
+            # (e.g. to be swept into the next ralph session's commit).
+            self.run(f"rm -f {_quote(name)}")
 
     def run(self, command: str, timeout: float = 60.0) -> CommandResult:
         """Run a shell command in the sandbox workspace directory."""

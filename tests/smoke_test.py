@@ -201,6 +201,26 @@ def main() -> None:
             check("ralph_done: subdir is CWD, sees project-local Hello.lean",
                   r.exit_code == 0, repr((r.exit_code, r.stdout, r.stderr)))
 
+            # Regression: the script is uploaded INTO the project dir (not /tmp),
+            # so the common `cd "$(dirname "$0")"` idiom resolves to the project --
+            # not a temp dir where the project's lean-toolchain is invisible (which
+            # made elan report "no default toolchain configured"). $0 must point
+            # into the project.
+            r = sb.run_script('#!/bin/bash\ncd "$(dirname "$0")"\npwd\ntest -f Hello.lean\n')
+            check("ralph_done: dirname \"$0\" resolves into the project dir",
+                  r.exit_code == 0
+                  and r.stdout.strip().splitlines()[:1] == ["/workspace/project/lean/proof"],
+                  repr((r.exit_code, r.stdout)))
+            # A failing check still propagates its exit code (the cleanup in the
+            # finally must not clobber it).
+            check("ralph_done: nonzero exit propagates",
+                  sb.run_script("#!/bin/sh\nexit 7\n").exit_code == 7)
+            # The uploaded script is cleaned up -- never left to be swept into the
+            # next ralph session's commit.
+            ls = sb.run("ls -a").stdout
+            check("ralph_done: temp script removed after run",
+                  "gerbil-ralph-done" not in ls, ls)
+
             # edits + diff still work; diff paths are relative to the repo root
             sb.write_file("Hello.lean", "def hello := 99\n")
             diff = sb.get_diff()
