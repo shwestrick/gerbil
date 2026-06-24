@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from gerbil.mcp_client import McpClient
+from gerbil.mcp_client import NETWORK_TOOLS, McpClient
 from gerbil.sandbox import LeanSandbox
 
 TOOLCHAIN = "leanprover/lean4:v4.15.0"
@@ -65,6 +65,26 @@ def main() -> None:
                 )
                 check("schemas in gerbil format", shape_ok)
                 print(f"  {len(schemas)} tools: {', '.join(sorted(names))}")
+
+                # -- Network tools must never be exposed: the agent must not be
+                # able to (or attempt to) leave the sandbox. ------------------
+                leaked = names & NETWORK_TOOLS
+                check("network tools filtered out of schemas",
+                      not leaked, f"leaked: {sorted(leaked)}")
+                check("local search tool is kept", "lean_local_search" in names,
+                      str(sorted(names)))
+                check("disabled list = the filtered network tools",
+                      set(mcp.disabled_tools) <= NETWORK_TOOLS
+                      and set(mcp.disabled_tools).isdisjoint(names),
+                      str(mcp.disabled_tools))
+                if mcp.disabled_tools:
+                    print(f"  {len(mcp.disabled_tools)} disabled: "
+                          f"{', '.join(mcp.disabled_tools)}")
+                # Defense in depth: a direct call to a network tool is refused
+                # outright (no network attempt), even though it isn't advertised.
+                refused = mcp.call_tool("lean_loogle", {"query": "?a = ?a"})
+                check("direct network-tool call is refused",
+                      refused.is_error and "disabled" in refused.content, refused.content)
 
                 # -- Phase 2: staleness check (slow; boots the LSP) -----------
                 print("\n[phase 2] warming up the toolchain + build (slow)...")

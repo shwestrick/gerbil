@@ -117,16 +117,21 @@ project where it is run, to store project-specific session data and patches.
 
 ## Lean LSP tools (MCP)
 
-By default, gerbil enables all
+By default, gerbil enables the
 [lean-lsp-mcp](https://github.com/oOo0oOo/lean-lsp-mcp) tools — proof state
 (`lean_goal`), diagnostics, hover info, tactic trials (`lean_multi_attempt`),
-and mathlib search — alongside the built-in `bash`/`read_file`/`write_file`/
-`edit_file` tools. The MCP server runs inside the sandbox container (where the
-Lean toolchain lives); gerbil connects to it over `docker exec`.
+and local declaration search (`lean_local_search`) — alongside the built-in
+`bash`/`read_file`/`write_file`/`edit_file` tools. The MCP server runs inside the
+sandbox container (where the Lean toolchain lives); gerbil connects to it over
+`docker exec`.
 
-Use `gerbil run --no-mcp` to disable it and use only the built-in tools.
-If the MCP server fails to start, gerbil warns and continues with the built-in
-tools.
+A few lean-lsp tools are intentionally disabled for better sandboxing:
+`lean_leansearch`, `lean_loogle`, `lean_leanfinder`, `lean_state_search`,
+and `lean_hammer_premise`.
+
+Use `gerbil run --no-mcp` to disable the MCP tools entirely and use only the
+built-in tools. If the MCP server fails to start, gerbil warns and continues with
+the built-in tools.
 
 ## Mathlib caching
 

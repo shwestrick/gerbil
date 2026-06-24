@@ -26,14 +26,27 @@ from .tools import ToolResult
 # tools are slow; everything else uses the default.
 DEFAULT_TIMEOUT = 60.0
 INIT_TIMEOUT = 120.0
+
+# lean-lsp-mcp tools that reach EXTERNAL, internet-hosted services (the mathlib
+# search / premise-selection engines). The sandbox is meant to be hermetic -- the
+# agent must not leave it -- and in practice these calls also trigger host
+# network-permission prompts and can wedge the whole MCP server when one stalls
+# (a stall there starved even local tools like lean_run_code). So gerbil never
+# exposes them to the agent. lean_local_search is deliberately NOT here: it
+# searches the LOCAL Lean/mathlib source with ripgrep, no network.
+NETWORK_TOOLS = frozenset({
+    "lean_leansearch",      # natural language -> mathlib (leansearch.net)
+    "lean_loogle",          # type/name pattern -> mathlib (loogle.lean-lang.org)
+    "lean_leanfinder",      # semantic/conceptual search (external service)
+    "lean_state_search",    # goal -> closing lemmas (external premise search)
+    "lean_hammer_premise",  # goal -> premises for simp/aesop (external selector)
+})
+
+# Slow LOCAL tools that need a longer timeout than the default. (The external
+# search tools are intentionally absent -- they are filtered out, never run.)
 TOOL_TIMEOUTS = {
     "lean_build": 300.0,
     "lean_profile_proof": 180.0,
-    "lean_leansearch": 45.0,
-    "lean_loogle": 45.0,
-    "lean_leanfinder": 45.0,
-    "lean_state_search": 45.0,
-    "lean_hammer_premise": 45.0,
 }
 
 
@@ -72,6 +85,7 @@ class McpClient:
         self._ready = threading.Event()
         self._startup_error: BaseException | None = None
         self._schemas: list[dict] = []
+        self._disabled: list[str] = []  # network tools filtered out at list time
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -122,7 +136,18 @@ class McpClient:
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     listed = await session.list_tools()
-                    self._schemas = [_to_schema(t) for t in listed.tools]
+                    # Drop the network tools here, at the source: the agent never
+                    # sees them in its schema list, so it cannot select (or even
+                    # attempt) a call that would leave the sandbox. Keep a record of
+                    # what was dropped for the startup banner.
+                    self._disabled = sorted(
+                        t.name for t in listed.tools if t.name in NETWORK_TOOLS
+                    )
+                    self._schemas = [
+                        _to_schema(t)
+                        for t in listed.tools
+                        if t.name not in NETWORK_TOOLS
+                    ]
                     self._session = session
                     self._ready.set()      # unblock start()
                     await self._stop.wait()  # park until close()
@@ -133,11 +158,27 @@ class McpClient:
     # ---- synchronous API -------------------------------------------------
 
     def list_tools(self) -> list[dict]:
-        """Tool schemas in gerbil format ({name, description, input_schema})."""
+        """Tool schemas in gerbil format ({name, description, input_schema}).
+        Network tools are already filtered out (see NETWORK_TOOLS)."""
         return self._schemas
+
+    @property
+    def disabled_tools(self) -> list[str]:
+        """Names of the network tools that were filtered out (never exposed to
+        the agent), for reporting at startup."""
+        return self._disabled
 
     def call_tool(self, name: str, args: dict) -> ToolResult:
         """Invoke an MCP tool. Never raises -- failures become error ToolResults."""
+        if name in NETWORK_TOOLS:
+            # Defense in depth: these are filtered out of the advertised schemas,
+            # so the agent should never reach here -- but refuse outright if it
+            # somehow does, rather than leaving the sandbox.
+            return ToolResult(
+                f"[{name} is disabled: it requires external network access, which "
+                "is not allowed inside the sandbox]",
+                is_error=True,
+            )
         if self._session is None or self._loop is None:
             return ToolResult("mcp session is not available", is_error=True)
         timeout = TOOL_TIMEOUTS.get(name, DEFAULT_TIMEOUT)

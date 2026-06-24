@@ -63,7 +63,9 @@ pyproject.toml          packaging; entry point is gerbil.cli:main
    all git-tracked files + the `.git` dir, configure a `gerbil` committer
    identity, and `lake exe cache get` (skip with `--skip-cache`).
 3. **MCP start** (`cli._start_mcp`): launch lean-lsp-mcp inside the container; on
-   failure, warn and continue with built-in tools only.
+   failure, warn and continue with built-in tools only. The network-backed search
+   tools (`mcp_client.NETWORK_TOOLS`) are filtered out of the advertised schemas
+   and refused if invoked, so the agent can't (and won't try to) leave the sandbox.
 4. **Agent loop** (`agent.run_session`): stream turns; execute tool calls via
    `Toolset.dispatch`; record everything to the `Session`; refresh the
    `.wip.patch` snapshot after each tool-running turn. When the model stops

@@ -82,8 +82,8 @@ understanding the proof state instead of guessing:
   - lean_hover_info: type signature and docs for an identifier
   - lean_multi_attempt: try candidate tactics at a position WITHOUT editing the file
   - lean_run_code: run a code snippet without needing to write it to a file
-  - search tools (lean_leansearch, lean_loogle, lean_local_search, ...): find \
-mathlib lemmas -- these are RATE-LIMITED, so use them sparingly
+  - lean_local_search: search the LOCAL Lean/mathlib source for declarations and \
+lemmas (ripgrep-backed) -- use it before guessing a lemma name
 The lean_* tools never modify files; keep using edit_file / write_file for changes. \
 After editing a file, re-run lean_build (or a diagnostics call) so the language \
 server sees your changes.

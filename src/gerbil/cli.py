@@ -1252,10 +1252,13 @@ def _start_mcp(sandbox, stack):
         from .mcp_client import McpClient
 
         mcp = stack.enter_context(McpClient(sandbox, project_path=sandbox.project_path))
-        print(
-            style(f"[mcp: {len(mcp.list_tools())} lean tools available]", "gray"),
-            flush=True,
-        )
+        banner = f"[mcp: {len(mcp.list_tools())} lean tools available"
+        if mcp.disabled_tools:
+            # Surface that the network tools were withheld, so it is clear the
+            # sandbox stays hermetic (and why those tools aren't offered).
+            banner += f"; {len(mcp.disabled_tools)} network tools disabled"
+        banner += "]"
+        print(style(banner, "gray"), flush=True)
         return mcp, None
     except Exception as exc:
         warning = f"lean-lsp MCP unavailable: {type(exc).__name__}: {exc}"
