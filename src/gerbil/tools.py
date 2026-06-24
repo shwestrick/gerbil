@@ -171,6 +171,17 @@ def dispatch(sandbox: LeanSandbox, name: str, args: dict) -> ToolResult:
         return ToolResult(f"{type(e).__name__}: {e}", is_error=True)
 
 
+# Appended to gerbil-side MCP failures (timeouts, transport errors like
+# ClosedResourceError, a lost session) to nudge the model toward recovery instead
+# of retrying into the same wall. Deliberately NOT added to policy rejections
+# (network tools, `import Mathlib`) or to normal tool-level errors, where
+# restarting the server would not help.
+RESET_HINT = (
+    " [hint: if the Lean server keeps timing out or failing like this, call the "
+    "reset_lean_server tool to restart it, then retry.]"
+)
+
+
 # A gerbil-provided tool (not from the sandbox or the MCP server) that restarts
 # the lean-lsp language server. Offered to the agent only when MCP is enabled, and
 # handled directly by the Toolset (see _reset_lean_server).
@@ -235,7 +246,11 @@ class Toolset:
             try:
                 return self._mcp.call_tool(name, args)
             except Exception as e:
-                return ToolResult(f"{type(e).__name__}: {e}", is_error=True)
+                # call_tool already turns failures into ToolResults; this is a
+                # belt-and-suspenders path for anything that still escapes.
+                return ToolResult(
+                    f"{type(e).__name__}: {e}" + RESET_HINT, is_error=True
+                )
         return dispatch(self._sandbox, name, args)
 
     def _reset_lean_server(self) -> ToolResult:

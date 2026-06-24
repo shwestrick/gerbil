@@ -58,6 +58,8 @@ def main() -> None:
         check("slow call times out", r.is_error and "timed out" in r.content, r.content)
         check("slow call returns promptly (~timeout, not 30s)", elapsed < 8,
               f"{elapsed:.1f}s")
+        check("timeout suggests reset_lean_server", "reset_lean_server" in r.content,
+              r.content)
 
         # ... and the server must have CANCELLED the job (the heart of the test):
         # poll the marker the mock writes from its CancelledError handler.

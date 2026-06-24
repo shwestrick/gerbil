@@ -25,7 +25,7 @@ from mcp.types import (
 )
 
 from .sandbox import WORKSPACE_DIR
-from .tools import ToolResult
+from .tools import RESET_HINT, ToolResult
 
 # Per-tool timeouts (seconds). lake build and the rate-limited external search
 # tools are slow; everything else uses the default.
@@ -273,7 +273,7 @@ class McpClient:
                 is_error=True,
             )
         if self._session is None or self._loop is None:
-            return ToolResult("mcp session is not available", is_error=True)
+            return ToolResult("mcp session is not available." + RESET_HINT, is_error=True)
         timeout = TOOL_TIMEOUTS.get(name, DEFAULT_TIMEOUT)
         fut = asyncio.run_coroutine_threadsafe(
             self._call_with_cancel(name, args, timeout), self._loop
@@ -289,10 +289,11 @@ class McpClient:
             # cancel. Drop the future defensively and report the timeout.
             fut.cancel()
             return ToolResult(
-                f"[mcp tool {name} timed out after {timeout:.0f}s]", is_error=True
+                f"[mcp tool {name} timed out after {timeout:.0f}s]" + RESET_HINT,
+                is_error=True,
             )
         except Exception as e:
-            return ToolResult(f"{type(e).__name__}: {e}", is_error=True)
+            return ToolResult(f"{type(e).__name__}: {e}" + RESET_HINT, is_error=True)
         return _to_result(result)
 
     async def _call_with_cancel(self, name: str, args: dict, timeout: float):

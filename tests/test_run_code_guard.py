@@ -52,6 +52,10 @@ def main() -> None:
     r = mcp.call_tool("lean_run_code", {"code": "import Mathlib\n#check Nat.repr_inj"})
     check("call_tool rejects import Mathlib",
           r.is_error and "not allowed" in r.content, r.content)
+    # A policy rejection is not a server-health problem, so it must NOT suggest
+    # reset_lean_server (restarting wouldn't change the rejection).
+    check("import-Mathlib rejection does not suggest reset",
+          "reset_lean_server" not in r.content, r.content)
 
     # A specific import passes the guard (falls through to the not-started session).
     r = mcp.call_tool("lean_run_code", {"code": "import Mathlib.Data.Nat.Basic\n#check Nat"})
