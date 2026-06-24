@@ -9,8 +9,9 @@ Usage:
 and `--version`. --at defaults to the current directory.)
 
 The agent works on the real repository (full history) inside the container.
-Each session's changes are committed there, and the result is emitted as a
-git format-patch -- a single .patch file holding the commit title, message, and
+Each session's changes -- including any intermediate commits the agent made
+itself -- are squashed into a single commit, and the result is emitted as a
+git format-patch: a single .patch file holding the commit title, message, and
 diff, committed on the host with `gerbil commit` (git am).
 
 Outputs:
@@ -359,44 +360,35 @@ def _finalize_session(
     session_path: Path, patch_path: Path, out_dir: Path, archive_dir: Path,
     include_session: bool, footer: str,
 ) -> str | None:
-    """Commit the agent's work and emit its format-patch. Shared by `gerbil run`
-    and `--resume`. Returns the patch filename if HEAD advanced (a patch was
-    written), else None."""
+    """Squash the session's work -- the agent's intermediate commits plus its
+    uncommitted changes -- into a single commit on top of base, then emit its
+    format-patch (always exactly one patch). Shared by `gerbil run` and
+    `--resume`. Returns the patch filename if anything was produced, else None."""
     if result.commit_message:
-        full = result.commit_message + "\n\n" + footer + "\n"
-        sandbox.commit(full)
+        message = result.commit_message + "\n\n" + footer + "\n"
+    else:
+        # The session stopped before generating a message (e.g. hit max turns);
+        # still collapse its work into one commit, under a stub message.
+        message = "gerbil session (incomplete; no commit message)\n\n" + footer + "\n"
+
+    squashed = sandbox.squash_commit(base, message)
 
     print(f"{style('session:', 'bold')} {session_path}")
+    if not squashed:
+        print(f"{style('patch:', 'bold')}   (no changes; skipped)")
+        return None
 
-    # The session "produced" something iff HEAD advanced (gerbil's commit above,
-    # or commits the agent made itself).
-    if sandbox.head() != base:
-        # Optionally fold the session log into the commit (and thus the patch);
-        # otherwise it never reaches the --at project.
-        if include_session:
-            sandbox.amend_with_file(
-                f".gerbil/{session_path.name}", session_path.read_text()
-            )
-        patch_text = sandbox.format_patch(base)
-        # HEAD advanced yet base..HEAD is empty: HEAD is not a descendant of base.
-        # This means the repo was reset/re-initialized inside the sandbox (e.g. the
-        # agent ran `git reset`/`git init`). Fail loudly rather than write a
-        # misleading 0-byte "patch".
-        if not patch_text.strip():
-            print(
-                f"{style('error:', 'bold', 'red')} HEAD moved but base..HEAD is "
-                f"empty -- the repository was reset or re-initialized inside the "
-                f"sandbox. No patch written for {patch_path.name}.",
-                file=sys.stderr,
-            )
-            return None
-        out_dir.mkdir(parents=True, exist_ok=True)
-        patch_path.write_text(patch_text)
-        shutil.copy2(patch_path, archive_dir / patch_path.name)
-        print(f"{style('patch:', 'bold')}   {patch_path} (git am)")
-        return patch_path.name
-
-    print(f"{style('patch:', 'bold')}   (no changes; skipped)")
+    # Optionally fold the session log into the (single) commit, and thus the patch.
+    if include_session:
+        sandbox.amend_with_file(
+            f".gerbil/{session_path.name}", session_path.read_text()
+        )
+    patch_text = sandbox.format_patch(base)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    patch_path.write_text(patch_text)
+    shutil.copy2(patch_path, archive_dir / patch_path.name)
+    print(f"{style('patch:', 'bold')}   {patch_path} (git am)")
+    return patch_path.name
     return None
 
 
@@ -948,25 +940,18 @@ def cmd_reconstruct_patch(args) -> None:
                     "yellow",
                 ))
 
-            # Commit whatever the replay produced (under the session's own message
-            # if it generated one), then emit the patch.
+            # Squash whatever the replay produced (the agent's replayed commits
+            # plus leftover changes) into a single commit, under the session's own
+            # message if it generated one, then emit the patch.
             msg = parsed.commit_message or f"Reconstructed patch for {session_file.name}"
             footer = f"authored by Gerbil:\n--reconstruct-patch {session_file.name}"
-            sandbox.commit(msg + "\n\n" + footer + "\n")
-
-            if sandbox.head() == base:
+            if not sandbox.squash_commit(base, msg + "\n\n" + footer + "\n"):
                 sys.exit(
                     "error: replay produced no changes -- nothing to reconstruct. "
                     "The session may have made no committable edits, or its bash "
                     "commands did not reproduce outside their original run."
                 )
             patch_text = sandbox.format_patch(base)
-            if not patch_text.strip():
-                sys.exit(
-                    f"{style('error:', 'bold', 'red')} HEAD advanced but the patch "
-                    "is empty -- the replayed commands reset or re-initialized the "
-                    "repository. No patch written."
-                )
 
             existed = patch_path.is_file() and patch_path.stat().st_size > 0
             out_dir.mkdir(parents=True, exist_ok=True)

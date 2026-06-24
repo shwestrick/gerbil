@@ -469,8 +469,13 @@ def run_session(
 
     # Final turn: ask for a commit message as a true continuation of the
     # conversation. Skipped if nothing changed, or if we bailed on max_turns
-    # (the work is incomplete and the history ends on a tool result).
-    diff = sandbox.get_diff()
+    # (the work is incomplete and the history ends on a tool result). The diff is
+    # taken from the session base, so the message describes the whole session even
+    # when the agent committed some of it internally.
+    diff = (
+        sandbox.diff_since(session.base_commit)
+        if session.base_commit else sandbox.get_diff()
+    )
     commit_message = ""
     if diff.strip() and not stopped_at_max:
         turn += 1

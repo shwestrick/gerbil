@@ -5,6 +5,7 @@ exercises everything else: container lifecycle, file upload, read/write/edit
 tools, bash, command timeout, and git diff.
 """
 
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -244,6 +245,40 @@ def main() -> None:
                   sb.read_file("Hello.lean") == "def hello := 999\n")
             check("wip: restores untracked file",
                   sb.read_file("Untracked.lean") == "def u := 2\n")
+
+    # squash_commit: a session's patch is always a SINGLE commit, even when the
+    # agent made intermediate commits inside the sandbox.
+    def n_commits(patch: str) -> int:
+        return len(re.findall(r"(?m)^From [0-9a-f]{40} ", patch))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        make_project(root)
+        with LeanSandbox(project_dir=root) as sb:
+            base = sb.head()
+            ident = "git -c user.email=a@a -c user.name=a"
+            sb.write_file("A.lean", "def a := 1\n")
+            sb.run(f"git add -A && {ident} commit -qm c1")
+            sb.write_file("B.lean", "def b := 2\n")
+            sb.run(f"git add -A && {ident} commit -qm c2")
+            sb.write_file("C.lean", "def c := 3\n")  # left uncommitted
+
+            check("pre-squash range has multiple commits",
+                  n_commits(sb.format_patch(base)) == 2, sb.format_patch(base))
+
+            made = sb.squash_commit(base, "squash subject\n\nbody text")
+            check("squash made a commit", made is True)
+            patch = sb.format_patch(base)
+            check("squashed patch is a single commit", n_commits(patch) == 1,
+                  f"{n_commits(patch)} commits")
+            check("squash kept committed file A",
+                  "A.lean" in patch and "def a := 1" in patch)
+            check("squash kept committed file B", "B.lean" in patch)
+            check("squash kept uncommitted file C",
+                  "C.lean" in patch and "def c := 3" in patch)
+            check("squash used the given message", "squash subject" in patch)
+            check("squash is a no-op when clean",
+                  sb.squash_commit(sb.head(), "noop") is False)
 
     print("\nAll smoke tests passed.")
 

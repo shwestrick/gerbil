@@ -248,6 +248,37 @@ class LeanSandbox:
         self._git("add -A")
         return self._git("diff --cached").stdout
 
+    def diff_since(self, base: str) -> str:
+        """A git diff of everything that changed since `base` -- including changes
+        the agent committed in intermediate commits, not just the uncommitted
+        ones. Used to describe (and squash) the whole session's work."""
+        self._git("add -A")
+        return self._git(f"diff --cached {_quote(base)}").stdout
+
+    def squash_commit(self, base: str, message: str) -> bool:
+        """Collapse everything from `base` to the current working tree -- the
+        agent's intermediate commits AND its uncommitted changes -- into a SINGLE
+        commit on top of base, so that format_patch(base) yields exactly one
+        patch. Returns False (committing nothing) when nothing changed from base.
+
+        Stages the full working tree, soft-resets HEAD back to base (which keeps
+        that staged state), and commits once."""
+        self._git("add -A")
+        if self._git(f"diff --cached --quiet {_quote(base)}").exit_code == 0:
+            return False  # working tree identical to base -> nothing to commit
+        reset = self._git(f"reset --soft {_quote(base)}")
+        if reset.exit_code != 0:
+            raise RuntimeError(f"git reset --soft {base} failed:\n{reset.stderr}")
+        # Heredoc so the message is taken literally (no shell expansion).
+        script = (
+            f"{self._git_env} git commit --no-verify -F - "
+            f"<<'GERBIL_MSG'\n{message}\nGERBIL_MSG\n"
+        )
+        result = self.run(script)
+        if result.exit_code != 0:
+            raise RuntimeError(f"git commit (squash) failed:\n{result.stderr}")
+        return True
+
     def wip_patch(self, base: str) -> str:
         """A live `git format-patch` from `base` to the current state -- every
         commit the agent made itself, plus a snapshot of the uncommitted working
