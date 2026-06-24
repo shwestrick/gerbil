@@ -37,6 +37,7 @@ class ParsedSession:
     complete: bool = False  # the convo already ended on the model (nothing pending)
     ralph: dict | None = None  # {iteration, total, chain_base, ancestors} in --ralph
     commit_message: str = ""  # the message the session generated, if it got that far
+    ralph_done_script: str | None = None  # the --ralph_done check script, if any
 
 
 # Prefix of the message gerbil sends to request a commit message (see
@@ -183,6 +184,7 @@ def parse_session(path: Path) -> ParsedSession:
         complete=complete,
         ralph=start.get("ralph"),
         commit_message=commit_message,
+        ralph_done_script=start.get("ralph_done_script"),
     )
 
 

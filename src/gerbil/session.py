@@ -35,6 +35,7 @@ class Session:
         base_commit: str = "",
         resumed_from: str | None = None,
         ralph: dict[str, Any] | None = None,
+        ralph_done_script: str | None = None,
     ):
         self.path = path
         self.model = model
@@ -43,6 +44,7 @@ class Session:
         self.version = version
         self.base_commit = base_commit
         self.ralph = ralph
+        self.ralph_done_script = ralph_done_script
         self._total_input_tokens = 0
         self._total_output_tokens = 0
 
@@ -67,6 +69,11 @@ class Session:
         # reading any sibling logs.
         if ralph is not None:
             start["ralph"] = ralph
+        # The --ralph_done check script's content, recorded so `--resume` can
+        # rebuild a ralph chain's termination check without the user re-supplying
+        # it (a command-line --ralph_done still overrides).
+        if ralph_done_script is not None:
+            start["ralph_done_script"] = ralph_done_script
         self._append(start)
 
     def record_turn(

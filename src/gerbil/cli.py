@@ -667,6 +667,7 @@ def cmd_run(args) -> None:
                         version=version,
                         base_commit=session_base,
                         ralph=ralph_meta,
+                        ralph_done_script=ralph_done_script,
                     )
                     if mcp_warning:
                         session.record_warning(mcp_warning)
@@ -835,9 +836,17 @@ def _resume_run(args) -> None:
     # host-reachable `chain_base` and `ancestors` rebuild this session's base; for
     # a single session, its base commit is the anchor and there are no ancestors.
     ralph = parsed.ralph
+    # The termination check survives a resume: a command-line --ralph_done wins,
+    # else fall back to the script recorded in the crashed session's log, so the
+    # rebuilt chain keeps the same stop condition without re-supplying it.
     ralph_done_script = _load_ralph_done_script(
         args.ralph_done, have_ralph=bool(ralph)
     )
+    if ralph_done_script is None and parsed.ralph_done_script is not None:
+        ralph_done_script = parsed.ralph_done_script
+        print(style(
+            f"using --ralph_done check recorded in {resume_file.name}", "gray",
+        ), flush=True)
     anchor, ancestor_patches = _reconstruct_anchor(
         parsed, resume_file, repo_root, patch_dirs
     )
@@ -930,6 +939,7 @@ def _resume_run(args) -> None:
                         base_commit=iter_base,
                         resumed_from=resume_file.name,
                         ralph=ralph_meta,
+                        ralph_done_script=ralph_done_script,
                     )
                     if mcp_warning:
                         session.record_warning(mcp_warning)

@@ -145,6 +145,19 @@ def test_ralph_metadata() -> None:
     check("non-ralph has no metadata", plain.ralph is None)
 
 
+def test_ralph_done_script_roundtrip() -> None:
+    """The --ralph_done check script is recovered from the log so a resumed ralph
+    chain keeps its termination check; absent when the run didn't use one."""
+    script = "#!/usr/bin/env bash\nlake build && ! grep -rq sorry .\n"
+    with_script = dict(START)
+    with_script["ralph_done_script"] = script
+    ps = parse_session(write_log([with_script, USER]))
+    check("ralph_done script recovered", ps.ralph_done_script == script)
+
+    plain = parse_session(write_log([START, USER]))
+    check("no ralph_done script when unused", plain.ralph_done_script is None)
+
+
 def test_commit_message_extraction() -> None:
     """The generated commit message is recovered from the commit-message
     exchange; empty when the session crashed before that phase."""
@@ -183,6 +196,7 @@ def main() -> None:
     test_already_complete()
     test_thought_signature_roundtrip()
     test_ralph_metadata()
+    test_ralph_done_script_roundtrip()
     test_commit_message_extraction()
     test_missing_session_start()
     print("\nAll resume parser tests passed.")

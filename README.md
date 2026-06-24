@@ -210,7 +210,10 @@ commit, reapplies the crashed session's working-tree patch, and then runs the
 remaining iterations. Each ralph session's header records the chain's base
 commit and the ordered list of ancestor patches needed to rebuild it, so the
 sibling `.patch` files (found by the `gerbil-<ts>-NN` naming convention) are all
-that's required -- including across a resume-of-a-resume.
+that's required -- including across a resume-of-a-resume. If the chain used a
+`--ralph_done` check, its script is recorded in the session log, so the resumed
+chain keeps the same termination check automatically (pass `--ralph_done` again
+to override it).
 
 Resume needs the same repository that produced the session, with the base
 commit still in its history.
