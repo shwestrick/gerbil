@@ -160,7 +160,7 @@ def _gutter(n: int | None) -> str:
     return style(f"{'' if n is None else n:>4} ", "dim")
 
 
-def _format_tool_call(name: str, args: dict) -> str:
+def _format_tool_call(name: str, args: dict, read_file=None) -> str:
     """A pretty, single- or multi-line rendering of a tool call for the terminal.
 
     Purely cosmetic: write_file shows its contents (when small) or a summary, and
@@ -177,7 +177,7 @@ def _format_tool_call(name: str, args: dict) -> str:
         and isinstance(args.get("old_string"), str)
         and isinstance(args.get("new_string"), str)
     ):
-        return f"{head} {_render_edit_file(args)}"
+        return f"{head} {_render_edit_file(args, read_file)}"
     return f"{head}({args})"
 
 
@@ -199,11 +199,27 @@ def _render_write_file(args: dict) -> str:
     return f"{path} {style(summary, 'gray')}"
 
 
-def _render_edit_file(args: dict) -> str:
-    path = style(str(args.get("path", "?")), TOOL_COLOR)
+def _edit_line_offset(read_file, path: str, old_string: str) -> int:
+    """How many lines precede old_string in the file -- the amount to add to the
+    fragment-relative diff numbers to get real file line numbers. 0 if the file
+    can't be read or old_string isn't found (best-effort, display-only)."""
+    if read_file is None:
+        return 0
+    try:
+        content = read_file(path)
+    except Exception:
+        return 0
+    idx = content.find(old_string)
+    return content.count("\n", 0, idx) if idx >= 0 else 0
+
+
+def _render_edit_file(args: dict, read_file=None) -> str:
+    path_str = str(args.get("path", "?"))
+    path = style(path_str, TOOL_COLOR)
+    old_string = args["old_string"]
     diff = [
         d for d in difflib.unified_diff(
-            args["old_string"].splitlines(), args["new_string"].splitlines(),
+            old_string.splitlines(), args["new_string"].splitlines(),
             lineterm="", n=2,
         )
         if not d.startswith(("---", "+++"))
@@ -214,15 +230,24 @@ def _render_edit_file(args: dict) -> str:
         adds = sum(1 for d in diff if d.startswith("+"))
         dels = sum(1 for d in diff if d.startswith("-"))
         return f"{path} {style(f'(+{adds} -{dels} lines)', 'gray')}"
-    # Track line numbers from each hunk header: removed lines show their position
-    # in the original, added lines their position in the new text.
+    # The diff is relative to old_string (starting at line 1). Locate old_string
+    # in the actual file to offset the gutter to real file line numbers. The edit
+    # has not run yet, so the file still contains old_string. Falls back to
+    # fragment-relative numbers if the file can't be read or old_string isn't found.
+    offset = _edit_line_offset(read_file, path_str, old_string)
+    # Removed lines show their position in the original, added lines in the new.
     rendered = []
     old_ln = new_ln = 0
     for d in diff:
         if d.startswith("@@"):
-            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", d)
+            m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", d)
             if m:
-                old_ln, new_ln = int(m.group(1)), int(m.group(2))
+                old_ln, new_ln = int(m.group(1)) + offset, int(m.group(3)) + offset
+                # Rewrite the hunk header to the same real line numbers as the
+                # gutter (the raw header is relative to old_string).
+                ocnt = f",{m.group(2)}" if m.group(2) else ""
+                ncnt = f",{m.group(4)}" if m.group(4) else ""
+                d = f"@@ -{old_ln}{ocnt} +{new_ln}{ncnt} @@"
             rendered.append(_BODY_INDENT + _gutter(None) + style(d, "dim"))
         elif d.startswith("-"):
             rendered.append(_BODY_INDENT + _gutter(old_ln) + style(_clip(d), "red"))
@@ -237,7 +262,7 @@ def _render_edit_file(args: dict) -> str:
     return f"{path}\n" + "\n".join(rendered)
 
 
-def _run_turn(model, system, messages, tools, provider):
+def _run_turn(model, system, messages, tools, provider, read_file=None):
     """Stream a single turn, printing text and tool calls live.
 
     Returns (assistant_parts, tool_calls, text, usage).
@@ -256,7 +281,10 @@ def _run_turn(model, system, messages, tools, provider):
             if current_text:
                 assistant_parts.append({"type": "text", "text": current_text})
                 current_text = ""
-            print("\n" + _format_tool_call(event.name, event.args), flush=True)
+            print(
+                "\n" + _format_tool_call(event.name, event.args, read_file),
+                flush=True,
+            )
             tool_calls.append({
                 "name": event.name,
                 "args": event.args,
@@ -380,7 +408,7 @@ def run_session(
         )
 
         assistant_parts, tool_calls, final_text, usage = _run_turn(
-            model, system, messages, tools, provider
+            model, system, messages, tools, provider, sandbox.read_file
         )
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
