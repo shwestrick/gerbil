@@ -3,6 +3,7 @@
 
 Usage:
     gerbil run [--prompt FILE] [--at DIRECTORY] [--ralph N] ...
+    gerbil resume SESSION_FILE [--at DIRECTORY] ...
     gerbil commit [--at DIRECTORY]
 
 (Normally invoked through the `gerbil` launcher, which also provides `update`
@@ -172,15 +173,8 @@ def main() -> None:
     run_p.add_argument(
         "--prompt",
         metavar="FILE",
-        help="Path to a file containing the task description. "
-        "Required unless --resume is given.",
-    )
-    run_p.add_argument(
-        "--resume",
-        metavar="SESSION_FILE",
-        help="Resume a crashed/incomplete session from its .jsonl log: recreate "
-        "its git base, replay the log, and continue. Model and prompt are taken "
-        "from the log. Not compatible with --prompt or --ralph.",
+        help="Path to a file containing the task description (required). To "
+        "continue a crashed session instead, use `gerbil resume`.",
     )
     run_p.add_argument(
         "--model",
@@ -233,6 +227,54 @@ def main() -> None:
         "commit --amend before the patch is produced).",
     )
     run_p.set_defaults(func=cmd_run)
+
+    resume_p = sub.add_parser(
+        "resume",
+        help="continue a crashed/incomplete session from its .jsonl log",
+    )
+    resume_p.add_argument(
+        "session_file",
+        metavar="SESSION_FILE",
+        help="The session .jsonl log to resume: recreate its git base, replay the "
+        "log, and continue. The model and prompt are taken from the log.",
+    )
+    resume_p.add_argument(
+        "--at",
+        metavar="DIRECTORY",
+        help="Path to the Lean/Lake project (a git repo). Default: the project "
+        "recorded in the session.",
+    )
+    resume_p.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        help="Safety cap on agent turns (default: unlimited, runs until done).",
+    )
+    resume_p.add_argument(
+        "--skip-cache",
+        action="store_true",
+        help="Skip 'lake exe cache get' at startup.",
+    )
+    resume_p.add_argument(
+        "--no-mcp",
+        dest="mcp",
+        action="store_false",
+        help="Disable the lean-lsp MCP tools; use only the built-in tools.",
+    )
+    resume_p.add_argument(
+        "--ralph_done",
+        metavar="SCRIPT",
+        help="Override the resumed ralph chain's termination check (by default the "
+        "script recorded in the session log is reused). Only applies to a resumed "
+        "--ralph chain.",
+    )
+    resume_p.add_argument(
+        "--include-session",
+        action="store_true",
+        help="Include the session .jsonl log in the commit (folded in via "
+        "commit --amend before the patch is produced).",
+    )
+    resume_p.set_defaults(func=cmd_resume)
 
     commit_p = sub.add_parser(
         "commit", help="git am the patches gerbil produced into the repo, in order"
@@ -598,7 +640,7 @@ def _abort(exc: BaseException, session) -> None:
             file=sys.stderr,
         )
         print(
-            f"{style('resume:', 'bold')}  gerbil run --resume {session.path}",
+            f"{style('resume:', 'bold')}  gerbil resume {session.path}",
             file=sys.stderr,
         )
     # 130 is the conventional shell exit code for SIGINT; 1 for any other failure.
@@ -606,17 +648,9 @@ def _abort(exc: BaseException, session) -> None:
 
 
 def cmd_run(args) -> None:
-    if args.resume:
-        if args.prompt:
-            sys.exit("error: --resume cannot be combined with --prompt "
-                     "(the prompt is taken from the session log).")
-        if args.ralph is not None:
-            sys.exit("error: --resume cannot be combined with --ralph "
-                     "(resume continues a single session).")
-        _resume_run(args)
-        return
     if not args.prompt:
-        sys.exit("error: --prompt is required (or use --resume SESSION_FILE).")
+        sys.exit("error: --prompt is required "
+                 "(to continue a crashed session, use `gerbil resume SESSION_FILE`).")
     if args.ralph is not None and args.ralph < 1:
         sys.exit("error: --ralph N must be >= 1")
     ralph_done_script = _load_ralph_done_script(
@@ -723,7 +757,7 @@ def cmd_run(args) -> None:
                     session = None
                     # The session finished cleanly; the live resume patch is only
                     # useful if it had crashed, so drop it. (On a crash, the except
-                    # handler leaves it in place for `gerbil run --resume`.)
+                    # handler leaves it in place for `gerbil resume`.)
                     wip_path.unlink(missing_ok=True)
 
                     footer = _run_footer(args, i if args.ralph else None, iterations)
@@ -814,7 +848,7 @@ def _rebuild_base(sandbox, anchor: str, ancestor_texts: list[str]) -> None:
             sandbox.git_am(text)
 
 
-def _resume_run(args) -> None:
+def cmd_resume(args) -> None:
     """Continue a crashed/incomplete session from its .jsonl log.
 
     Recreate the world the session started in, then replay the logged
@@ -832,7 +866,7 @@ def _resume_run(args) -> None:
     """
     from .resume import parse_session
 
-    resume_file = Path(args.resume).resolve()
+    resume_file = Path(args.session_file).resolve()
     if not resume_file.is_file():
         sys.exit(f"error: {resume_file} is not a file")
     try:
@@ -1006,7 +1040,7 @@ def _resume_run(args) -> None:
                     footer = (
                         "authored by Gerbil:\n"
                         f"--model {parsed.model}\n"
-                        f"--resume {resume_file.name}"
+                        f"resume {resume_file.name}"
                     )
                     if ralph:
                         footer += f"\n--ralph (session {i}/{total_iters})"

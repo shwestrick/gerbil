@@ -1,6 +1,6 @@
 """Parse a (possibly crashed) session log back into a resumable conversation.
 
-`gerbil run --resume <session-file>` reads the append-only .jsonl a previous run
+`gerbil resume <session-file>` reads the append-only .jsonl a previous run
 left behind, reconstructs the LLM conversation up to the point of the crash, and
 hands it to the agent loop to continue. The session log records everything the
 model saw -- turn text, tool calls (name + args), and the (already-truncated)

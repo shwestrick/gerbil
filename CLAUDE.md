@@ -95,7 +95,10 @@ the project commit if `--include-session` is passed.
 ## Subcommands
 
 - `gerbil run --prompt FILE [--model M] [--ralph N] [--ralph_done SCRIPT]
-  [--max-turns N] [--skip-cache] [--no-mcp] [--include-session] [--resume LOG]`
+  [--max-turns N] [--skip-cache] [--no-mcp] [--include-session]`
+- `gerbil resume LOG [--at DIR] [--max-turns N] [--skip-cache] [--no-mcp]
+  [--ralph_done SCRIPT] [--include-session]` — continue a crashed/interrupted
+  session (model and prompt come from the log).
 - `gerbil commit` — `git am` the project's `.gerbil/*.patch` in order, skipping
   already-applied (by stable patch-id) and stale (non-applying) patches.
 - `gerbil summarize` — token/cost/tool/status stats across `.gerbil/*.jsonl`.
@@ -109,11 +112,12 @@ its `chain_base` + ordered `ancestors` (prior patches) so any mid-chain session
 is independently resumable. `--ralph_done SCRIPT` runs in-container after each
 session; exit 0 stops the loop.
 
-**Resume** (`--resume LOG`): recreate the session's git starting point (for a
-ralph chain, `git am` the recorded ancestor patches), reapply the `.wip.patch`,
-replay the logged conversation, and continue. Model/prompt come from the log
-(so `--resume` takes neither `--prompt` nor `--model`, and not `--ralph`). The
-continuation is written as its own fresh, resumable log/patch.
+**Resume** (`gerbil resume LOG`): recreate the session's git starting point (for
+a ralph chain, `git am` the recorded ancestor patches), reapply the `.wip.patch`,
+replay the logged conversation, and continue. Model/prompt come from the log (so
+`gerbil resume` takes neither `--prompt` nor `--model`, and no `--ralph` — a
+resumed ralph chain continues on its own). The continuation is written as its own
+fresh, resumable log/patch. `cmd_resume` in cli.py handles it.
 
 ## Development
 

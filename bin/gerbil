@@ -8,6 +8,7 @@
 #
 # Commands:
 #   gerbil run [--prompt FILE] [--at DIR] [--ralph N] ...   run a session
+#   gerbil resume SESSION_FILE [--at DIR] ...                continue a crashed session
 #   gerbil commit [--at DIR]                                git am the patches
 #   gerbil summarize [--at DIR]                             token/cost/tool stats
 #   gerbil reconstruct-patch SESSION_FILE [--at DIR]        rebuild a .patch
@@ -147,7 +148,7 @@ ensure_image() {
 }
 
 usage() {
-    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 cmd="${1:-}"
@@ -173,6 +174,15 @@ case "$cmd" in
         exec env GERBIL_CWD="$PWD" GERBIL_SANDBOX_IMAGE="$(sandbox_image)" \
             GERBIL_VERSION="$(cat "$CURRENT_FILE")" \
             uv run --project "$(current_dir)" python -m gerbil run "$@"
+        ;;
+    resume)
+        bootstrap_if_needed
+        ensure_image
+        shift
+        # Boots a sandbox to replay + continue a session, so it needs the image.
+        exec env GERBIL_CWD="$PWD" GERBIL_SANDBOX_IMAGE="$(sandbox_image)" \
+            GERBIL_VERSION="$(cat "$CURRENT_FILE")" \
+            uv run --project "$(current_dir)" python -m gerbil resume "$@"
         ;;
     commit)
         bootstrap_if_needed
@@ -201,6 +211,6 @@ case "$cmd" in
         usage
         ;;
     *)
-        die "unknown command '$cmd' (try: run, commit, summarize, reconstruct-patch, update, --version)"
+        die "unknown command '$cmd' (try: run, resume, commit, summarize, reconstruct-patch, update, --version)"
         ;;
 esac

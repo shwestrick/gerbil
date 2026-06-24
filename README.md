@@ -182,13 +182,14 @@ unavailable"), a lost connection, a Ctrl-C -- you can resume
 it from its session log:
 
 ```console
-$ gerbil run --resume ~/.gerbil/sessions/gerbil-260623-235800.jsonl
+$ gerbil resume ~/.gerbil/sessions/gerbil-260623-235800.jsonl
 ```
 
 gerbil boots a fresh sandbox, recreates the git state the session started
 from, replays the conversation up to the crash, and continues from there.
-The model and prompt are taken from the log, so `--resume` takes neither
-`--prompt` nor `--model` (and is not combined with `--ralph`).
+The model and prompt are taken from the log, so `gerbil resume` takes neither
+`--prompt` nor `--model` (and has no `--ralph` -- a resumed ralph chain
+continues automatically).
 
 The working tree is recovered from a `*.wip.patch` file that is kept live
 next to the session log, refreshed after every turn. It is a `git
@@ -196,14 +197,14 @@ format-patch` from the session's base to the current state -- including any
 commits the agent made itself, not just uncommitted changes -- so it never
 loses work. It is a normal git patch: if you'd rather not resume, you can
 just `git apply` it yourself. A clean finish deletes the `.wip.patch`; a
-crash leaves it in place for `--resume`.
+crash leaves it in place for `gerbil resume`.
 
 The continuation is written as its own session log and patch (named
 `...-resume-<timestamp>`), carrying the full prior history forward, so it is
 itself resumable if it too is interrupted. The original crashed log is left
 untouched.
 
-Ralph chains are supported. Point `--resume` at the crashed session's log
+Ralph chains are supported. Point `gerbil resume` at the crashed session's log
 (e.g. `gerbil-<ts>-03.jsonl`) and gerbil rebuilds that session's starting
 point by replaying the earlier sessions' patches on top of the chain's base
 commit, reapplies the crashed session's working-tree patch, and then runs the
@@ -220,7 +221,7 @@ commit still in its history.
 
 ### Reconstructing a patch by replaying tool calls
 
-Where `--resume` restores the working tree from the live `.wip.patch` snapshot,
+Where `gerbil resume` restores the working tree from the live `.wip.patch` snapshot,
 `gerbil reconstruct-patch` rebuilds a session's `.patch` by *actually replaying
 the session's tool calls* in a fresh sandbox -- no model involved:
 
