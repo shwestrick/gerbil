@@ -13,7 +13,15 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .providers import Done, TextDelta, ToolCall, Usage, _ToolMeta, stream
+from .providers import (
+    Done,
+    TextDelta,
+    ToolCall,
+    Usage,
+    _ToolMeta,
+    get_context_window,
+    stream,
+)
 from .sandbox import LeanSandbox
 from .session import Session
 from .term import style
@@ -500,6 +508,16 @@ def run_session(
     )
     tools = toolset.schemas()
 
+    # Query the model's maximum context window once at session start; every turn
+    # then reports how close the running conversation is to filling it. None means
+    # the provider doesn't report it (OpenAI), so we show raw token totals instead.
+    max_context = get_context_window(model, provider)
+    if max_context:
+        banner = f"[context window: {max_context:,} tokens ({model})]"
+    else:
+        banner = f"[context window: unknown for {model}; reporting token totals only]"
+    print(style(banner, "gray"), flush=True)
+
     total = Usage()
     turn = 0
     final_text = ""
@@ -545,6 +563,7 @@ def run_session(
         session.record_turn(
             "assistant", final_text, usage.input_tokens, usage.output_tokens
         )
+        _print_context(max_context, usage)
 
         # No tool calls => the model is done with the task.
         if not tool_calls:
@@ -629,12 +648,31 @@ def run_session(
         session.record_turn(
             "assistant", text, usage.input_tokens, usage.output_tokens
         )
+        _print_context(max_context, usage)
         commit_message = text.strip()
         print(flush=True)
 
     _print_usage(model, turn, total)
     return SessionResult(
         final_text=final_text, diff=diff, commit_message=commit_message
+    )
+
+
+def _print_context(max_context: int | None, usage: Usage) -> None:
+    """Report how full the context window is after a turn. `usage.input_tokens`
+    is the whole conversation fed to the model this turn and `output_tokens` what
+    it generated -- together, the tokens that had to fit in the window at once.
+    When the window is known, show the percentage (color escalating toward the
+    limit); when it isn't (provider doesn't report it), show the raw total."""
+    used = usage.input_tokens + usage.output_tokens
+    if not max_context:
+        print(style(f"  [context: {used:,} tokens]", "gray"), flush=True)
+        return
+    pct = used / max_context * 100
+    color = "red" if pct >= 80 else "yellow" if pct >= 50 else "gray"
+    print(
+        style(f"  [context: {used:,} / {max_context:,} tokens ({pct:.1f}%)]", color),
+        flush=True,
     )
 
 

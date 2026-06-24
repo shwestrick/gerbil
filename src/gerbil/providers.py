@@ -23,8 +23,41 @@ Ported from lea-prover (lea/providers.py).
 
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 
 ANTHROPIC_MAX_TOKENS = 16384
+
+
+@lru_cache(maxsize=None)
+def get_context_window(model: str, provider: str | None = None) -> int | None:
+    """The model's maximum context window in total tokens, queried live from the
+    provider's model-info endpoint -- or None if it can't be determined.
+
+    Gemini (`input_token_limit`) and Anthropic (`max_input_tokens`) report it; the
+    OpenAI models endpoint does not, so it returns None there (and the caller just
+    reports raw token totals). No static table -- we ask the provider so the
+    number can't drift out of date. Cached, so a --ralph chain queries at most
+    once; never raises (any failure -> None)."""
+    try:
+        provider = provider or detect_provider(model)
+    except ValueError:
+        return None
+    try:
+        if provider == "gemini":
+            from google import genai
+
+            client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+            limit = getattr(client.models.get(model=model), "input_token_limit", None)
+            return int(limit) if limit else None
+        if provider == "anthropic":
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+            limit = getattr(client.models.retrieve(model), "max_input_tokens", None)
+            return int(limit) if limit else None
+    except Exception:
+        return None
+    return None  # openai: no endpoint exposes the context window
 
 
 @dataclass
