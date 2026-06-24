@@ -562,6 +562,49 @@ def _finalize_session(
     return None
 
 
+def _abort(exc: BaseException, session) -> None:
+    """Handle a crash or Ctrl-C interruption uniformly, then exit the process.
+
+    Records the failure as the in-flight session's terminal event (if one is
+    open), prints a clear message, and -- since an open session is always
+    resumable (its base commit and model are recorded at session_start, and the
+    live .wip.patch snapshot holds the working tree) -- shows the command to
+    continue it. A KeyboardInterrupt reads as a clean interruption rather than an
+    error. Either way the .wip.patch is left in place: only a clean session
+    finish removes it, so an interrupted run can always be picked back up.
+
+    Shared by `gerbil run` and `--resume`."""
+    interrupted = isinstance(exc, KeyboardInterrupt)
+    if session is not None:
+        session.record_error(exc)  # the log already lives in ~/.gerbil/
+
+    if interrupted:
+        print(
+            "\n" + style("interrupted:", "bold", "yellow")
+            + " session stopped (Ctrl-C)",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"\n{style('error:', 'bold', 'red')} "
+            f"aborted by {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+    if session is not None:
+        print(
+            f"{style('session:', 'bold')} {session.path} "
+            "(details recorded inside)",
+            file=sys.stderr,
+        )
+        print(
+            f"{style('resume:', 'bold')}  gerbil run --resume {session.path}",
+            file=sys.stderr,
+        )
+    # 130 is the conventional shell exit code for SIGINT; 1 for any other failure.
+    sys.exit(130 if interrupted else 1)
+
+
 def cmd_run(args) -> None:
     if args.resume:
         if args.prompt:
@@ -702,23 +745,12 @@ def cmd_run(args) -> None:
                         print(flush=True)
                         if _ralph_done(sandbox, ralph_done_script):
                             break
-    except Exception as exc:
-        # Catch-all: record the failure as the in-flight session's terminal event
-        # (if one is open), point the user at it, and exit non-zero.
-        if session is not None:
-            session.record_error(exc)  # the log already lives in ~/.gerbil/
-        print(
-            f"\n{style('error:', 'bold', 'red')} "
-            f"aborted by {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
-        if session is not None:
-            print(
-                f"{style('session:', 'bold')} {session.path} "
-                "(error details recorded inside)",
-                file=sys.stderr,
-            )
-        sys.exit(1)
+    except (Exception, KeyboardInterrupt) as exc:
+        # Catch both crashes and Ctrl-C (KeyboardInterrupt is a BaseException, not
+        # an Exception, so it must be named explicitly). The sandbox/MCP context
+        # managers have already torn down by the time we get here. _abort records
+        # the failure, points the user at the session, and exits non-zero.
+        _abort(exc, session)
 
 
 def _resolve_patch(name: str, dirs: list[Path]) -> Path | None:
@@ -992,21 +1024,10 @@ def _resume_run(args) -> None:
                         print(flush=True)
                         if _ralph_done(sandbox, ralph_done_script):
                             break
-    except Exception as exc:
-        if session is not None:
-            session.record_error(exc)
-        print(
-            f"\n{style('error:', 'bold', 'red')} "
-            f"aborted by {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
-        if session is not None:
-            print(
-                f"{style('session:', 'bold')} {session.path} "
-                "(error details recorded inside)",
-                file=sys.stderr,
-            )
-        sys.exit(1)
+    except (Exception, KeyboardInterrupt) as exc:
+        # A resumed run is itself resumable: _abort points at this continuation's
+        # own log (and Ctrl-C is caught the same as a crash -- see cmd_run).
+        _abort(exc, session)
 
 
 # The tool calls that mutate sandbox state and so must be replayed to reproduce a
@@ -1148,6 +1169,15 @@ def cmd_reconstruct_patch(args) -> None:
             print(f"{style('patch:', 'bold')}   {patch_path} (git am){note}")
     except SystemExit:
         raise
+    except KeyboardInterrupt:
+        # reconstruct-patch is not a model session, so there is nothing to resume;
+        # just stop cleanly instead of dumping a traceback.
+        print(
+            "\n" + style("interrupted:", "bold", "yellow")
+            + " reconstruct-patch stopped (Ctrl-C)",
+            file=sys.stderr,
+        )
+        sys.exit(130)
     except Exception as exc:
         print(
             f"\n{style('error:', 'bold', 'red')} "
