@@ -116,6 +116,9 @@ def detect_provider(model: str) -> str:
         return "anthropic"
     if model.startswith(("gpt", "o3", "o4")):
         return "openai"
+    # ollama:<NAME> selects a local model served by ollama (OpenAI-compatible).
+    if model.startswith("ollama:"):
+        return "ollama"
     raise ValueError(
         f"Can't detect provider for model '{model}'. Pass provider explicitly."
     )
@@ -140,6 +143,8 @@ def stream(
         yield from _stream_anthropic(model, system, messages, tools)
     elif provider == "openai":
         yield from _stream_openai(model, system, messages, tools)
+    elif provider == "ollama":
+        yield from _stream_ollama(model, system, messages, tools)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
@@ -397,11 +402,19 @@ def _stream_openai(model, system, messages, tools):
         yield from _stream_openai_responses(model, system, messages, tools)
         return
 
-    import json
-
     from openai import OpenAI
 
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], base_url=os.environ.get("OPENAI_BASE_URL", None))
+    yield from _stream_openai_chat(client, model, system, messages, tools)
+
+
+def _stream_openai_chat(client, model, system, messages, tools):
+    """The Chat Completions streaming core, shared by the OpenAI provider and the
+    ollama provider (which speaks the same OpenAI-compatible API). The caller
+    supplies an already-constructed client and the resolved model name; everything
+    below -- message conversion, tool-call accumulation, usage tracking -- is
+    identical regardless of which endpoint the client points at."""
+    import json
 
     openai_tools = [
         {
@@ -500,6 +513,23 @@ def _stream_openai(model, system, messages, tools):
             tool_calls_acc = {}
 
     yield Done(usage)
+
+
+def _stream_ollama(model, system, messages, tools):
+    """Local model served by ollama. ollama exposes an OpenAI-compatible Chat
+    Completions endpoint (default http://localhost:11434/v1), so we point an
+    OpenAI client at it and reuse the shared streaming core. The `ollama:` prefix
+    is stripped so the real model name reaches ollama; it stays attached
+    everywhere else (logs, pricing, banners) as the model's identity. No API key
+    is required -- a non-empty placeholder keeps the SDK happy."""
+    from openai import OpenAI
+
+    from .ollama import ollama_base_url, ollama_model_name
+
+    client = OpenAI(api_key="ollama", base_url=ollama_base_url() + "/v1")
+    yield from _stream_openai_chat(
+        client, ollama_model_name(model), system, messages, tools
+    )
 
 
 def _stream_openai_responses(model, system, messages, tools):

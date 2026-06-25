@@ -105,6 +105,20 @@ $ export ANTHROPIC_API_KEY=...
 $ export OPENAI_API_KEY=...
 ```
 
+### Local models with ollama
+
+To run against a local model served by [ollama](https://ollama.com), use the
+`ollama:<NAME>` model syntax — no API key required:
+
+```console
+$ ollama pull qwen2.5-coder
+$ gerbil run --model ollama:qwen2.5-coder --prompt prompt.md
+```
+
+If no ollama server is already running, gerbil runs `ollama serve` as a child
+process. The model must already be pulled locally.
+Set `OLLAMA_HOST` to point at a non-default address (e.g. a remote box).
+
 ## The `~/.gerbil` directory
 
 gerbil maintains a `$HOME/.gerbil` directory that contains an archive of

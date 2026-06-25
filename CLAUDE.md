@@ -22,8 +22,9 @@ The defining design choices:
   read *purely* as `git format-patch <base>..HEAD` — anything not reachable from
   that range is lost.
 - **Provider-agnostic**: one unified streaming interface over Gemini, Anthropic,
-  and OpenAI. Model is selected with `--model`; provider is auto-detected from
-  the name.
+  OpenAI, and ollama (local models, `--model ollama:<NAME>`). Model is selected
+  with `--model`; provider is auto-detected from the name. ollama runs on the
+  host (not in the sandbox) and gerbil starts `ollama serve` itself if needed.
 - **Resumable**: a crashed session can be continued from its append-only `.jsonl`
   log; a `.wip.patch` snapshot next to the log is refreshed every turn.
 
@@ -40,7 +41,9 @@ src/gerbil/
                         summarize, reconstruct-patch) and the resume orchestration
   agent.py              the agent loop (run_session), system prompts, pricing
                         table, and pretty terminal rendering of tool calls
-  providers.py          unified LLM streaming over gemini/anthropic/openai
+  providers.py          unified LLM streaming over gemini/anthropic/openai/ollama
+  ollama.py             host-side ollama server detect/start/stop + model check
+                        (local provider; reuses the OpenAI-compatible stream core)
   sandbox.py            LeanSandbox — Docker container lifecycle + all git plumbing
   tools.py              built-in tools (bash/read_file/write_file/edit_file) and
                         the Toolset that merges them with MCP tools
@@ -152,11 +155,13 @@ uv run python tests/test_mcp.py          # lean-lsp MCP integration (Docker; slo
 uv run python tests/test_reconstruct.py  # reconstruct-patch end-to-end (Docker)
 uv run python tests/test_resume.py       # resume logic
 uv run python tests/test_render.py       # terminal rendering
+uv run python tests/test_ollama.py       # ollama provider plumbing (no Docker; live smoke if a server is up)
 GOOGLE_API_KEY=... uv run python tests/test_gemini.py   # live Gemini backend
 ```
 
 Most require Docker and the `lean-sandbox` image; `test_gemini.py` needs a real
-API key.
+API key. `test_ollama.py` needs neither Docker nor a key (it runs a live smoke
+only if an ollama server is already reachable).
 
 ## Conventions
 

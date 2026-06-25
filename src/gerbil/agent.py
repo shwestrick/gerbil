@@ -52,6 +52,15 @@ MODEL_PRICING = {
 }
 DEFAULT_PRICING = (2.0, 10.0)
 
+
+def model_pricing(model: str) -> tuple[float, float]:
+    """Per-million-token (input, output) pricing for a model. ollama models run
+    locally and cost nothing, so they price at (0, 0) -- otherwise the cost
+    summary would invent a DEFAULT_PRICING charge for a free local run."""
+    if model.startswith("ollama:"):
+        return (0.0, 0.0)
+    return MODEL_PRICING.get(model, DEFAULT_PRICING)
+
 SYSTEM_PROMPT = """\
 You are gerbil, an autonomous agent working inside a sandboxed Lean 4 / Lake \
 project. Your job is to carry out the user's task by editing files and running \
@@ -1042,7 +1051,7 @@ def _context_suffix(max_context: int | None, usage: Usage | None) -> str:
 
 def _print_usage(model: str, turns: int, usage: Usage) -> None:
     """Print a summary line with token counts and estimated cost."""
-    price_in, price_out = MODEL_PRICING.get(model, DEFAULT_PRICING)
+    price_in, price_out = model_pricing(model)
     cost = (usage.input_tokens * price_in + usage.output_tokens * price_out) / 1_000_000
     total = usage.input_tokens + usage.output_tokens
     # thinking_tokens is a subset of output_tokens, so show it as a breakdown.

@@ -41,7 +41,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from .agent import DEFAULT_PRICING, MODEL_PRICING, run_session
+from .agent import MODEL_PRICING, model_pricing, run_session
 from .sandbox import LeanSandbox
 from .session import Session
 from .term import style
@@ -182,7 +182,9 @@ def main() -> None:
         metavar="MODEL",
         help=(
             f"LLM to use (default: {DEFAULT_MODEL}). Provider is auto-detected. "
-            f"Known models: {', '.join(MODEL_PRICING)}."
+            f"Use `ollama:<NAME>` for a local model served by ollama (e.g. "
+            f"ollama:qwen2.5-coder); gerbil starts the server if one isn't running. "
+            f"Known cloud models: {', '.join(MODEL_PRICING)}."
         ),
     )
     run_p.add_argument(
@@ -475,7 +477,7 @@ def _scan_session(path: Path) -> dict:
 
 def _cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """Estimated USD cost from per-million-token pricing (falls back to DEFAULT)."""
-    price_in, price_out = MODEL_PRICING.get(model, DEFAULT_PRICING)
+    price_in, price_out = model_pricing(model)
     return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
 
 
@@ -569,7 +571,12 @@ def cmd_summarize(args) -> None:
 
     print(bold("By model"))
     for model, m in sorted(by_model.items(), key=lambda kv: -kv[1]["cost"]):
-        known = "" if model in MODEL_PRICING else style(" (est. pricing)", "gray")
+        if model.startswith("ollama:"):
+            known = style(" (local)", "gray")
+        elif model in MODEL_PRICING:
+            known = ""
+        else:
+            known = style(" (est. pricing)", "gray")
         thinking = (
             style(f" ({m['thinking']:,} thinking)", "gray") if m["thinking"] else ""
         )
@@ -716,6 +723,10 @@ def cmd_run(args) -> None:
             # guarantees that ordering on every exit path). Started once and
             # reused across all --ralph sessions. If it fails, warn and continue.
             with contextlib.ExitStack() as stack:
+                # For an ollama model, make sure a host-side server is up (and the
+                # model is pulled) before any turn runs; torn down on exit if we
+                # started it.
+                _start_ollama(args.model, stack)
                 mcp, mcp_warning = (
                     _start_mcp(sandbox, stack) if args.mcp else (None, None)
                 )
@@ -975,6 +986,9 @@ def cmd_resume(args) -> None:
             fetch_cache=not args.skip_cache,
         ) as sandbox:
             with contextlib.ExitStack() as stack:
+                # The resumed session's model may be an ollama one; ensure a
+                # host-side server (and the model) is available before continuing.
+                _start_ollama(parsed.model, stack)
                 mcp, mcp_warning = (
                     _start_mcp(sandbox, stack) if args.mcp else (None, None)
                 )
@@ -1277,6 +1291,22 @@ def _start_mcp(sandbox, stack):
             file=sys.stderr,
         )
         return None, warning
+
+
+def _start_ollama(model, stack):
+    """Ensure a host-side ollama server is reachable for an `ollama:<NAME>` model,
+    registering it for teardown on the stack (only a server we start is stopped).
+
+    No-op for any non-ollama model. Verifies the requested model is pulled locally
+    before the session begins, failing fast with a `ollama pull` hint otherwise.
+    Reused across all --ralph sessions, like the MCP client."""
+    from .ollama import OllamaServer, ensure_model_available, is_ollama_model
+
+    if not is_ollama_model(model):
+        return
+    stack.enter_context(OllamaServer())
+    ensure_model_available(model)
+    print(style(f"[ollama: serving {model}]", "gray"), flush=True)
 
 
 def _load_ralph_done_script(path_str: str | None, *, have_ralph: bool) -> str | None:
