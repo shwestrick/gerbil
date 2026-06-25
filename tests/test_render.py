@@ -11,6 +11,7 @@ from gerbil.agent import (
     _render_build_result,
     _render_diagnostics_result,
     _render_goal_result,
+    _render_hover_result,
     _render_read_result,
 )
 
@@ -291,6 +292,36 @@ def test_goal_result() -> None:
     check("goal non-json -> None", _render_goal_result("nope") is None)
 
 
+def test_hover_result() -> None:
+    # Symbol header, signature + docs, no diagnostics.
+    out = _render_hover_result(json.dumps({
+        "symbol": "Nat.succ",
+        "info": "Nat.succ : Nat → Nat\n\nThe successor function on natural numbers.",
+        "diagnostics": [],
+    }))
+    check("hover symbol header", "Nat.succ" in out, out)
+    check("hover signature", "Nat.succ : Nat → Nat" in out, out)
+    check("hover docs", "successor function" in out, out)
+
+    # Diagnostics at the position are surfaced with severity symbols + count.
+    d = _render_hover_result(json.dumps({
+        "symbol": "foo",
+        "info": "foo : Nat",
+        "diagnostics": [{"severity": "error", "message": "unknown", "line": 2, "column": 1}],
+    }))
+    check("hover diag count", "(1 diagnostic)" in d, d)
+    check("hover diag line", "✗ 2:1: unknown" in d, d)
+
+    # Leading/trailing blank lines in info are trimmed.
+    t = _render_hover_result(json.dumps({"symbol": "x", "info": "\n\nT\n\n", "diagnostics": []}))
+    check("hover trims blanks", t.strip().endswith("T"), repr(t))
+
+    # Wrong shape / non-JSON -> None.
+    check("hover no-info-key -> None",
+          _render_hover_result(json.dumps({"symbol": "x"})) is None)
+    check("hover non-json -> None", _render_hover_result("nope") is None)
+
+
 def test_lean_goal_position() -> None:
     src = "namespace D\n\ntheorem big (n : Nat) :\n    n + 0 = n := by\n  simp\n"
     out = _format_tool_call(
@@ -363,6 +394,7 @@ def main() -> None:
     test_diagnostics_result()
     test_build_result()
     test_goal_result()
+    test_hover_result()
     test_lean_goal_position()
     test_lean_goal_fallbacks()
     test_lean_build()

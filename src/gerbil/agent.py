@@ -244,8 +244,8 @@ def _elide_middle(lines: list[str]) -> list[str]:
     return lines[:PREVIEW_HEAD_LINES] + [marker] + lines[-PREVIEW_TAIL_LINES:]
 
 
-# lean_run_code diagnostics by severity: the leading symbol and color used to
-# render each line. The symbol reinforces the color (and survives NO_COLOR).
+# Diagnostics by severity: the leading symbol and color used to render each line.
+# The symbol reinforces the color (and survives NO_COLOR).
 _SEVERITY_STYLE = {
     "error":   ("✗", "red"),
     "warning": ("⚠", "yellow"),
@@ -254,6 +254,24 @@ _SEVERITY_STYLE = {
 }
 _SEVERITY_DEFAULT = ("•", "magenta")   # unknown(N) severities
 _SEVERITY_ORDER = ("error", "warning", "info", "hint")   # header summary order
+
+
+def _diagnostic_lines(diags: list) -> list[str]:
+    """Render a list of {severity,message,line,column} diagnostics to display
+    lines: one severity symbol + color per line, multi-line messages keeping the
+    symbol on every line so a truncated tail stays legible. Shared by the
+    diagnostics-result and hover-info previews."""
+    out: list[str] = []
+    for d in diags:
+        if not isinstance(d, dict):
+            continue
+        symbol, color = _SEVERITY_STYLE.get(d.get("severity", ""), _SEVERITY_DEFAULT)
+        loc = f"{d.get('line', '?')}:{d.get('column', '?')}"
+        msg_lines = str(d.get("message", "")).splitlines() or [""]
+        out.append(_BODY_INDENT + style(_clip(f"{symbol} {loc}: {msg_lines[0]}"), color))
+        for ln in msg_lines[1:]:
+            out.append(_BODY_INDENT + style(_clip(f"{symbol} {ln}"), color))
+    return out
 
 
 def _render_diagnostics_result(content: str) -> str | None:
@@ -302,16 +320,7 @@ def _render_diagnostics_result(content: str) -> str | None:
     body: list[str] = [
         _BODY_INDENT + style(_clip(f"✗ failed dependency: {dep}"), "red") for dep in deps
     ]
-    for d in diags:
-        if not isinstance(d, dict):
-            continue
-        symbol, color = _SEVERITY_STYLE.get(d.get("severity", ""), _SEVERITY_DEFAULT)
-        loc = f"{d.get('line', '?')}:{d.get('column', '?')}"
-        msg_lines = str(d.get("message", "")).splitlines() or [""]
-        body.append(_BODY_INDENT + style(_clip(f"{symbol} {loc}: {msg_lines[0]}"), color))
-        for ln in msg_lines[1:]:
-            body.append(_BODY_INDENT + style(_clip(f"{symbol} {ln}"), color))
-
+    body += _diagnostic_lines(diags)
     body = _elide_middle(body)
     return header + ("\n" + "\n".join(body) if body else "")
 
@@ -404,6 +413,42 @@ def _render_goal_result(content: str) -> str | None:
             body += _goal_blocks(goals, pad="  ")
         else:
             body.append(_BODY_INDENT + style(f"{label}: ", "dim") + style("✓ no goals", "green"))
+    body = _elide_middle(body)
+    return header + ("\n" + "\n".join(body) if body else "")
+
+
+def _render_hover_result(content: str) -> str | None:
+    """Human-readable preview of a lean_hover_info *result* -- a JSON HoverInfo
+    {symbol, info, diagnostics}. Show the hovered symbol as a header, its type/doc
+    text (the signature line highlighted, docs dimmed), and any diagnostics at the
+    position with their severity symbols. head+tail elision as elsewhere. Returns
+    None on an unexpected shape, so the caller falls back to the generic preview.
+    Display-only."""
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or "info" not in data:
+        return None
+
+    symbol = str(data.get("symbol", "")).strip()
+    header = style(symbol, "bold", "cyan") if symbol else style("hover", "cyan")
+    diags = data.get("diagnostics") or []
+    if diags:
+        header += " " + style(f"({len(diags)} diagnostic{'' if len(diags) == 1 else 's'})", "dim")
+
+    info_lines = str(data.get("info", "")).splitlines()
+    while info_lines and not info_lines[0].strip():   # trim leading/trailing blanks
+        info_lines.pop(0)
+    while info_lines and not info_lines[-1].strip():
+        info_lines.pop()
+    # First line is the type signature (highlighted); the rest is documentation.
+    body = [
+        _BODY_INDENT + style(_clip(ln), *(("cyan",) if i == 0 else ("gray",)))
+        for i, ln in enumerate(info_lines)
+    ]
+    body += _diagnostic_lines(diags)
+
     body = _elide_middle(body)
     return header + ("\n" + "\n".join(body) if body else "")
 
@@ -900,6 +945,8 @@ def run_session(
                     rendered = _render_build_result(result.content)
                 elif tc["name"] == "lean_goal":
                     rendered = _render_goal_result(result.content)
+                elif tc["name"] == "lean_hover_info":
+                    rendered = _render_hover_result(result.content)
             if rendered is None:
                 preview = content[:200] + "..." if len(content) > 200 else content
                 # Align continuation lines under the content (after "  <- ").
