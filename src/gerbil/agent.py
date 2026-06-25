@@ -8,6 +8,7 @@ tool result to the Session as it goes.
 """
 
 import difflib
+import json
 import re
 import sys
 import time
@@ -162,11 +163,13 @@ def _commit_request(diff: str) -> str:
     )
 
 
-# Cosmetic limits for rendering write_file / edit_file tool calls in the
-# terminal. Display-only: they never affect what is written, dispatched, or
-# recorded to the session log.
-WRITE_FILE_INLINE_MAX_LINES = 10     # show contents inline at/below this
-WRITE_FILE_INLINE_MAX_CHARS = 2000   # ...and only if not too large overall
+# Cosmetic limits for rendering tool calls in the terminal. Display-only: they
+# never affect what is written, dispatched, or recorded to the session log.
+PREVIEW_HEAD_LINES = 10              # write_file/lean_run_code: lines shown at the top...
+PREVIEW_TAIL_LINES = 10             # ...and at the bottom of a truncated preview
+# At/below this many lines the whole thing is shown; above it, head+tail with an
+# elision marker. Equals head+tail so a truncated preview never overlaps itself.
+PREVIEW_FULL_MAX_LINES = PREVIEW_HEAD_LINES + PREVIEW_TAIL_LINES
 EDIT_FILE_DIFF_MAX_LINES = 30        # show the diff at/below this; else summarize
 SNIPPET_INLINE_MAX_LINES = 12        # lean_multi_attempt: show a snippet inline below this
 SNIPPET_INLINE_MAX_CHARS = 800       # ...and only if not too large overall
@@ -186,6 +189,131 @@ def _clip(s: str, width: int = _LINE_CLIP) -> str:
 def _gutter(n: int | None) -> str:
     """A right-aligned, dim line-number gutter (blank when n is None)."""
     return style(f"{'' if n is None else n:>4} ", "dim")
+
+
+def _render_file_preview(lines: list[str]) -> str:
+    """A gutter-numbered preview of file/snippet contents, shown no matter the
+    size. At/below PREVIEW_FULL_MAX_LINES the whole thing is shown; above it, the
+    first PREVIEW_HEAD_LINES and last PREVIEW_TAIL_LINES with an elision marker in
+    between noting how many lines were omitted (the tail keeps real line numbers).
+    Each line is clipped to _LINE_CLIP, so the output is bounded regardless of
+    input. Display-only."""
+    def row(n: int, text: str) -> str:
+        return _BODY_INDENT + _gutter(n) + style(_clip(text), "gray")
+
+    total = len(lines)
+    if total <= PREVIEW_FULL_MAX_LINES:
+        return "\n".join(row(i, ln) for i, ln in enumerate(lines, 1))
+    omitted = total - PREVIEW_HEAD_LINES - PREVIEW_TAIL_LINES
+    marker = _BODY_INDENT + _gutter(None) + style(
+        f"... ({omitted} line{'' if omitted == 1 else 's'} omitted)", "dim"
+    )
+    head = [row(i, ln) for i, ln in enumerate(lines[:PREVIEW_HEAD_LINES], 1)]
+    tail_start = total - PREVIEW_TAIL_LINES + 1
+    tail = [row(tail_start + i, ln) for i, ln in enumerate(lines[-PREVIEW_TAIL_LINES:])]
+    return "\n".join(head + [marker] + tail)
+
+
+def _render_read_result(content: str) -> str:
+    """A line-numbered preview of a read_file *result* (head+tail when long),
+    shown in place of the generic truncated-to-200-chars tool-result preview --
+    same head/tail elision as write_file/lean_run_code. `content` is whatever the
+    model sees (already run through truncate_tool_output), so the preview reflects
+    exactly that. Display-only."""
+    lines = content.splitlines()
+    if not lines:
+        return style("(empty)", "gray")
+    n = len(lines)
+    header = style(f"({n} line{'' if n == 1 else 's'})", "gray")
+    return f"{header}\n{_render_file_preview(lines)}"
+
+
+def _elide_middle(lines: list[str]) -> list[str]:
+    """Apply the head+tail elision policy to a list of already-rendered display
+    lines (which carry their own prefix/color -- unlike _render_file_preview,
+    which numbers raw text). At/below PREVIEW_FULL_MAX_LINES the lines are returned
+    unchanged; above it, the first PREVIEW_HEAD_LINES and last PREVIEW_TAIL_LINES
+    with an elision marker between."""
+    total = len(lines)
+    if total <= PREVIEW_FULL_MAX_LINES:
+        return lines
+    omitted = total - PREVIEW_HEAD_LINES - PREVIEW_TAIL_LINES
+    marker = _BODY_INDENT + style(
+        f"... ({omitted} line{'' if omitted == 1 else 's'} omitted)", "dim"
+    )
+    return lines[:PREVIEW_HEAD_LINES] + [marker] + lines[-PREVIEW_TAIL_LINES:]
+
+
+# lean_run_code diagnostics by severity: the leading symbol and color used to
+# render each line. The symbol reinforces the color (and survives NO_COLOR).
+_SEVERITY_STYLE = {
+    "error":   ("✗", "red"),
+    "warning": ("⚠", "yellow"),
+    "info":    ("ℹ", "cyan"),
+    "hint":    ("·", "gray"),
+}
+_SEVERITY_DEFAULT = ("•", "magenta")   # unknown(N) severities
+_SEVERITY_ORDER = ("error", "warning", "info", "hint")   # header summary order
+
+
+def _render_diagnostics_result(content: str) -> str | None:
+    """Human-readable preview of a lean_run_code / lean_diagnostic_messages
+    *result*. Both return a JSON object carrying a compile status and a list of
+    diagnostics ({severity,message,line,column}) -- under "diagnostics" for
+    lean_run_code, "items" for lean_diagnostic_messages, which may also list
+    "failed_dependencies". Raw JSON is noisy to read; render a status header plus
+    one block per diagnostic, each line carrying a severity symbol and color, with
+    the same head+tail elision as the other previews. Returns None when `content`
+    isn't the expected JSON shape, so the caller falls back to the generic
+    preview. Display-only -- the model still sees the raw JSON."""
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    diags = data.get("diagnostics")
+    if diags is None:
+        diags = data.get("items")
+    if not isinstance(diags, list):
+        return None
+    deps = [d for d in (data.get("failed_dependencies") or []) if isinstance(d, str)]
+
+    header = style("✓ compiled", "green") if data.get("success") else style("✗ failed", "red")
+    if data.get("timed_out"):
+        header += " " + style("(timed out -- partial)", "yellow")
+    counts: dict[str, int] = {}
+    for d in diags:
+        sev = d.get("severity", "?") if isinstance(d, dict) else "?"
+        counts[sev] = counts.get(sev, 0) + 1
+    ordered = [s for s in _SEVERITY_ORDER if s in counts] + \
+              [s for s in counts if s not in _SEVERITY_ORDER]
+    summary = [f"{counts[s]} {s}{'' if counts[s] == 1 else 's'}" for s in ordered]
+    if deps:
+        summary.append(f"{len(deps)} failed dependenc{'y' if len(deps) == 1 else 'ies'}")
+    if summary:
+        header += " " + style(f"({', '.join(summary)})", "dim")
+    elif data.get("success"):
+        header += " " + style("(no diagnostics)", "dim")
+
+    # Failed dependencies first (they are usually the root cause), then each
+    # diagnostic. Every line carries its severity symbol so a truncated tail stays
+    # legible.
+    body: list[str] = [
+        _BODY_INDENT + style(_clip(f"✗ failed dependency: {dep}"), "red") for dep in deps
+    ]
+    for d in diags:
+        if not isinstance(d, dict):
+            continue
+        symbol, color = _SEVERITY_STYLE.get(d.get("severity", ""), _SEVERITY_DEFAULT)
+        loc = f"{d.get('line', '?')}:{d.get('column', '?')}"
+        msg_lines = str(d.get("message", "")).splitlines() or [""]
+        body.append(_BODY_INDENT + style(_clip(f"{symbol} {loc}: {msg_lines[0]}"), color))
+        for ln in msg_lines[1:]:
+            body.append(_BODY_INDENT + style(_clip(f"{symbol} {ln}"), color))
+
+    body = _elide_middle(body)
+    return header + ("\n" + "\n".join(body) if body else "")
 
 
 def _format_tool_call(name: str, args: dict, read_file=None) -> str:
@@ -226,16 +354,14 @@ def _render_write_file(args: dict) -> str:
     lines = content.splitlines()
     if not lines:
         return f"{path} {style('(empty)', 'gray')}"
-    if len(lines) <= WRITE_FILE_INLINE_MAX_LINES and len(content) <= WRITE_FILE_INLINE_MAX_CHARS:
-        body = "\n".join(
-            _BODY_INDENT + _gutter(i) + style(_clip(ln), "gray")
-            for i, ln in enumerate(lines, 1)
-        )
-        return f"{path}\n{body}"
-    n = len(lines)
-    summary = f"({n} line{'' if n == 1 else 's'}, " \
-              f"{len(content.encode('utf-8', 'replace'))} bytes)"
-    return f"{path} {style(summary, 'gray')}"
+    # Always show a preview (head+tail when long); for a long file also keep the
+    # total size on the path line, since the elision marker only counts lines.
+    head = path
+    if len(lines) > PREVIEW_FULL_MAX_LINES:
+        n = len(lines)
+        summary = f"({n} lines, {len(content.encode('utf-8', 'replace'))} bytes)"
+        head = f"{path} {style(summary, 'gray')}"
+    return f"{head}\n{_render_file_preview(lines)}"
 
 
 def _edit_line_offset(read_file, path: str, old_string: str) -> int:
@@ -369,24 +495,16 @@ def _render_position(args: dict, read_file=None) -> str:
 
 
 def _render_lean_run_code(args: dict) -> str:
-    """lean_run_code runs a standalone Lean snippet. Show the code (with a
-    line-number gutter) when short, or a summary when long, instead of dumping
-    the whole `code` string."""
+    """lean_run_code runs a standalone Lean snippet. Always show a line-numbered
+    preview of the code (head+tail when long), under a line-count header, instead
+    of dumping the whole `code` string."""
     code = args["code"]
     lines = code.splitlines()
     if not lines:
         return style("(empty)", "gray")
-    if len(lines) == 1:
-        return style(_clip(lines[0]), "gray")
-    if len(lines) <= SNIPPET_INLINE_MAX_LINES and len(code) <= SNIPPET_INLINE_MAX_CHARS:
-        body = "\n".join(
-            _BODY_INDENT + _gutter(i) + style(_clip(ln), "gray")
-            for i, ln in enumerate(lines, 1)
-        )
-        return f"{style(f'({len(lines)} lines)', 'dim')}\n{body}"
-    first = next((ln for ln in lines if ln.strip()), lines[0])
-    summary = f"({len(lines)} lines, {len(code)} chars)"
-    return f"{style(summary, 'dim')} {style(_clip(first), 'gray')}"
+    n = len(lines)
+    header = style(f"({n} line{'' if n == 1 else 's'})", "dim")
+    return f"{header}\n{_render_file_preview(lines)}"
 
 
 def _render_snippet(i: int, snip: str) -> str:
@@ -676,14 +794,23 @@ def run_session(
             content = truncate_tool_output(result.content)
             session.record_tool_result(tc["name"], content)
 
-            preview = content[:200] + "..." if len(content) > 200 else content
             result_color = "red" if result.is_error else "gray"
-            # Align continuation lines under the content (after "  <- ").
-            indented = preview.rstrip("\n").replace("\n", "\n     ")
-            print(
-                f"  {style('<-', result_color)} {style(indented, result_color)}",
-                flush=True,
-            )
+            # Tool-specific human-readable previews (display-only; the model still
+            # sees `content`). They render the untruncated result so a long output
+            # still previews fully -- their own head+tail elision bounds the size.
+            rendered = None
+            if not result.is_error:
+                if tc["name"] == "read_file":
+                    rendered = _render_read_result(content)
+                elif tc["name"] in ("lean_run_code", "lean_diagnostic_messages"):
+                    rendered = _render_diagnostics_result(result.content)
+            if rendered is None:
+                preview = content[:200] + "..." if len(content) > 200 else content
+                # Align continuation lines under the content (after "  <- ").
+                rendered = style(
+                    preview.rstrip("\n").replace("\n", "\n     "), result_color
+                )
+            print(f"  {style('<-', result_color)} {rendered}", flush=True)
 
             tr = {
                 "type": "tool_result",

@@ -4,7 +4,13 @@ Pure functions, no Docker. term.style() is a no-op off a TTY, so output is plain
 text here and we can assert on substrings. Run: uv run python tests/test_render.py
 """
 
-from gerbil.agent import _format_tool_call
+import json
+
+from gerbil.agent import (
+    _format_tool_call,
+    _render_diagnostics_result,
+    _render_read_result,
+)
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
@@ -28,8 +34,12 @@ def test_write_file_summary_when_large() -> None:
     out = _format_tool_call(
         "write_file", {"path": "B.lean", "content": "\n".join(f"l{i}" for i in range(40))}
     )
-    check("large write summarized", "lines," in out and "bytes)" in out, out)
-    check("large write hides content", "l39" not in out, out)
+    # Long file: size summary on the path line, plus a head+tail preview.
+    check("large write keeps size summary", "lines," in out and "bytes)" in out, out)
+    check("large write shows head", "l0" in out, out)
+    check("large write shows tail", "l39" in out, out)
+    check("large write elides middle", "l20" not in out, out)
+    check("large write counts omitted", "20 lines omitted" in out, out)
 
 
 def test_edit_file_real_line_numbers() -> None:
@@ -106,11 +116,108 @@ def test_lean_run_code() -> None:
 
     big = "\n".join(f"def x{i} := {i}" for i in range(60))
     out2 = _format_tool_call("lean_run_code", {"code": big})
-    check("run_code large summarized", "(60 lines," in out2 and "chars)" in out2, out2)
-    check("run_code large not dumped", "def x59" not in out2, out2)
+    check("run_code large shows line count", "(60 lines)" in out2, out2)
+    check("run_code large shows head", "def x0 := 0" in out2, out2)
+    check("run_code large shows tail", "def x59 := 59" in out2, out2)
+    check("run_code large elides middle", "def x30 := 30" not in out2, out2)
+    check("run_code large counts omitted", "40 lines omitted" in out2, out2)
 
     out3 = _format_tool_call("lean_run_code", {"code": "#check Nat"})
-    check("run_code single line inline", out3.strip() == "-> lean_run_code #check Nat", out3)
+    check("run_code single line shown", "(1 line)" in out3 and "#check Nat" in out3, out3)
+
+
+def test_file_preview_boundary() -> None:
+    # Exactly 20 lines: shown whole, no elision marker.
+    twenty = "\n".join(f"L{i}" for i in range(1, 21))
+    out20 = _format_tool_call("write_file", {"path": "C.lean", "content": twenty})
+    check("20 lines shown whole", "L1\n" in out20 + "\n" and "L20" in out20, out20)
+    check("20 lines no elision", "omitted" not in out20, out20)
+
+    # 21 lines: head(1-10) + marker(1 omitted) + tail(12-21).
+    twentyone = "\n".join(f"L{i}" for i in range(1, 22))
+    out21 = _format_tool_call("write_file", {"path": "C.lean", "content": twentyone})
+    check("21 lines shows head", "L10" in out21, out21)
+    check("21 lines shows tail", "L21" in out21, out21)
+    check("21 lines elides one", "1 line omitted" in out21, out21)
+    check("21 lines drops the middle line", "L11" not in out21, out21)
+    # Tail keeps real line numbers: L21 sits on gutter line 21.
+    tail_row = next(l for l in out21.splitlines() if l.strip().endswith("L21"))
+    check("tail keeps real line numbers", tail_row.strip().startswith("21 "), tail_row)
+
+
+def test_read_file_result() -> None:
+    # Small file: shown whole, line-numbered, with a line count.
+    small = _render_read_result("alpha\nbeta\ngamma")
+    check("read small shows line count", "(3 lines)" in small, small)
+    check("read small numbers from 1", "1 alpha" in small, small)
+    check("read small shows last line", "3 gamma" in small, small)
+    check("read small no elision", "omitted" not in small, small)
+
+    # Large file: head+tail with elision and real tail line numbers.
+    big = _render_read_result("\n".join(f"r{i}" for i in range(30)))
+    check("read large shows head", "r0" in big, big)
+    check("read large shows tail", "r29" in big, big)
+    check("read large elides middle", "r15" not in big, big)
+    check("read large counts omitted", "10 lines omitted" in big, big)
+
+    check("read empty", "(empty)" in _render_read_result(""), "")
+
+
+def test_diagnostics_result() -> None:
+    # Clean compile, no diagnostics (lean_run_code shape: "diagnostics").
+    ok = _render_diagnostics_result(
+        json.dumps({"success": True, "timed_out": False, "diagnostics": []})
+    )
+    check("diag result ok header", "✓ compiled" in ok and "no diagnostics" in ok, ok)
+
+    # Mixed severities: status, counts, per-line symbols, location, multi-line.
+    out = _render_diagnostics_result(json.dumps({
+        "success": False, "timed_out": False, "diagnostics": [
+            {"severity": "error", "message": "type mismatch\n  expected Nat",
+             "line": 3, "column": 5},
+            {"severity": "warning", "message": "unused variable x", "line": 1, "column": 1},
+            {"severity": "info", "message": "trying", "line": 4, "column": 2},
+        ],
+    }))
+    check("diag result fail header", "✗ failed" in out, out)
+    check("diag result counts", "1 error, 1 warning, 1 info" in out, out)
+    check("diag result error symbol+loc", "✗ 3:5: type mismatch" in out, out)
+    check("diag result continuation keeps symbol", "✗   expected Nat" in out, out)
+    check("diag result warning symbol", "⚠ 1:1: unused variable x" in out, out)
+    check("diag result info symbol", "ℹ 4:2: trying" in out, out)
+
+    # lean_diagnostic_messages shape: diagnostics under "items", plus deps.
+    dm = _render_diagnostics_result(json.dumps({
+        "success": False, "timed_out": False,
+        "items": [{"severity": "error", "message": "boom", "line": 2, "column": 1}],
+        "failed_dependencies": ["Foo/Bar.lean"],
+    }))
+    check("diag result reads items", "✗ 2:1: boom" in dm, dm)
+    check("diag result counts deps", "1 failed dependency" in dm, dm)
+    check("diag result shows dep", "✗ failed dependency: Foo/Bar.lean" in dm, dm)
+
+    # timed_out is surfaced.
+    t = _render_diagnostics_result(
+        json.dumps({"success": False, "timed_out": True, "diagnostics": []})
+    )
+    check("diag result timed out", "timed out" in t, t)
+
+    # Long diagnostic list: head+tail elision over the rendered lines.
+    big = _render_diagnostics_result(json.dumps({
+        "success": False, "timed_out": False,
+        "items": [
+            {"severity": "error", "message": f"e{i}", "line": i, "column": 1}
+            for i in range(30)
+        ],
+    }))
+    check("diag result elides", "lines omitted" in big, big)
+    check("diag result shows first", "✗ 0:1: e0" in big, big)
+    check("diag result shows last", "✗ 29:1: e29" in big, big)
+
+    # Non-JSON / wrong shape -> None (caller falls back to the generic preview).
+    check("diag result non-json -> None", _render_diagnostics_result("oops") is None)
+    check("diag result wrong shape -> None",
+          _render_diagnostics_result(json.dumps({"foo": 1})) is None)
 
 
 def test_lean_goal_position() -> None:
@@ -180,6 +287,9 @@ def main() -> None:
     test_edit_file_fallback_without_file()
     test_lean_multi_attempt()
     test_lean_run_code()
+    test_file_preview_boundary()
+    test_read_file_result()
+    test_diagnostics_result()
     test_lean_goal_position()
     test_lean_goal_fallbacks()
     test_lean_build()
