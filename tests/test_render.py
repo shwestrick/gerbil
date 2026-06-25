@@ -10,6 +10,7 @@ from gerbil.agent import (
     _format_tool_call,
     _render_build_result,
     _render_diagnostics_result,
+    _render_goal_result,
     _render_read_result,
 )
 
@@ -253,6 +254,43 @@ def test_build_result() -> None:
     check("build result non-json -> None", _render_build_result("nope") is None)
 
 
+def test_goal_result() -> None:
+    # Column mode, one goal: count header, hypotheses + highlighted target.
+    one = _render_goal_result(json.dumps({
+        "line_context": "  simp",
+        "goals": ["n : Nat\nh : n > 0\n⊢ n + 1 > 1"],
+    }))
+    check("goal one count", "1 goal" in one, one)
+    check("goal shows hypothesis", "n : Nat" in one, one)
+    check("goal shows target", "⊢ n + 1 > 1" in one, one)
+
+    # Column mode, empty goals -> proof complete.
+    done = _render_goal_result(json.dumps({"line_context": "  rfl", "goals": []}))
+    check("goal complete", done.strip() == "✓ no goals", done)
+
+    # Multiple goals get a goal i/n separator.
+    multi = _render_goal_result(json.dumps({
+        "line_context": "x", "goals": ["⊢ A", "⊢ B"],
+    }))
+    check("goal count plural", "2 goals" in multi, multi)
+    check("goal separator", "goal 1/2" in multi and "goal 2/2" in multi, multi)
+
+    # Before/after mode (column omitted).
+    ba = _render_goal_result(json.dumps({
+        "line_context": "  simp",
+        "goals_before": ["⊢ n + 0 = n"],
+        "goals_after": [],
+    }))
+    check("goal before/after header", "before → after" in ba, ba)
+    check("goal before shown", "⊢ n + 0 = n" in ba, ba)
+    check("goal after complete", "after: " in ba and "✓ no goals" in ba, ba)
+
+    # term-goal-ish shape (no goal fields) and non-JSON -> None.
+    check("goal term shape -> None",
+          _render_goal_result(json.dumps({"line_context": "x", "expected_type": "Nat"})) is None)
+    check("goal non-json -> None", _render_goal_result("nope") is None)
+
+
 def test_lean_goal_position() -> None:
     src = "namespace D\n\ntheorem big (n : Nat) :\n    n + 0 = n := by\n  simp\n"
     out = _format_tool_call(
@@ -324,6 +362,7 @@ def main() -> None:
     test_read_file_result()
     test_diagnostics_result()
     test_build_result()
+    test_goal_result()
     test_lean_goal_position()
     test_lean_goal_fallbacks()
     test_lean_build()

@@ -351,6 +351,63 @@ def _render_build_result(content: str) -> str | None:
     return header + ("\n" + "\n".join(body) if body else "")
 
 
+def _goal_blocks(goals: list, pad: str = "") -> list[str]:
+    """Render pretty-printed goals to display lines: the ⊢ target line highlighted,
+    hypotheses dimmed, with a 'goal i/n' separator when there is more than one.
+    `pad` adds indentation (used to nest goals under before/after). A goal is the
+    pretty text (default format); a structured goal dict falls back to its
+    'pretty'/'goal' field."""
+    out: list[str] = []
+    for i, g in enumerate(goals, 1):
+        text = g if isinstance(g, str) else (g.get("pretty") or g.get("goal") or "")
+        if len(goals) > 1:
+            out.append(_BODY_INDENT + pad + style(f"goal {i}/{len(goals)}", "dim"))
+        for ln in (str(text).splitlines() or [""]):
+            styles = ("bold", "cyan") if ln.lstrip().startswith("⊢") else ("gray",)
+            out.append(_BODY_INDENT + pad + style(_clip(ln), *styles))
+    return out
+
+
+def _render_goal_result(content: str) -> str | None:
+    """Human-readable preview of a lean_goal *result* -- a JSON GoalState. With a
+    column it carries `goals`; without, `goals_before`/`goals_after` showing how
+    the line's tactic transforms the state. Render each goal's pretty text with the
+    ⊢ target highlighted; an empty goal list is "✓ no goals" (proof complete).
+    head+tail elision as elsewhere. Returns None on an unexpected shape, so the
+    caller falls back to the generic preview. Display-only."""
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or "line_context" not in data:
+        return None
+    if not any(data.get(k) is not None for k in ("goals", "goals_before", "goals_after")):
+        return None  # e.g. a term-goal shape; let the generic preview handle it
+
+    # Column given: a single goal list.
+    if data.get("goals") is not None:
+        goals = data["goals"]
+        if not goals:
+            return style("✓ no goals", "green")
+        header = style(f"{len(goals)} goal{'' if len(goals) == 1 else 's'}", "cyan")
+        body = _elide_middle(_goal_blocks(goals))
+        return header + "\n" + "\n".join(body)
+
+    # Column omitted: goals at line start and end (the tactic's effect).
+    header = style("goals before → after", "cyan")
+    body: list[str] = []
+    for label, goals in (("before", data.get("goals_before") or []),
+                         ("after", data.get("goals_after") or [])):
+        if goals:
+            body.append(_BODY_INDENT + style(
+                f"{label} ({len(goals)} goal{'' if len(goals) == 1 else 's'})", "dim"))
+            body += _goal_blocks(goals, pad="  ")
+        else:
+            body.append(_BODY_INDENT + style(f"{label}: ", "dim") + style("✓ no goals", "green"))
+    body = _elide_middle(body)
+    return header + ("\n" + "\n".join(body) if body else "")
+
+
 def _format_tool_call(name: str, args: dict, read_file=None) -> str:
     """A pretty, single- or multi-line rendering of a tool call for the terminal.
 
@@ -841,6 +898,8 @@ def run_session(
                     rendered = _render_diagnostics_result(result.content)
                 elif tc["name"] == "lean_build":
                     rendered = _render_build_result(result.content)
+                elif tc["name"] == "lean_goal":
+                    rendered = _render_goal_result(result.content)
             if rendered is None:
                 preview = content[:200] + "..." if len(content) > 200 else content
                 # Align continuation lines under the content (after "  <- ").
