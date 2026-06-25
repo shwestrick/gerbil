@@ -316,6 +316,41 @@ def _render_diagnostics_result(content: str) -> str | None:
     return header + ("\n" + "\n".join(body) if body else "")
 
 
+def _render_build_result(content: str) -> str | None:
+    """Human-readable preview of a lean_build *result* -- a JSON BuildResult
+    {success, output, errors}. Render a pass/fail header, any error strings (red,
+    one symbol per line), then the build log (dimmed), with the same head+tail
+    elision as the other previews. Errors come first since they are the point of a
+    failed build; the log is trailing context. Returns None when `content` isn't
+    the expected shape, so the caller falls back to the generic preview.
+    Display-only -- the model still sees the raw JSON."""
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return None
+    # "output" keys this apart from the diagnostics shape and from arbitrary JSON.
+    if not isinstance(data, dict) or "output" not in data:
+        return None
+    errors = [e for e in (data.get("errors") or []) if isinstance(e, str)]
+
+    header = (
+        style("✓ build succeeded", "green") if data.get("success")
+        else style("✗ build failed", "red")
+    )
+    if errors:
+        header += " " + style(f"({len(errors)} error{'' if len(errors) == 1 else 's'})", "dim")
+
+    body: list[str] = []
+    for err in errors:
+        for ln in (err.splitlines() or [""]):
+            body.append(_BODY_INDENT + style(_clip(f"✗ {ln}"), "red"))
+    for ln in str(data.get("output", "")).splitlines():
+        body.append(_BODY_INDENT + style(_clip(ln), "gray"))
+
+    body = _elide_middle(body)
+    return header + ("\n" + "\n".join(body) if body else "")
+
+
 def _format_tool_call(name: str, args: dict, read_file=None) -> str:
     """A pretty, single- or multi-line rendering of a tool call for the terminal.
 
@@ -804,6 +839,8 @@ def run_session(
                     rendered = _render_read_result(content)
                 elif tc["name"] in ("lean_run_code", "lean_diagnostic_messages"):
                     rendered = _render_diagnostics_result(result.content)
+                elif tc["name"] == "lean_build":
+                    rendered = _render_build_result(result.content)
             if rendered is None:
                 preview = content[:200] + "..." if len(content) > 200 else content
                 # Align continuation lines under the content (after "  <- ").

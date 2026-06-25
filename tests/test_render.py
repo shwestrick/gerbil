@@ -8,6 +8,7 @@ import json
 
 from gerbil.agent import (
     _format_tool_call,
+    _render_build_result,
     _render_diagnostics_result,
     _render_read_result,
 )
@@ -220,6 +221,38 @@ def test_diagnostics_result() -> None:
           _render_diagnostics_result(json.dumps({"foo": 1})) is None)
 
 
+def test_build_result() -> None:
+    # Success with no errors -> just the green header.
+    ok = _render_build_result(json.dumps({"success": True, "output": "", "errors": []}))
+    check("build result ok header", "✓ build succeeded" in ok, ok)
+
+    # Failure: red header, error count, each error line red-symboled, log dimmed.
+    out = _render_build_result(json.dumps({
+        "success": False,
+        "output": "Building Foo\nerror: oops",
+        "errors": ["Foo.lean:3:5: unexpected token\n  expected term"],
+    }))
+    check("build result fail header", "✗ build failed" in out, out)
+    check("build result error count", "(1 error)" in out, out)
+    check("build result error symbol", "✗ Foo.lean:3:5: unexpected token" in out, out)
+    check("build result error continuation", "✗   expected term" in out, out)
+    check("build result shows log", "Building Foo" in out, out)
+
+    # Long log -> head+tail elision.
+    big = _render_build_result(json.dumps({
+        "success": False, "errors": [],
+        "output": "\n".join(f"line {i}" for i in range(30)),
+    }))
+    check("build result elides", "lines omitted" in big, big)
+    check("build result shows first log line", "line 0" in big, big)
+    check("build result shows last log line", "line 29" in big, big)
+
+    # Wrong shape / non-JSON -> None (fall back to generic preview).
+    check("build result no-output-key -> None",
+          _render_build_result(json.dumps({"success": True})) is None)
+    check("build result non-json -> None", _render_build_result("nope") is None)
+
+
 def test_lean_goal_position() -> None:
     src = "namespace D\n\ntheorem big (n : Nat) :\n    n + 0 = n := by\n  simp\n"
     out = _format_tool_call(
@@ -290,6 +323,7 @@ def main() -> None:
     test_file_preview_boundary()
     test_read_file_result()
     test_diagnostics_result()
+    test_build_result()
     test_lean_goal_position()
     test_lean_goal_fallbacks()
     test_lean_build()
