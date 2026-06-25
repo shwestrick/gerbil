@@ -28,6 +28,18 @@ from functools import lru_cache
 ANTHROPIC_MAX_TOKENS = 16384
 
 
+class TransientProviderError(RuntimeError):
+    """A provider failure that is safe to retry by re-running the same turn.
+
+    Some failures arrive not as an SDK exception but as a *finish reason* on an
+    otherwise-empty final chunk -- notably Gemini's MALFORMED_RESPONSE and the
+    botched-function-call reasons. With no exception raised, the stream just ends,
+    and the agent loop reads a content-free, tool-call-free turn as "the model is
+    done" -- silently mistaking a model failure for task completion. We raise this
+    instead so _run_turn_with_retry re-streams the same turn (nothing is lost; the
+    retry runs from the unchanged `messages`)."""
+
+
 @lru_cache(maxsize=None)
 def get_context_window(model: str, provider: str | None = None) -> int | None:
     """The model's maximum context window in total tokens, queried live from the
@@ -190,6 +202,8 @@ def _stream_gemini(model, system, messages, tools):
             contents.append(types.Content(role="model", parts=parts))
 
     usage = Usage()
+    emitted = False
+    finish_reason = None
     for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
         if chunk.usage_metadata:
             um = chunk.usage_metadata
@@ -207,17 +221,67 @@ def _stream_gemini(model, system, messages, tools):
             )
         if not chunk.candidates:
             continue
+        candidate = chunk.candidates[0]
+        # The completion status rides on the final chunk's candidate. Remember it
+        # so we can tell a real stop from a malformed/failed turn once the stream
+        # ends (see _check_gemini_finish).
+        if candidate.finish_reason is not None:
+            finish_reason = candidate.finish_reason
         # A final chunk may carry only a finish reason / usage, with no content.
-        content = chunk.candidates[0].content
+        content = candidate.content
         if content is None or content.parts is None:
             continue
         for part in content.parts:
             if part.text:
+                emitted = True
                 yield TextDelta(part.text)
             elif part.function_call:
+                emitted = True
                 yield ToolCall(part.function_call.name, dict(part.function_call.args), raw_part=part)
 
+    # A malformed/empty finish must raise BEFORE Done, so the agent loop never
+    # sees it as a completed (content-free) turn -- it gets retried instead.
+    _check_gemini_finish(finish_reason, emitted)
     yield Done(usage)
+
+
+# Gemini finish reasons that mean the turn FAILED rather than completed: the model
+# produced a malformed response or bungled a function call. To the agent loop these
+# look identical to an empty, tool-call-free "the model is done" turn, so we must
+# catch them here and surface them as retryable.
+_GEMINI_BAD_FINISH = {
+    "MALFORMED_RESPONSE",
+    "MALFORMED_FUNCTION_CALL",
+    "UNEXPECTED_TOOL_CALL",
+    "OTHER",
+    "FINISH_REASON_UNSPECIFIED",
+}
+
+
+def _finish_reason_name(finish_reason) -> str | None:
+    """Bare uppercase name of a google-genai FinishReason, e.g. 'MALFORMED_RESPONSE'.
+
+    Handles both a normal enum member and -- for a reason the installed SDK
+    predates -- the synthetic member google-genai fabricates around the raw string
+    (which is exactly the MALFORMED_RESPONSE case that prompted this). Returns None
+    when there is no finish reason."""
+    if finish_reason is None:
+        return None
+    name = getattr(finish_reason, "name", None) or str(finish_reason)
+    return name.rsplit(".", 1)[-1].upper()
+
+
+def _check_gemini_finish(finish_reason, emitted: bool) -> None:
+    """Raise TransientProviderError when Gemini ended a turn on a malformed/failed
+    finish reason, or produced an empty stream with no finish reason at all. Both
+    are recoverable by re-running the turn; without this they would be misread as
+    a completed turn. A clean STOP/MAX_TOKENS (even with no content) is left alone
+    so a genuine empty completion still ends the run as before."""
+    name = _finish_reason_name(finish_reason)
+    if name in _GEMINI_BAD_FINISH:
+        raise TransientProviderError(f"gemini finish reason {name}")
+    if not emitted and name is None:
+        raise TransientProviderError("gemini returned an empty response")
 
 
 # ---------------------------------------------------------------------------

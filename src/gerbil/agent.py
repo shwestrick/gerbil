@@ -18,6 +18,7 @@ from .providers import (
     Done,
     TextDelta,
     ToolCall,
+    TransientProviderError,
     Usage,
     _ToolMeta,
     get_context_window,
@@ -480,6 +481,10 @@ def _is_transient_error(exc: BaseException) -> bool:
     """Whether `exc` is a transient provider failure worth retrying (503/
     UNAVAILABLE, rate limits, 5xx, dropped connections). Conservative: anything
     not recognized returns False so permanent errors still abort the run."""
+    # A malformed/empty Gemini turn surfaces as no SDK exception, only a finish
+    # reason; providers.py converts it to this, which is always retryable.
+    if isinstance(exc, TransientProviderError):
+        return True
     for attr in ("status_code", "code", "http_status"):
         val = getattr(exc, attr, None)
         if isinstance(val, bool):  # bool is an int subclass; never a status code
