@@ -146,6 +146,8 @@ def test_client_construction() -> None:
         check("api key reaches client", seen["client"].get("api_key") == "pk-test")
         check("base url reaches client",
               seen["client"].get("base_url") == "https://gw.example/v1/")
+        check("strict compliance requested",
+              seen["client"].get("strict_open_ai_compliance") is True)
         check("stripped model reaches create",
               seen["create"].get("model") == CATALOG_MODEL,
               str(seen["create"].get("model")))
@@ -176,6 +178,87 @@ def test_client_construction() -> None:
             sys.modules["portkey_ai"] = saved
 
 
+def _chunk(content=None, tool_calls=None, finish=None):
+    delta = types.SimpleNamespace(content=content, tool_calls=tool_calls)
+    return types.SimpleNamespace(
+        choices=[types.SimpleNamespace(delta=delta, finish_reason=finish)],
+        usage=None,
+    )
+
+
+def _tc_delta(index=0, id=None, name=None, arguments=None):
+    fn = types.SimpleNamespace(name=name, arguments=arguments)
+    return types.SimpleNamespace(index=index, id=id, function=fn)
+
+
+def _fake_client(chunks):
+    def create(**kwargs):
+        yield from chunks
+
+    return types.SimpleNamespace(
+        chat=types.SimpleNamespace(
+            completions=types.SimpleNamespace(create=create)
+        )
+    )
+
+
+def test_tool_call_flush() -> None:
+    """The shared streaming core must surface accumulated tool calls whatever
+    terminal finish_reason label the server used. Portkey's gateway (in its
+    default non-strict mode) forwards Anthropic's raw "tool_use" verbatim, and
+    the old exact-match gate on "tool_calls" silently dropped the call --
+    making the agent look done after its very first turn."""
+    from gerbil import providers
+    from gerbil.providers import ToolCall, _ToolMeta
+
+    def events_for(chunks):
+        return list(providers._stream_openai_chat(
+            _fake_client(chunks), "m", "sys",
+            [{"role": "user", "content": "hi"}], [],
+        ))
+
+    call = [_tc_delta(0, id="c1", name="read_file",
+                      arguments='{"path": "PLAN.md"}')]
+
+    def check_flushed(label, events):
+        kinds = [type(e).__name__ for e in events]
+        check(label, kinds == ["TextDelta", "ToolCall", "_ToolMeta", "Done"],
+              str(kinds))
+        tc = events[1]
+        check(label + ": call content",
+              isinstance(tc, ToolCall) and tc.name == "read_file"
+              and tc.args == {"path": "PLAN.md"})
+        check(label + ": tool id",
+              isinstance(events[2], _ToolMeta)
+              and events[2].tool_use_id == "c1")
+
+    # The spec-compliant label still works.
+    check_flushed("finish=tool_calls", events_for([
+        _chunk(content="reading"), _chunk(tool_calls=call),
+        _chunk(finish="tool_calls"),
+    ]))
+    # Anthropic's raw label, as a non-strict gateway forwards it.
+    check_flushed("finish=tool_use", events_for([
+        _chunk(content="reading"), _chunk(tool_calls=call),
+        _chunk(finish="tool_use"),
+    ]))
+    # Any other terminal label with calls accumulated must flush too.
+    check_flushed("finish=stop with calls", events_for([
+        _chunk(content="reading"), _chunk(tool_calls=call),
+        _chunk(finish="stop"),
+    ]))
+    # Safety net: stream ends without any finish_reason at all.
+    check_flushed("no finish_reason", events_for([
+        _chunk(content="reading"), _chunk(tool_calls=call),
+    ]))
+
+    # A genuinely tool-free turn must not grow phantom events.
+    kinds = [type(e).__name__ for e in
+             events_for([_chunk(content="done"), _chunk(finish="stop")])]
+    check("text-only turn unchanged", kinds == ["TextDelta", "Done"],
+          str(kinds))
+
+
 def test_live_smoke() -> None:
     """If PORTKEY_API_KEY and PORTKEY_TEST_MODEL are set, exercise the real SDK
     path end to end for one short, tool-free completion. Skipped otherwise."""
@@ -201,6 +284,7 @@ def main() -> None:
     test_model_name()
     test_pricing()
     test_client_construction()
+    test_tool_call_flush()
     test_live_smoke()
     print("\nAll portkey tests passed.")
 

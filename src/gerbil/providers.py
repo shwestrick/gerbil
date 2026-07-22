@@ -469,6 +469,14 @@ def _stream_openai_chat(client, model, system, messages, tools):
     usage = Usage()
     tool_calls_acc = {}  # index -> {id, name, args_json}
 
+    def flush_tool_calls():
+        for idx in sorted(tool_calls_acc.keys()):
+            tc = tool_calls_acc[idx]
+            args = json.loads(tc["args_json"]) if tc["args_json"] else {}
+            yield ToolCall(tc["name"], args)
+            yield _ToolMeta(tc["id"])
+        tool_calls_acc.clear()
+
     create_kwargs = dict(
         model=model,
         messages=openai_messages,
@@ -510,13 +518,19 @@ def _stream_openai_chat(client, model, system, messages, tools):
                 if tc.function and tc.function.arguments:
                     tool_calls_acc[idx]["args_json"] += tc.function.arguments
 
-        if chunk.choices[0].finish_reason == "tool_calls":
-            for idx in sorted(tool_calls_acc.keys()):
-                tc = tool_calls_acc[idx]
-                args = json.loads(tc["args_json"]) if tc["args_json"] else {}
-                yield ToolCall(tc["name"], args)
-                yield _ToolMeta(tc["id"])
-            tool_calls_acc = {}
+        # Flush on ANY terminal chunk, not just finish_reason == "tool_calls".
+        # Gateways translating other providers' responses can mislabel the
+        # finish reason -- Portkey in its default non-strict-compliance mode
+        # passes Anthropic's raw "tool_use" through verbatim -- and gating on
+        # the exact label silently dropped the accumulated calls, making the
+        # agent look done after its very first turn. Accumulated calls are
+        # themselves the proof that tools were requested; the label is not.
+        if chunk.choices[0].finish_reason is not None:
+            yield from flush_tool_calls()
+
+    # Safety net: some servers end the stream without ever setting a
+    # finish_reason (or set it on a choices-less usage chunk we skip above).
+    yield from flush_tool_calls()
 
     yield Done(usage)
 
@@ -565,7 +579,12 @@ def _stream_portkey(model, system, messages, tools):
         raise RuntimeError(
             "portkey models need the PORTKEY_API_KEY environment variable"
         ) from None
-    client_kwargs = {"api_key": api_key}
+    # strict_open_ai_compliance makes the gateway normalize provider-native
+    # finish reasons to the OpenAI vocabulary (e.g. Anthropic's "tool_use" ->
+    # "tool_calls"). The SDK defaults it to False, which leaks raw provider
+    # labels into the stream; the shared core tolerates that now, but ask for
+    # the spec-compliant dialect anyway since that is what we parse against.
+    client_kwargs = {"api_key": api_key, "strict_open_ai_compliance": True}
     base_url = os.environ.get("PORTKEY_BASE_URL", "").strip()
     if base_url:
         client_kwargs["base_url"] = base_url
