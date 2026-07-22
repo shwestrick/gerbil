@@ -83,6 +83,16 @@ def test_pricing() -> None:
     ambiguous = "portkey:@foo/o3-versus-gpt-4o"
     check("ambiguous is detected", pricing_match(ambiguous) is None)
     check("ambiguous -> None", model_pricing(ambiguous) is None)
+    # Nested family keys are NOT ambiguous: the longest match subsumes the
+    # shorter ones riding along inside it, so the most specific key wins.
+    check("nested: o3-mini beats o3",
+          pricing_match("portkey:@foo/o3-mini") == "o3-mini")
+    check("nested: mini not mispriced as base",
+          model_pricing("@foo/gpt-4.1-mini") == MODEL_PRICING["gpt-4.1-mini"])
+    check("nested: dated pro key beats gpt-5.4 and gpt-5.4-pro",
+          pricing_match("@foo/gpt-5.4-pro-2026-03-05") == "gpt-5.4-pro-2026-03-05")
+    check("nested: flash-lite beats flash",
+          pricing_match("@foo/gemini-3.5-flash-lite") == "gemini-3.5-flash-lite")
     # Exact table entries and ollama's free pricing are untouched.
     check("exact model still priced", model_pricing("gpt-4o") == (2.50, 10.0))
     check("ollama still free", model_pricing("ollama:anything") == (0.0, 0.0))
