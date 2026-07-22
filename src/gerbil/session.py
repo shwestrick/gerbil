@@ -50,6 +50,8 @@ class Session:
         self._total_input_tokens = 0
         self._total_output_tokens = 0
         self._total_thinking_tokens = 0
+        self._total_cache_read_tokens = 0
+        self._total_cache_write_tokens = 0
 
         # base_commit anchors the git state this session starts from -- the HEAD
         # the agent's changes are layered on top of. It is what `--resume` checks
@@ -90,12 +92,18 @@ class Session:
         input_tokens: int = 0,
         output_tokens: int = 0,
         thinking_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
     ) -> None:
         self._total_input_tokens += input_tokens
         self._total_output_tokens += output_tokens
         self._total_thinking_tokens += thinking_tokens
+        self._total_cache_read_tokens += cache_read_tokens
+        self._total_cache_write_tokens += cache_write_tokens
         # thinking_tokens is a subset of output_tokens (the inclusive,
-        # output-rate-billed total), recorded for reporting.
+        # output-rate-billed total), recorded for reporting. The cache counts
+        # are ADDITIONAL prompt tokens (Anthropic semantics: input_tokens is
+        # only the uncached remainder), billed at their own rates.
         self._append({
             "event": "turn",
             "timestamp": _now(),
@@ -105,6 +113,8 @@ class Session:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "thinking_tokens": thinking_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_write_tokens": cache_write_tokens,
             },
         })
 
@@ -143,6 +153,8 @@ class Session:
                 "input_tokens": self._total_input_tokens,
                 "output_tokens": self._total_output_tokens,
                 "thinking_tokens": self._total_thinking_tokens,
+                "cache_read_tokens": self._total_cache_read_tokens,
+                "cache_write_tokens": self._total_cache_write_tokens,
             },
         })
 
@@ -180,6 +192,8 @@ class Session:
                 "input_tokens": self._total_input_tokens,
                 "output_tokens": self._total_output_tokens,
                 "thinking_tokens": self._total_thinking_tokens,
+                "cache_read_tokens": self._total_cache_read_tokens,
+                "cache_write_tokens": self._total_cache_write_tokens,
             },
         })
 

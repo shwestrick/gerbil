@@ -129,6 +129,38 @@ def model_pricing(model: str) -> tuple[float, float] | None:
         )
     return None
 
+
+# Anthropic prompt-cache billing, as multiples of the model's input rate:
+# reading a cached prefix costs ~0.1x, writing one costs ~1.25x (5-minute TTL).
+# Applied to Usage.cache_read_tokens / cache_write_tokens, which follow the
+# same exclusive semantics (input_tokens covers only the uncached remainder).
+CACHE_READ_MULTIPLIER = 0.10
+CACHE_WRITE_MULTIPLIER = 1.25
+
+
+def estimate_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> float | None:
+    """Estimated USD cost from per-million-token pricing, or None when the
+    model's pricing is unknown -- callers must then report N/A rather than a
+    made-up number. Cache reads/writes bill at their multiplier of the input
+    rate; both counts are zero for providers without explicit caching, which
+    reduces this to the plain input+output estimate."""
+    pricing = model_pricing(model)
+    if pricing is None:
+        return None
+    price_in, price_out = pricing
+    return (
+        input_tokens * price_in
+        + cache_read_tokens * price_in * CACHE_READ_MULTIPLIER
+        + cache_write_tokens * price_in * CACHE_WRITE_MULTIPLIER
+        + output_tokens * price_out
+    ) / 1_000_000
+
 SYSTEM_PROMPT = """\
 You are gerbil, an autonomous agent working inside a sandboxed Lean 4 / Lake \
 project. Your job is to carry out the user's task by editing files and running \
@@ -983,12 +1015,15 @@ def run_session(
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
         total.thinking_tokens += usage.thinking_tokens
+        total.cache_read_tokens += usage.cache_read_tokens
+        total.cache_write_tokens += usage.cache_write_tokens
         last_usage = usage
 
         messages.append({"role": "assistant", "content": assistant_parts})
         session.record_turn(
             "assistant", final_text, usage.input_tokens, usage.output_tokens,
-            usage.thinking_tokens,
+            usage.thinking_tokens, usage.cache_read_tokens,
+            usage.cache_write_tokens,
         )
 
         # No tool calls => the model is done with the task.
@@ -1083,12 +1118,15 @@ def run_session(
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
         total.thinking_tokens += usage.thinking_tokens
+        total.cache_read_tokens += usage.cache_read_tokens
+        total.cache_write_tokens += usage.cache_write_tokens
         last_usage = usage
 
         messages.append({"role": "assistant", "content": parts})
         session.record_turn(
             "assistant", text, usage.input_tokens, usage.output_tokens,
-            usage.thinking_tokens,
+            usage.thinking_tokens, usage.cache_read_tokens,
+            usage.cache_write_tokens,
         )
         commit_message = text.strip()
         print(flush=True)
@@ -1109,7 +1147,12 @@ def _context_suffix(max_context: int | None, usage: Usage | None) -> str:
     isn't (provider doesn't report it), show the raw total."""
     if usage is None:
         return ""
-    used = usage.input_tokens + usage.output_tokens
+    # Cached prompt tokens still occupy the window -- input_tokens alone is
+    # just the uncached remainder when explicit caching is active.
+    used = (
+        usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens
+        + usage.output_tokens
+    )
     if not max_context:
         return style(f"  [context: {used:,} tokens]", "gray")
     pct = used / max_context * 100
@@ -1119,21 +1162,31 @@ def _context_suffix(max_context: int | None, usage: Usage | None) -> str:
 
 def _print_usage(model: str, turns: int, usage: Usage) -> None:
     """Print a summary line with token counts and estimated cost."""
-    pricing = model_pricing(model)
-    if pricing is None:
-        cost_str = "cost: N/A"
-    else:
-        price_in, price_out = pricing
-        cost = (usage.input_tokens * price_in + usage.output_tokens * price_out) / 1_000_000
-        cost_str = f"~${cost:.4f}"
-    total = usage.input_tokens + usage.output_tokens
+    cost = estimate_cost(
+        model, usage.input_tokens, usage.output_tokens,
+        usage.cache_read_tokens, usage.cache_write_tokens,
+    )
+    cost_str = "cost: N/A" if cost is None else f"~${cost:.4f}"
+    total = (
+        usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens
+        + usage.output_tokens
+    )
+    # Cache reads/writes are extra prompt tokens on top of input_tokens (the
+    # uncached remainder), each billed at its own rate -- break them out so the
+    # discount is visible.
+    inp = f"in: {usage.input_tokens:,}"
+    if usage.cache_read_tokens or usage.cache_write_tokens:
+        inp += (
+            f" + {usage.cache_read_tokens:,} cache-read"
+            f" + {usage.cache_write_tokens:,} cache-write"
+        )
     # thinking_tokens is a subset of output_tokens, so show it as a breakdown.
     out = f"out: {usage.output_tokens:,}"
     if usage.thinking_tokens:
         out += f" incl. {usage.thinking_tokens:,} thinking"
     line = (
         f"--- {turns} turns, {total:,} tokens "
-        f"(in: {usage.input_tokens:,}, {out}), "
+        f"({inp}, {out}), "
         f"{cost_str} ---"
     )
     print("\n" + style(line, "bold"), flush=True)

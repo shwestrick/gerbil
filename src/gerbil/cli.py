@@ -41,7 +41,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from .agent import MODEL_PRICING, model_pricing, pricing_match, run_session
+from .agent import (
+    MODEL_PRICING,
+    estimate_cost,
+    model_pricing,
+    pricing_match,
+    run_session,
+)
 from .sandbox import LeanSandbox
 from .session import Session
 from .term import style
@@ -429,12 +435,16 @@ def _scan_session(path: Path) -> dict:
     prior log by --resume) are skipped so a resumed chain isn't double-counted --
     this mirrors how Session accumulates totals only from live turns.
 
-    Returns: {model, input_tokens, output_tokens, thinking_tokens, turns,
-    tool_calls (Counter), status} where status is 'completed' | 'errored' |
-    'incomplete', and thinking_tokens is the reasoning subset of output_tokens. A
-    garbled log yields a sentinel with status 'unreadable' and zero usage."""
+    Returns: {model, input_tokens, output_tokens, thinking_tokens,
+    cache_read_tokens, cache_write_tokens, turns, tool_calls (Counter), status}
+    where status is 'completed' | 'errored' | 'incomplete', thinking_tokens is
+    the reasoning subset of output_tokens, and the cache counts are additional
+    prompt tokens (input_tokens is the uncached remainder; pre-caching logs
+    simply lack the fields and read as zero). A garbled log yields a sentinel
+    with status 'unreadable' and zero usage."""
     model = "unknown"
     input_tokens = output_tokens = thinking_tokens = turns = 0
+    cache_read_tokens = cache_write_tokens = 0
     tool_calls: collections.Counter = collections.Counter()
     status = "incomplete"  # no session_end/error recorded => crashed mid-run
 
@@ -442,7 +452,8 @@ def _scan_session(path: Path) -> dict:
         lines = path.read_text().splitlines()
     except OSError:
         return {"model": model, "input_tokens": 0, "output_tokens": 0,
-                "thinking_tokens": 0, "turns": 0, "tool_calls": tool_calls,
+                "thinking_tokens": 0, "cache_read_tokens": 0,
+                "cache_write_tokens": 0, "turns": 0, "tool_calls": tool_calls,
                 "status": "unreadable"}
 
     for line in lines:
@@ -465,6 +476,8 @@ def _scan_session(path: Path) -> dict:
             input_tokens += usage.get("input_tokens", 0)
             output_tokens += usage.get("output_tokens", 0)
             thinking_tokens += usage.get("thinking_tokens", 0)
+            cache_read_tokens += usage.get("cache_read_tokens", 0)
+            cache_write_tokens += usage.get("cache_write_tokens", 0)
             turns += 1
         elif event == "tool_call":
             tool_calls[e.get("name", "?")] += 1
@@ -475,17 +488,18 @@ def _scan_session(path: Path) -> dict:
 
     return {"model": model, "input_tokens": input_tokens,
             "output_tokens": output_tokens, "thinking_tokens": thinking_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
             "turns": turns, "tool_calls": tool_calls, "status": status}
 
 
-def _cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
-    """Estimated USD cost from per-million-token pricing, or None when the
-    model's pricing is unknown (reported as N/A, never a made-up number)."""
-    pricing = model_pricing(model)
-    if pricing is None:
-        return None
-    price_in, price_out = pricing
-    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+def _cost(s: dict) -> float | None:
+    """Estimated USD cost of one session's stats dict, or None when the model's
+    pricing is unknown (reported as N/A, never a made-up number)."""
+    return estimate_cost(
+        s["model"], s["input_tokens"], s["output_tokens"],
+        s["cache_read_tokens"], s["cache_write_tokens"],
+    )
 
 
 def cmd_summarize(args) -> None:
@@ -514,8 +528,10 @@ def cmd_summarize(args) -> None:
     total_in = sum(s["input_tokens"] for s in stats)
     total_out = sum(s["output_tokens"] for s in stats)
     total_thinking = sum(s["thinking_tokens"] for s in stats)
+    total_cache_read = sum(s["cache_read_tokens"] for s in stats)
+    total_cache_write = sum(s["cache_write_tokens"] for s in stats)
     total_turns = sum(s["turns"] for s in stats)
-    costs = [_cost(s["model"], s["input_tokens"], s["output_tokens"]) for s in stats]
+    costs = [_cost(s) for s in stats]
     total_cost = sum(c for c in costs if c is not None)
     unpriced = sum(1 for c in costs if c is None)
 
@@ -530,14 +546,16 @@ def cmd_summarize(args) -> None:
     for s in stats:
         m = by_model.setdefault(
             s["model"],
-            {"sessions": 0, "input": 0, "output": 0, "thinking": 0, "cost": 0.0},
+            {"sessions": 0, "input": 0, "output": 0, "thinking": 0,
+             "cached": 0, "cost": 0.0},
         )
         m["sessions"] += 1
         m["input"] += s["input_tokens"]
         m["output"] += s["output_tokens"]
         m["thinking"] += s["thinking_tokens"]
+        m["cached"] += s["cache_read_tokens"] + s["cache_write_tokens"]
         # None poisons the rollup: one unpriced session makes the model's cost N/A.
-        c = _cost(s["model"], s["input_tokens"], s["output_tokens"])
+        c = _cost(s)
         if c is None:
             m["cost"] = None
         elif m["cost"] is not None:
@@ -549,12 +567,18 @@ def cmd_summarize(args) -> None:
 
     print(bold("Tokens"))
     print(f"  input:    {total_in:>12,}")
+    # Cache reads/writes are prompt tokens beyond `input` (which is only the
+    # uncached remainder), billed at ~0.1x / ~1.25x the input rate.
+    if total_cache_read or total_cache_write:
+        print(f"  cache-rd: {total_cache_read:>12,}  {style('(0.1x input rate)', 'gray')}")
+        print(f"  cache-wr: {total_cache_write:>12,}  {style('(1.25x input rate)', 'gray')}")
     print(f"  output:   {total_out:>12,}")
     # thinking is a subset of output (billed at the output rate), so list it as a
     # breakdown beneath output rather than adding it into the total.
     if total_thinking:
         print(f"  thinking: {total_thinking:>12,}  {style('(of output)', 'gray')}")
-    print(f"  total:    {total_in + total_out:>12,}")
+    total_all = total_in + total_cache_read + total_cache_write + total_out
+    print(f"  total:    {total_all:>12,}")
     print()
 
     print(bold("Estimated cost"))
@@ -602,11 +626,15 @@ def cmd_summarize(args) -> None:
         thinking = (
             style(f" ({m['thinking']:,} thinking)", "gray") if m["thinking"] else ""
         )
+        cached = (
+            style(f" ({m['cached']:,} cached)", "gray") if m["cached"] else ""
+        )
         cost_str = "cost: N/A" if m["cost"] is None else f"~${m['cost']:,.4f}"
         print(
             f"  {style(model, 'cyan')}{known}: "
             f"{m['sessions']} session(s), "
-            f"{m['input'] + m['output']:,} tokens{thinking}, {cost_str}"
+            f"{m['input'] + m['cached'] + m['output']:,} tokens"
+            f"{cached}{thinking}, {cost_str}"
         )
 
 

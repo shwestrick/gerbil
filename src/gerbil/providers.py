@@ -22,6 +22,7 @@ Ported from lea-prover (lea/providers.py).
 """
 
 import os
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -81,6 +82,15 @@ class Usage:
     # Populated only for providers/models that expose the breakdown; 0 otherwise,
     # in which case any thinking is silently folded into output_tokens.
     thinking_tokens: int = 0
+    # Prompt-cache token counts, Anthropic semantics: these are IN ADDITION to
+    # input_tokens (which then covers only the uncached remainder of the prompt).
+    # Total prompt size = input + cache_read + cache_write. Reads bill at ~0.1x
+    # the input rate and writes at ~1.25x (see agent.CACHE_READ_MULTIPLIER /
+    # CACHE_WRITE_MULTIPLIER). Zero for providers that cache implicitly (Gemini,
+    # OpenAI) or not at all -- their caching discounts are invisible here and
+    # cost estimates stay conservative.
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 @dataclass
@@ -300,11 +310,20 @@ def _check_gemini_finish(finish_reason, emitted: bool) -> None:
 # ---------------------------------------------------------------------------
 
 def _stream_anthropic(model, system, messages, tools):
-    import json
-
     import anthropic
 
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    yield from _stream_anthropic_chat(client, model, system, messages, tools)
+
+
+def _stream_anthropic_chat(client, model, system, messages, tools):
+    """The Messages-API streaming core, shared by the Anthropic provider and the
+    Portkey provider's native route (the gateway speaks /v1/messages too). The
+    caller supplies an already-constructed anthropic client and the resolved
+    model name; everything below -- message conversion, cache breakpoints,
+    tool-call accumulation, usage tracking -- is identical regardless of which
+    endpoint the client points at."""
+    import json
 
     anthropic_tools = [
         {
@@ -346,6 +365,46 @@ def _stream_anthropic(model, system, messages, tools):
                     })
             anthropic_messages.append({"role": "assistant", "content": content})
 
+    # Prompt caching. Anthropic caching is an explicit prefix match (unlike
+    # Gemini/OpenAI, which cache server-side with no opt-in): content up to a
+    # `cache_control` breakpoint is cached for ~5 minutes and re-served at ~0.1x
+    # the input rate, with a one-time ~1.25x write premium. Two breakpoints (max
+    # allowed is 4):
+    #
+    #   1. The system prompt -- the request renders tools -> system -> messages,
+    #      so this one breakpoint caches the tool schemas AND the system prompt.
+    #      Both are byte-identical across every turn of a session, which is what
+    #      makes the prefix cacheable at all -- keep it that way.
+    #   2. The last content block of the final message -- the "moving"
+    #      breakpoint. Each turn re-sends the whole conversation; last turn's
+    #      breakpoint is a prefix of this turn's request, so the entire history
+    #      is a cache read and only the new suffix is written. (Anthropic finds
+    #      the prior entry by scanning back up to 20 blocks from a breakpoint; a
+    #      single turn would need >9 parallel tool calls to outrun that.)
+    #
+    # Prefixes under a model-dependent minimum (~4k tokens on Opus) silently
+    # don't cache -- no error, just zero cache usage -- so this is safe even for
+    # tiny conversations.
+    cache_breakpoint = {"type": "ephemeral"}
+    anthropic_system = [
+        {"type": "text", "text": system, "cache_control": cache_breakpoint}
+    ]
+    if anthropic_messages:
+        last = anthropic_messages[-1]
+        if isinstance(last["content"], str):
+            last["content"] = [{"type": "text", "text": last["content"]}]
+        if last["content"]:
+            # Stamp a copy, not the block itself: some blocks pass through from
+            # the caller's conversation by reference, and a marker stuck to one
+            # would still be there next turn when the block is no longer last --
+            # breakpoints would accumulate until the API's limit of 4 rejects
+            # the request. Rebuilding the marked block keeps each request's
+            # markers to exactly this turn's two.
+            last["content"] = list(last["content"])
+            last["content"][-1] = {
+                **last["content"][-1], "cache_control": cache_breakpoint,
+            }
+
     usage = Usage()
     current_tool_name = None
     current_tool_json = ""
@@ -354,7 +413,7 @@ def _stream_anthropic(model, system, messages, tools):
     stream_kwargs = dict(
         model=model,
         max_tokens=ANTHROPIC_MAX_TOKENS,
-        system=system,
+        system=anthropic_system,
         messages=anthropic_messages,
     )
     if anthropic_tools:
@@ -393,7 +452,16 @@ def _stream_anthropic(model, system, messages, tools):
                         )
             elif event.type == "message_start":
                 if hasattr(event.message, "usage") and event.message.usage:
-                    usage.input_tokens = event.message.usage.input_tokens
+                    mu = event.message.usage
+                    # input_tokens excludes cached tokens; the cache counts are
+                    # reported separately and billed at their own rates.
+                    usage.input_tokens = mu.input_tokens
+                    usage.cache_read_tokens = (
+                        getattr(mu, "cache_read_input_tokens", 0) or 0
+                    )
+                    usage.cache_write_tokens = (
+                        getattr(mu, "cache_creation_input_tokens", 0) or 0
+                    )
 
     yield Done(usage)
 
@@ -497,6 +565,18 @@ def _stream_openai_chat(client, model, system, messages, tools):
             details = getattr(chunk.usage, "completion_tokens_details", None)
             if details is not None:
                 usage.thinking_tokens = getattr(details, "reasoning_tokens", 0) or 0
+            # Gateways translating Anthropic responses (Portkey) pass the
+            # Anthropic cache counters through with their exclusive semantics
+            # (prompt_tokens covers only the uncached remainder). Absent on real
+            # OpenAI/ollama responses, which is correct: OpenAI's own
+            # prompt_tokens_details.cached_tokens is a SUBSET of prompt_tokens
+            # with different billing, and must not be double-counted here.
+            usage.cache_read_tokens = (
+                getattr(chunk.usage, "cache_read_input_tokens", 0) or 0
+            )
+            usage.cache_write_tokens = (
+                getattr(chunk.usage, "cache_creation_input_tokens", 0) or 0
+            )
 
         if not chunk.choices:
             continue
@@ -561,37 +641,122 @@ def portkey_model_name(model: str) -> str:
     return model[len("portkey:") :] if model.startswith("portkey:") else model
 
 
-def _stream_portkey(model, system, messages, tools):
-    """Model served through a Portkey AI gateway (https://portkey.ai). The
-    gateway speaks the OpenAI Chat Completions dialect and the portkey-ai SDK's
-    streaming chunks are field-compatible with openai's, so we hand a Portkey
-    client to the shared streaming core unchanged. Auth comes from
-    PORTKEY_API_KEY; a self-hosted/enterprise gateway (the usual reason to use
-    Portkey at all) is selected with PORTKEY_BASE_URL -- unset, the SDK targets
-    Portkey's hosted service. The `portkey:` prefix (if any) is stripped so the
-    gateway sees its own model name; the full prefixed name stays attached
-    everywhere else (logs, pricing, banners) as the model's identity."""
-    from portkey_ai import Portkey
+def _portkey_gateway_root(base_url: str) -> str:
+    """The gateway's root URL, for SDKs that append their own path. The
+    OpenAI-compatible route lives under `{root}/v1/chat/completions` and
+    PORTKEY_BASE_URL conventionally includes the `/v1`; the anthropic SDK
+    appends `/v1/messages` itself, so it needs the bare root."""
+    root = (base_url or "https://api.portkey.ai").rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    return root
 
+
+def _portkey_split_catalog(name: str) -> tuple[str | None, str]:
+    """Split a Portkey model-catalog name `@provider/model` into its provider
+    slug and bare model name. Non-catalog names pass through with no provider."""
+    if name.startswith("@") and "/" in name:
+        provider, bare = name.split("/", 1)
+        return provider, bare
+    return None, name
+
+
+def _portkey_route_missing(exc) -> bool:
+    """Whether an error from the gateway means the /v1/messages route itself is
+    absent (older gateway build) rather than the request being bad -- only then
+    is falling back to the chat-completions dialect the right move."""
+    import anthropic
+
+    return isinstance(exc, anthropic.APIStatusError) and exc.status_code in (
+        404, 405, 501,
+    )
+
+
+def _stream_portkey_anthropic(api_key, base_url, name, system, messages, tools):
+    """Anthropic-family model through the gateway's native /v1/messages route.
+    Portkey serves the Anthropic Messages API directly (it's how Claude Code
+    runs through Portkey), so we point an anthropic client at the gateway and
+    reuse the Anthropic streaming core. This matters for two reasons: the
+    chat-completions translation drops `cache_control` on tool_result messages
+    (so the moving cache breakpoint -- the one that makes the growing
+    conversation cheap -- can't survive it), and the native route needs no
+    finish_reason translation at all. Auth follows Portkey's documented shape:
+    the Portkey key in `x-portkey-api-key`, the provider slug from the catalog
+    name in `x-portkey-provider`, and the bare model name in the request."""
+    import anthropic
+
+    provider, bare_model = _portkey_split_catalog(name)
+    headers = {"x-portkey-api-key": api_key}
+    if provider:
+        headers["x-portkey-provider"] = provider
+    client = anthropic.Anthropic(
+        auth_token=api_key,
+        base_url=_portkey_gateway_root(base_url),
+        default_headers=headers,
+    )
+    yield from _stream_anthropic_chat(client, bare_model, system, messages, tools)
+
+
+def _stream_portkey(model, system, messages, tools):
+    """Model served through a Portkey AI gateway (https://portkey.ai).
+
+    Anthropic-family models take the gateway's native /v1/messages route (see
+    _stream_portkey_anthropic -- prompt caching and native stop reasons); if
+    the gateway predates that route, they fall back to the OpenAI-compatible
+    dialect below with a warning. Everything else speaks the OpenAI Chat
+    Completions dialect: the portkey-ai SDK's streaming chunks are
+    field-compatible with openai's, so we hand a Portkey client to the shared
+    streaming core unchanged.
+
+    Auth comes from PORTKEY_API_KEY; a self-hosted/enterprise gateway (the
+    usual reason to use Portkey at all) is selected with PORTKEY_BASE_URL --
+    unset, the SDK targets Portkey's hosted service. The `portkey:` prefix (if
+    any) is stripped so the gateway sees its own model name; the full prefixed
+    name stays attached everywhere else (logs, pricing, banners) as the
+    model's identity."""
     try:
         api_key = os.environ["PORTKEY_API_KEY"]
     except KeyError:
         raise RuntimeError(
             "portkey models need the PORTKEY_API_KEY environment variable"
         ) from None
+    base_url = os.environ.get("PORTKEY_BASE_URL", "").strip()
+    name = portkey_model_name(model)
+
+    if "claude" in name.lower():
+        native = _stream_portkey_anthropic(
+            api_key, base_url, name, system, messages, tools
+        )
+        started = False
+        try:
+            for event in native:
+                started = True
+                yield event
+            return
+        except Exception as exc:
+            # Fall back only when the route itself is missing and nothing has
+            # been yielded yet -- once events are out, a retry would duplicate
+            # them, and any other error would just recur on the fallback.
+            if started or not _portkey_route_missing(exc):
+                raise
+            print(
+                "warning: gateway has no /v1/messages route; falling back to "
+                "the chat-completions dialect (prompt caching unavailable)",
+                file=sys.stderr,
+            )
+
+    from portkey_ai import Portkey
+
     # strict_open_ai_compliance makes the gateway normalize provider-native
     # finish reasons to the OpenAI vocabulary (e.g. Anthropic's "tool_use" ->
     # "tool_calls"). The SDK defaults it to False, which leaks raw provider
     # labels into the stream; the shared core tolerates that now, but ask for
     # the spec-compliant dialect anyway since that is what we parse against.
     client_kwargs = {"api_key": api_key, "strict_open_ai_compliance": True}
-    base_url = os.environ.get("PORTKEY_BASE_URL", "").strip()
     if base_url:
         client_kwargs["base_url"] = base_url
     client = Portkey(**client_kwargs)
-    yield from _stream_openai_chat(
-        client, portkey_model_name(model), system, messages, tools
-    )
+    yield from _stream_openai_chat(client, name, system, messages, tools)
 
 
 def _stream_openai_responses(model, system, messages, tools):
