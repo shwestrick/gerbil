@@ -50,16 +50,51 @@ MODEL_PRICING = {
     "o3": (2.0, 8.0),
     "o4-mini": (1.10, 4.40),
 }
-DEFAULT_PRICING = (2.0, 10.0)
+
+def pricing_match(model: str) -> str | None:
+    """The MODEL_PRICING key that prices `model`, or None when we don't know.
+
+    An exact key wins. Otherwise fall back to substring matching, which is what
+    prices a gateway model: a Portkey catalog name like
+    `@vertexai-foo/anthropic.claude-opus-4-7` embeds the real model name, so a
+    MODEL_PRICING key found inside the string identifies the pricing. The match
+    must be unique -- zero or several embedded keys means we'd be guessing, and
+    a guessed price is worse than an honest N/A."""
+    if model in MODEL_PRICING:
+        return model
+    matches = [key for key in MODEL_PRICING if key in model]
+    return matches[0] if len(matches) == 1 else None
 
 
-def model_pricing(model: str) -> tuple[float, float]:
-    """Per-million-token (input, output) pricing for a model. ollama models run
-    locally and cost nothing, so they price at (0, 0) -- otherwise the cost
-    summary would invent a DEFAULT_PRICING charge for a free local run."""
+# Models already warned about by model_pricing, so a summary spanning many
+# sessions of the same unknown model warns once, not once per session.
+_pricing_warned: set[str] = set()
+
+
+def model_pricing(model: str) -> tuple[float, float] | None:
+    """Per-million-token (input, output) pricing for a model, or None when the
+    pricing is unknown -- callers must then report cost as N/A rather than
+    invent a number. ollama models run locally and cost nothing, so they price
+    at (0, 0). An unknown model warns once (per process) on stderr."""
     if model.startswith("ollama:"):
         return (0.0, 0.0)
-    return MODEL_PRICING.get(model, DEFAULT_PRICING)
+    key = pricing_match(model)
+    if key is not None:
+        return MODEL_PRICING[key]
+    if model not in _pricing_warned:
+        _pricing_warned.add(model)
+        matches = [k for k in MODEL_PRICING if k in model]
+        reason = (
+            f"ambiguous match: {', '.join(matches)}"
+            if len(matches) > 1
+            else "no known model matches"
+        )
+        print(
+            style(f"warning: unknown pricing for '{model}' ({reason}); "
+                  "cost will be reported as N/A", "yellow"),
+            file=sys.stderr,
+        )
+    return None
 
 SYSTEM_PROMPT = """\
 You are gerbil, an autonomous agent working inside a sandboxed Lean 4 / Lake \
@@ -1051,8 +1086,13 @@ def _context_suffix(max_context: int | None, usage: Usage | None) -> str:
 
 def _print_usage(model: str, turns: int, usage: Usage) -> None:
     """Print a summary line with token counts and estimated cost."""
-    price_in, price_out = model_pricing(model)
-    cost = (usage.input_tokens * price_in + usage.output_tokens * price_out) / 1_000_000
+    pricing = model_pricing(model)
+    if pricing is None:
+        cost_str = "cost: N/A"
+    else:
+        price_in, price_out = pricing
+        cost = (usage.input_tokens * price_in + usage.output_tokens * price_out) / 1_000_000
+        cost_str = f"~${cost:.4f}"
     total = usage.input_tokens + usage.output_tokens
     # thinking_tokens is a subset of output_tokens, so show it as a breakdown.
     out = f"out: {usage.output_tokens:,}"
@@ -1061,6 +1101,6 @@ def _print_usage(model: str, turns: int, usage: Usage) -> None:
     line = (
         f"--- {turns} turns, {total:,} tokens "
         f"(in: {usage.input_tokens:,}, {out}), "
-        f"~${cost:.4f} ---"
+        f"{cost_str} ---"
     )
     print("\n" + style(line, "bold"), flush=True)

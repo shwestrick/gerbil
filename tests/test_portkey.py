@@ -64,6 +64,30 @@ def test_model_name() -> None:
     check("non-portkey passthrough", portkey_model_name("gpt-4o") == "gpt-4o")
 
 
+def test_pricing() -> None:
+    """A catalog name embeds the real model name, so a unique MODEL_PRICING key
+    found inside the string prices it; zero or ambiguous matches mean N/A."""
+    from gerbil.agent import MODEL_PRICING, model_pricing, pricing_match
+
+    priced = "portkey:@vertexai-foo/anthropic.claude-opus-4-7"
+    check("unique substring match found", pricing_match(priced) == "claude-opus-4-7")
+    check("unique substring match priced",
+          model_pricing(priced) == MODEL_PRICING["claude-opus-4-7"])
+    # Bare catalog syntax prices the same way.
+    check("bare catalog name priced",
+          model_pricing("@vertexai-foo/anthropic.claude-opus-4-7")
+          == MODEL_PRICING["claude-opus-4-7"])
+    # No embedded known model -> unknown (None), reported as N/A downstream.
+    check("no match -> None", model_pricing("portkey:@foo/unheard-of-model") is None)
+    # Several embedded known models -> ambiguous -> also None.
+    ambiguous = "portkey:@foo/o3-versus-gpt-4o"
+    check("ambiguous is detected", pricing_match(ambiguous) is None)
+    check("ambiguous -> None", model_pricing(ambiguous) is None)
+    # Exact table entries and ollama's free pricing are untouched.
+    check("exact model still priced", model_pricing("gpt-4o") == (2.50, 10.0))
+    check("ollama still free", model_pricing("ollama:anything") == (0.0, 0.0))
+
+
 def _fake_portkey_module(seen: dict):
     """A stand-in portkey_ai module whose Portkey() records its kwargs and whose
     chat.completions.create records the request and streams one text chunk --
@@ -165,6 +189,7 @@ def test_live_smoke() -> None:
 def main() -> None:
     test_detect_provider()
     test_model_name()
+    test_pricing()
     test_client_construction()
     test_live_smoke()
     print("\nAll portkey tests passed.")

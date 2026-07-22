@@ -41,7 +41,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from .agent import MODEL_PRICING, model_pricing, run_session
+from .agent import MODEL_PRICING, model_pricing, pricing_match, run_session
 from .sandbox import LeanSandbox
 from .session import Session
 from .term import style
@@ -478,9 +478,13 @@ def _scan_session(path: Path) -> dict:
             "turns": turns, "tool_calls": tool_calls, "status": status}
 
 
-def _cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Estimated USD cost from per-million-token pricing (falls back to DEFAULT)."""
-    price_in, price_out = model_pricing(model)
+def _cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    """Estimated USD cost from per-million-token pricing, or None when the
+    model's pricing is unknown (reported as N/A, never a made-up number)."""
+    pricing = model_pricing(model)
+    if pricing is None:
+        return None
+    price_in, price_out = pricing
     return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
 
 
@@ -511,9 +515,9 @@ def cmd_summarize(args) -> None:
     total_out = sum(s["output_tokens"] for s in stats)
     total_thinking = sum(s["thinking_tokens"] for s in stats)
     total_turns = sum(s["turns"] for s in stats)
-    total_cost = sum(
-        _cost(s["model"], s["input_tokens"], s["output_tokens"]) for s in stats
-    )
+    costs = [_cost(s["model"], s["input_tokens"], s["output_tokens"]) for s in stats]
+    total_cost = sum(c for c in costs if c is not None)
+    unpriced = sum(1 for c in costs if c is None)
 
     tools: collections.Counter = collections.Counter()
     for s in stats:
@@ -532,7 +536,12 @@ def cmd_summarize(args) -> None:
         m["input"] += s["input_tokens"]
         m["output"] += s["output_tokens"]
         m["thinking"] += s["thinking_tokens"]
-        m["cost"] += _cost(s["model"], s["input_tokens"], s["output_tokens"])
+        # None poisons the rollup: one unpriced session makes the model's cost N/A.
+        c = _cost(s["model"], s["input_tokens"], s["output_tokens"])
+        if c is None:
+            m["cost"] = None
+        elif m["cost"] is not None:
+            m["cost"] += c
 
     bold = lambda t: style(t, "bold")
     print(bold(f"gerbil summary -- {len(logs)} session(s) in {out_dir}"))
@@ -549,7 +558,13 @@ def cmd_summarize(args) -> None:
     print()
 
     print(bold("Estimated cost"))
-    print(f"  ~${total_cost:,.4f}")
+    if unpriced == len(stats):
+        print("  N/A " + style("(unknown model pricing)", "gray"))
+    elif unpriced:
+        print(f"  ~${total_cost:,.4f} " + style(
+            f"(excludes {unpriced} session(s) with unknown pricing)", "gray"))
+    else:
+        print(f"  ~${total_cost:,.4f}")
     print()
 
     print(bold("Sessions"))
@@ -573,20 +588,25 @@ def cmd_summarize(args) -> None:
     print()
 
     print(bold("By model"))
-    for model, m in sorted(by_model.items(), key=lambda kv: -kv[1]["cost"]):
+    for model, m in sorted(by_model.items(), key=lambda kv: -(kv[1]["cost"] or 0.0)):
         if model.startswith("ollama:"):
             known = style(" (local)", "gray")
         elif model in MODEL_PRICING:
             known = ""
+        elif (match := pricing_match(model)) is not None:
+            # A gateway model (e.g. portkey:@provider/...) priced by the unique
+            # MODEL_PRICING key embedded in its name.
+            known = style(f" (priced as {match})", "gray")
         else:
-            known = style(" (est. pricing)", "gray")
+            known = style(" (pricing unknown)", "gray")
         thinking = (
             style(f" ({m['thinking']:,} thinking)", "gray") if m["thinking"] else ""
         )
+        cost_str = "cost: N/A" if m["cost"] is None else f"~${m['cost']:,.4f}"
         print(
             f"  {style(model, 'cyan')}{known}: "
             f"{m['sessions']} session(s), "
-            f"{m['input'] + m['output']:,} tokens{thinking}, ~${m['cost']:,.4f}"
+            f"{m['input'] + m['output']:,} tokens{thinking}, {cost_str}"
         )
 
 

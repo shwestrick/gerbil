@@ -65,9 +65,10 @@ def test_base_url() -> None:
 def test_pricing() -> None:
     check("ollama is free (input)", model_pricing("ollama:anything")[0] == 0.0)
     check("ollama is free (output)", model_pricing("ollama:anything")[1] == 0.0)
-    # A known cloud model keeps its real pricing; an unknown one gets the default.
+    # A known cloud model keeps its real pricing; an unknown one has no price
+    # (None -> reported as N/A), never a made-up default.
     check("known cloud priced", model_pricing("gpt-4o") == (2.50, 10.0))
-    check("unknown cloud -> default", model_pricing("mystery-model") == (2.0, 10.0))
+    check("unknown cloud -> None", model_pricing("mystery-model") is None)
 
 
 def test_openai_extraction() -> None:
