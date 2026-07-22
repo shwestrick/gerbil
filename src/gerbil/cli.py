@@ -184,6 +184,9 @@ def main() -> None:
             f"LLM to use (default: {DEFAULT_MODEL}). Provider is auto-detected. "
             f"Use `ollama:<NAME>` for a local model served by ollama (e.g. "
             f"ollama:qwen2.5-coder); gerbil starts the server if one isn't running. "
+            f"Use `portkey:<MODEL>` (or a bare @provider/model catalog name) to "
+            f"route through a Portkey AI gateway; set PORTKEY_API_KEY and, for a "
+            f"self-hosted gateway, PORTKEY_BASE_URL. "
             f"Known cloud models: {', '.join(MODEL_PRICING)}."
         ),
     )

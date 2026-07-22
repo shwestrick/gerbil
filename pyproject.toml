@@ -12,6 +12,7 @@ dependencies = [
     "anthropic>=0.40",
     "openai>=1.50",
     "google-genai>=0.3",
+    "portkey-ai>=2.0",
 ]
 
 [project.scripts]

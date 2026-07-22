@@ -15,8 +15,8 @@ This lets the agent loop stay provider-agnostic. The unified message format is:
 Tool schemas are dicts with name, description, and input_schema (JSON Schema) --
 the same shape gerbil's tools.py produces.
 
-Provider SDKs (anthropic, openai, google-genai) are optional and imported only
-when their provider is selected.
+Provider SDKs (anthropic, openai, google-genai, portkey-ai) are optional and
+imported only when their provider is selected.
 
 Ported from lea-prover (lea/providers.py).
 """
@@ -119,6 +119,10 @@ def detect_provider(model: str) -> str:
     # ollama:<NAME> selects a local model served by ollama (OpenAI-compatible).
     if model.startswith("ollama:"):
         return "ollama"
+    # portkey:<MODEL> routes through a Portkey AI gateway. A bare @provider/model
+    # name is Portkey's own model-catalog syntax, so it also selects portkey.
+    if model.startswith(("portkey:", "@")):
+        return "portkey"
     raise ValueError(
         f"Can't detect provider for model '{model}'. Pass provider explicitly."
     )
@@ -145,6 +149,8 @@ def stream(
         yield from _stream_openai(model, system, messages, tools)
     elif provider == "ollama":
         yield from _stream_ollama(model, system, messages, tools)
+    elif provider == "portkey":
+        yield from _stream_portkey(model, system, messages, tools)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
@@ -529,6 +535,43 @@ def _stream_ollama(model, system, messages, tools):
     client = OpenAI(api_key="ollama", base_url=ollama_base_url() + "/v1")
     yield from _stream_openai_chat(
         client, ollama_model_name(model), system, messages, tools
+    )
+
+
+def portkey_model_name(model: str) -> str:
+    """The model name the Portkey gateway expects, with any `portkey:` prefix
+    stripped. Only the first `portkey:` is removed, so a catalog name like
+    `portkey:@vertexai-foo/anthropic.claude-opus-4-8` survives intact as
+    `@vertexai-foo/anthropic.claude-opus-4-8`. A bare `@provider/model` name
+    (already in gateway syntax) passes through unchanged."""
+    return model[len("portkey:") :] if model.startswith("portkey:") else model
+
+
+def _stream_portkey(model, system, messages, tools):
+    """Model served through a Portkey AI gateway (https://portkey.ai). The
+    gateway speaks the OpenAI Chat Completions dialect and the portkey-ai SDK's
+    streaming chunks are field-compatible with openai's, so we hand a Portkey
+    client to the shared streaming core unchanged. Auth comes from
+    PORTKEY_API_KEY; a self-hosted/enterprise gateway (the usual reason to use
+    Portkey at all) is selected with PORTKEY_BASE_URL -- unset, the SDK targets
+    Portkey's hosted service. The `portkey:` prefix (if any) is stripped so the
+    gateway sees its own model name; the full prefixed name stays attached
+    everywhere else (logs, pricing, banners) as the model's identity."""
+    from portkey_ai import Portkey
+
+    try:
+        api_key = os.environ["PORTKEY_API_KEY"]
+    except KeyError:
+        raise RuntimeError(
+            "portkey models need the PORTKEY_API_KEY environment variable"
+        ) from None
+    client_kwargs = {"api_key": api_key}
+    base_url = os.environ.get("PORTKEY_BASE_URL", "").strip()
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    client = Portkey(**client_kwargs)
+    yield from _stream_openai_chat(
+        client, portkey_model_name(model), system, messages, tools
     )
 
 

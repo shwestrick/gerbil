@@ -22,9 +22,12 @@ The defining design choices:
   read *purely* as `git format-patch <base>..HEAD` — anything not reachable from
   that range is lost.
 - **Provider-agnostic**: one unified streaming interface over Gemini, Anthropic,
-  OpenAI, and ollama (local models, `--model ollama:<NAME>`). Model is selected
-  with `--model`; provider is auto-detected from the name. ollama runs on the
-  host (not in the sandbox) and gerbil starts `ollama serve` itself if needed.
+  OpenAI, ollama (local models, `--model ollama:<NAME>`), and Portkey AI
+  gateways (`--model portkey:<MODEL>` or a bare `@provider/model` catalog name;
+  auth via `PORTKEY_API_KEY`, self-hosted gateway via `PORTKEY_BASE_URL`).
+  Model is selected with `--model`; provider is auto-detected from the name.
+  ollama runs on the host (not in the sandbox) and gerbil starts `ollama serve`
+  itself if needed.
 - **Resumable**: a crashed session can be continued from its append-only `.jsonl`
   log; a `.wip.patch` snapshot next to the log is refreshed every turn.
 
@@ -41,7 +44,8 @@ src/gerbil/
                         summarize, reconstruct-patch) and the resume orchestration
   agent.py              the agent loop (run_session), system prompts, pricing
                         table, and pretty terminal rendering of tool calls
-  providers.py          unified LLM streaming over gemini/anthropic/openai/ollama
+  providers.py          unified LLM streaming over gemini/anthropic/openai/
+                        ollama/portkey
   ollama.py             host-side ollama server detect/start/stop + model check
                         (local provider; reuses the OpenAI-compatible stream core)
   sandbox.py            LeanSandbox — Docker container lifecycle + all git plumbing
@@ -141,9 +145,9 @@ docker build -t lean-sandbox:latest src/lean-sandbox
 ```
 
 Dependencies (managed by `uv`, see pyproject.toml): `docker`, `mcp`, and all
-three provider SDKs (`anthropic`, `openai`, `google-genai`) are core deps so any
-`--model` works out of the box. `providers.py` imports only the selected SDK at
-runtime. Requires Python ≥ 3.12.
+four provider SDKs (`anthropic`, `openai`, `google-genai`, `portkey-ai`) are
+core deps so any `--model` works out of the box. `providers.py` imports only
+the selected SDK at runtime. Requires Python ≥ 3.12.
 
 ## Testing
 
@@ -156,12 +160,13 @@ uv run python tests/test_reconstruct.py  # reconstruct-patch end-to-end (Docker)
 uv run python tests/test_resume.py       # resume logic
 uv run python tests/test_render.py       # terminal rendering
 uv run python tests/test_ollama.py       # ollama provider plumbing (no Docker; live smoke if a server is up)
+uv run python tests/test_portkey.py      # portkey provider plumbing (no Docker/key; live smoke if PORTKEY_API_KEY + PORTKEY_TEST_MODEL set)
 GOOGLE_API_KEY=... uv run python tests/test_gemini.py   # live Gemini backend
 ```
 
 Most require Docker and the `lean-sandbox` image; `test_gemini.py` needs a real
-API key. `test_ollama.py` needs neither Docker nor a key (it runs a live smoke
-only if an ollama server is already reachable).
+API key. `test_ollama.py` and `test_portkey.py` need neither Docker nor a key
+(each runs a live smoke only if its backend is already reachable/configured).
 
 ## Conventions
 

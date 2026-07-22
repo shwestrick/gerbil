@@ -105,6 +105,14 @@ $ export ANTHROPIC_API_KEY=...
 $ export OPENAI_API_KEY=...
 ```
 
+gerbil also supports [Portkey](https://app.portkey.ai):
+
+```console
+$ export PORTKEY_API_KEY=...
+$ export PORTKEY_BASE_URL=...    # e.g. https://your.gateway.com/v1/
+$ gerbil run --model portkey:<MODEL_CATALOG_STRING> --prompt prompt.md
+```
+
 ### Local models with ollama
 
 To run against a local model served by [ollama](https://ollama.com), use the
