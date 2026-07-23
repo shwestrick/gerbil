@@ -8,7 +8,10 @@ Docker-based sandboxing, a git-based workflow, and built-in support for
 Ralph loops.
 
 gerbil sessions are self-contained and sandboxed: each session is run
-in a container and produces a git commit.
+in a container and produces a git commit. The container only ever sees
+the current branch: the git repo uploaded into the sandbox is stripped
+to the current branch's history -- no other branches, tags, remotes,
+upstreams, or reflogs.
 
 ## Example Usage
 

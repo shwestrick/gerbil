@@ -15,8 +15,10 @@ The defining design choices:
 
 - **Sandboxed**: every session runs inside a Docker container (the
   `lean-sandbox` image). The host never executes agent-authored commands.
-- **Git-native I/O**: gerbil uploads the *real* repo (with full `.git` history)
-  into the container, lets the agent work, then squashes the session's work into
+- **Git-native I/O**: gerbil uploads the *real* repo into the container — the
+  tracked files plus a *sanitized* `.git` holding only the current branch's
+  history (no other branches, tags, remotes, or reflogs: the agent sees nothing
+  beyond the branch) — lets the agent work, then squashes the session's work into
   a single commit and emits a `git format-patch` (`.patch`). Nothing touches the
   host repo until the user runs `gerbil commit` (`git am`). The agent's output is
   read *purely* as `git format-patch <base>..HEAD` — anything not reachable from
@@ -67,8 +69,9 @@ pyproject.toml          packaging; entry point is gerbil.cli:main
 1. **Preflight** (`cli.cmd_run`): require a git repo with ≥1 commit, a lakefile,
    a clean working tree, and a reachable Docker daemon.
 2. **Sandbox boot** (`sandbox.LeanSandbox.__enter__`): start the container, upload
-   all git-tracked files + the `.git` dir, configure a `gerbil` committer
-   identity, and `lake exe cache get` (skip with `--skip-cache`).
+   all git-tracked files + a sanitized single-branch `.git`
+   (`sandbox._sanitized_git_dir`), configure a `gerbil` committer identity, and
+   `lake exe cache get` (skip with `--skip-cache`).
 3. **MCP start** (`cli._start_mcp`): launch lean-lsp-mcp inside the container; on
    failure, warn and continue with built-in tools only. The network-backed search
    tools (`mcp_client.NETWORK_TOOLS`) are filtered out of the advertised schemas
@@ -93,6 +96,10 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   running `git reset`/`checkout`/`stash`/`init`. gerbil's own git always goes
   through `sandbox._git`, which pins `GIT_DIR`/`GIT_WORK_TREE` so a stray nested
   repo the agent creates can't hijack gerbil's bookkeeping.
+- **Only the current branch enters the sandbox.** The uploaded `.git` is built
+  by `sandbox._sanitized_git_dir` — a fetch of HEAD into a fresh repo, so no
+  other branches, tags, remotes, reflogs, or unreachable objects reach the
+  agent. Never reintroduce a raw copy of the host `.git`.
 - **Built-in tool names win** over colliding MCP tool names (today none collide).
 - **Tool output is truncated once** (`tools.truncate_tool_output`, 10k chars,
   head+tail) and the *same* truncated text is what the model sees and what the log
@@ -158,6 +165,7 @@ Tests are **standalone scripts**, not a pytest suite — run each directly:
 uv run python tests/smoke_test.py        # Docker plumbing (needs Docker; stubs cache)
 uv run python tests/test_mcp.py          # lean-lsp MCP integration (Docker; slow phase 2)
 uv run python tests/test_reconstruct.py  # reconstruct-patch end-to-end (Docker)
+uv run python tests/test_commit.py       # gerbil commit end-to-end (Docker)
 uv run python tests/test_resume.py       # resume logic
 uv run python tests/test_render.py       # terminal rendering
 uv run python tests/test_ollama.py       # ollama provider plumbing (no Docker; live smoke if a server is up)

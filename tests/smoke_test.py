@@ -1,8 +1,9 @@
 """Smoke test for the Docker plumbing in sandbox.py.
 
 Stubs out the mathlib cache fetch (slow, needs network + a mathlib project) and
-exercises everything else: container lifecycle, file upload, read/write/edit
-tools, bash, command timeout, and git diff.
+exercises everything else: container lifecycle, file upload, git sanitization
+(only the current branch enters the sandbox), read/write/edit tools, bash,
+command timeout, and git diff.
 """
 
 import re
@@ -46,10 +47,57 @@ def main() -> None:
         root = Path(tmp)
         make_project(root)
 
+        # Contaminate the host repo with everything the sandbox must NOT see:
+        # a second branch carrying its own commit (and file), a tag on it, and
+        # a remote. The sanitized .git upload must strip all of it.
+        def hostgit(*a: str) -> None:
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                cwd=root, check=True, capture_output=True,
+            )
+
+        branch = subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"],
+            cwd=root, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        hostgit("checkout", "-qb", "secret-branch")
+        (root / "SECRET.txt").write_text("do not leak\n")
+        hostgit("add", "SECRET.txt")
+        hostgit("commit", "-qm", "secret work")
+        secret_sha = subprocess.run(
+            ["git", "rev-parse", "secret-branch"],
+            cwd=root, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        hostgit("tag", "secret-tag", "secret-branch")
+        hostgit("checkout", "-q", branch)
+        hostgit("remote", "add", "origin", "https://example.com/secret.git")
+
         with LeanSandbox(project_dir=root) as sb:
             # 1. uploaded file is readable inside the container
             r = sb.read_file("Hello.lean")
             check("read uploaded file", r == "def hello := 1\n", repr(r))
+
+            # 1b. git sanitization: only the current branch made it in -- the
+            # secret branch, its commit objects, the tag, the remote, reflogs,
+            # and the host path must all be invisible (see _sanitized_git_dir).
+            r = sb._git("branch -a")
+            check("sanitized: only current branch",
+                  r.stdout.split() == ["*", branch], repr(r.stdout))
+            check("sanitized: no tags", sb._git("tag").stdout.strip() == "")
+            check("sanitized: no remotes", sb._git("remote").stdout.strip() == "")
+            check("sanitized: secret commit's objects absent",
+                  sb._git(f"cat-file -e {secret_sha}").exit_code != 0)
+            r = sb._git("reflog")
+            check("sanitized: no reflogs",
+                  r.exit_code != 0 or r.stdout.strip() == "", repr(r.stdout))
+            r = sb.run(f"grep -r {root} .git")
+            check("sanitized: no host paths in .git",
+                  r.exit_code != 0, r.stdout)
+            check("sanitized: secret file not in tree",
+                  sb.run("test -f SECRET.txt").exit_code != 0)
+            r = sb._git("status --porcelain")
+            check("sanitized: baseline status clean",
+                  r.stdout.strip() == "", repr(r.stdout))
 
             # 2. write a new file, read it back
             sb.write_file("Sub/New.lean", "theorem t : True := trivial\n")

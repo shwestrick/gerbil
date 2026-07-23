@@ -3,6 +3,7 @@ import os
 import posixpath
 import subprocess
 import tarfile
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,60 @@ def _host_timezone() -> str | None:
     idx = target.rfind(marker)
     return target[idx + len(marker):] if idx != -1 else None
 
+
+def _sanitized_git_dir(repo_root: Path, scratch: Path) -> Path:
+    """Build a stripped .git for the sandbox: the current branch's history and
+    nothing else. Returns the path of the new .git directory (inside `scratch`).
+
+    The agent needs the history behind the commit it starts from (past-commit
+    lookups, format-patch), but must not see anything beyond that: no other
+    branches or tags, no remotes/upstream config, no reflogs, no stash -- any
+    of which could leak information into the sandbox (in-progress work, private
+    branch names, remote URLs and credentials-bearing remote helpers).
+
+    Implemented as a `git fetch` of HEAD into a fresh repo rather than a copy
+    of the host .git: the fetch transport transfers only objects *reachable*
+    from HEAD, so loose/packed objects belonging to other branches stay behind
+    too (a raw copy -- or a local `git clone`, which hardlinks the entire
+    object store -- would carry them along, recoverable via `git cat-file` /
+    `git fsck --lost-found`). Fetching HEAD also works from a detached HEAD
+    and from a linked worktree, where .git is a file rather than a directory."""
+
+    def git(*args: str) -> None:
+        r = subprocess.run(
+            ["git", "-C", str(clone), *args], capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"git {' '.join(args)} failed while building the sanitized "
+                f"repo for upload:\n{r.stderr}"
+            )
+
+    # Keep the real branch name -- it's part of the current branch, and the
+    # prompt may refer to it. A detached HEAD gets a neutral stand-in.
+    named = subprocess.run(
+        ["git", "symbolic-ref", "--short", "-q", "HEAD"],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    branch = named.stdout.strip() or "gerbil-work"
+
+    # Init on a throwaway branch name that cannot equal `branch`: git refuses
+    # to fetch into the checked-out branch (even an unborn one), so HEAD must
+    # point elsewhere until the fetch lands and we flip it.
+    clone = scratch / "sanitized"
+    placeholder = "gerbil-init" if branch != "gerbil-init" else "gerbil-init-2"
+    subprocess.run(["git", "init", "-q", "-b", placeholder, str(clone)], check=True)
+    # No reflogs: each entry would record the fetch command line -- host path
+    # included -- and old ref positions.
+    git("config", "core.logAllRefUpdates", "false")
+    # HEAD is always advertised by upload-pack, so no ref name is needed;
+    # --no-tags stops tag auto-following from dragging tag refs back in.
+    git("fetch", "-q", "--no-tags", str(repo_root), f"+HEAD:refs/heads/{branch}")
+    git("symbolic-ref", "HEAD", f"refs/heads/{branch}")
+    # FETCH_HEAD records the host path the objects came from -- drop it.
+    (clone / ".git" / "FETCH_HEAD").unlink(missing_ok=True)
+    return clone / ".git"
+
 # Must match the uid/gid of the user created in the Dockerfile, so files we
 # upload land owned by that user and git operations don't hit ownership errors.
 SANDBOX_UID = 1000
@@ -61,8 +116,10 @@ class LeanSandbox:
     WORKSPACE_DIR/<subdir>, where subdir is project_dir relative to repo_root.
 
     At startup:
-      - Uploads all git-tracked files from repo_root into the container, plus the
-        .git directory (full history, for format-patch and past-commit lookups).
+      - Uploads all git-tracked files from repo_root into the container, plus a
+        sanitized .git holding only the current branch's history (full history
+        of HEAD for format-patch and past-commit lookups, but no other branches,
+        tags, remotes, or reflogs -- the agent sees nothing beyond the branch).
       - Configures a committer identity so gerbil can commit the agent's work.
       - Runs lake exe cache get to fetch precompiled mathlib oleans.
 
@@ -144,8 +201,9 @@ class LeanSandbox:
         raise TimeoutError("sandbox container did not reach running state")
 
     def _upload_project(self) -> None:
-        """Upload the real repository into the container: the .git directory (full
-        history, so the agent can refer to past commits) plus the tracked files.
+        """Upload the repository into the container: the tracked files plus a
+        *sanitized* .git holding only the current branch (see _sanitized_git_dir
+        -- the agent must not see other branches, remotes, tags, or reflogs).
         Rooted at repo_root, which may be an ancestor of the Lake project. The
         working tree is required to be clean (see the CLI preflight), so the
         tracked files match HEAD and no untracked files are uploaded -- the agent
@@ -159,13 +217,13 @@ class LeanSandbox:
         rels = [p for p in out.decode().split("\0") if p]
 
         buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w") as tar:
-            for rel in rels:
-                local = self.repo_root / rel
-                if local.is_file():
-                    tar.add(local, arcname=rel, filter=_own_by_sandbox)
-            gitdir = self.repo_root / ".git"
-            if gitdir.is_dir():
+        with tempfile.TemporaryDirectory() as scratch:
+            gitdir = _sanitized_git_dir(self.repo_root, Path(scratch))
+            with tarfile.open(fileobj=buf, mode="w") as tar:
+                for rel in rels:
+                    local = self.repo_root / rel
+                    if local.is_file():
+                        tar.add(local, arcname=rel, filter=_own_by_sandbox)
                 tar.add(gitdir, arcname=".git", filter=_own_by_sandbox)
         buf.seek(0)
         self._container.put_archive(WORKSPACE_DIR, buf.getvalue())
@@ -187,6 +245,11 @@ class LeanSandbox:
         # Uploaded .git is owned by the sandbox user (uid 1000 == container user),
         # but add safe.directory defensively in case of ownership quirks.
         self.run(f"git config --global --add safe.directory {WORKSPACE_DIR}")
+        # The sanitized .git ships without an index (it was built by fetch, not
+        # checkout); build one matching HEAD so the baseline reads as clean --
+        # otherwise the agent's first `git status` would show every file as a
+        # staged deletion plus an untracked file.
+        self._git("read-tree HEAD")
 
     def _fetch_mathlib_cache(self) -> None:
         """Download precompiled mathlib oleans. Runs once per session."""
