@@ -165,10 +165,11 @@ to disable the initial `lake exe cache get`.
 
 Use `gerbil run --max-turns N` to forcibly terminate sessions after `N` turns.
 
-## Include session data in commits
+## Session data in commits
 
-Use `gerbil run --include-session` to include the `.jsonl` session data in
-the generated patch.
+By default the `.jsonl` session data is included in the generated patch. Use
+`gerbil run --omit-session-log` to keep it out. Either way, the session log is
+always archived in `~/.gerbil/sessions/`.
 
 ## Summarizing usage with `gerbil summarize`
 
@@ -198,8 +199,8 @@ tokens). Thinking tokens bill at the output rate and are already included in
 For models that don't expose the breakdown, thinking is silently counted within
 `output`.
 
-Session logs are only included in the project `.gerbil/` when
-`gerbil run --include-session` is used; otherwise they live in
+Session logs reach the project `.gerbil/` by default (via the committed patch);
+runs made with `gerbil run --omit-session-log` keep them only in
 `~/.gerbil/sessions/` (and `summarize` points you there if the project has
 none).
 
@@ -251,9 +252,9 @@ that's required -- including across a resume-of-a-resume. If the chain used a
 chain keeps the same termination check automatically (pass `--ralph_done` again
 to override it).
 
-`--include-session` is likewise inherited: if the resumed session's run recorded
-it, the continuation also folds its log into the commit (pass `--include-session`
-to force it on).
+The session-log setting is likewise inherited: if the resumed session's run
+folded its log into the commit (the default), so does the continuation (pass
+`--omit-session-log` to force the log out).
 
 Resume needs the same repository that produced the session, with the base
 commit still in its history.

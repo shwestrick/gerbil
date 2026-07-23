@@ -449,8 +449,8 @@ class LeanSandbox:
     def amend_with_file(self, repo_path: str, content: str) -> None:
         """Fold an extra file into the HEAD commit: write it into the repo, stage
         it (force, in case its directory is gitignored), and `commit --amend`
-        without changing the message. Used by --include-session to embed the
-        session log in the commit before format_patch()."""
+        without changing the message. Used to embed the session log in the
+        commit before format_patch() (unless --omit-session-log)."""
         self.write_file(repo_path, content)
         self._git(f"add -f {_quote(repo_path)}")
         result = self._git("commit --amend --no-edit --no-verify")

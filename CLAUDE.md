@@ -82,8 +82,9 @@ pyproject.toml          packaging; entry point is gerbil.cli:main
    changes) into one commit, then `format_patch(base)` writes the `.patch`.
 
 Outputs: the live `.jsonl` log lands in `~/.gerbil/sessions/`; the `.patch` lands
-in the project's `.gerbil/` (and is copied to the archive). The log only reaches
-the project commit if `--include-session` is passed.
+in the project's `.gerbil/` (and is copied to the archive). The log is folded
+into the project commit by default; `--omit-session-log` keeps it out (the
+archive copy in `~/.gerbil/sessions/` is kept regardless).
 
 ## Key invariants — read before changing git/sandbox logic
 
@@ -104,9 +105,9 @@ the project commit if `--include-session` is passed.
 ## Subcommands
 
 - `gerbil run --prompt FILE [--model M] [--ralph N] [--ralph_done SCRIPT]
-  [--max-turns N] [--skip-cache] [--no-mcp] [--include-session]`
+  [--max-turns N] [--skip-cache] [--no-mcp] [--omit-session-log]`
 - `gerbil resume LOG [--at DIR] [--max-turns N] [--skip-cache] [--no-mcp]
-  [--ralph_done SCRIPT] [--include-session]` — continue a crashed/interrupted
+  [--ralph_done SCRIPT] [--omit-session-log]` — continue a crashed/interrupted
   session (model and prompt come from the log).
 - `gerbil commit` — `git am` the project's `.gerbil/*.patch` in order, skipping
   already-applied (by stable patch-id) and stale (non-applying) patches.

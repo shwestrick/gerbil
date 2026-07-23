@@ -38,7 +38,9 @@ class ParsedSession:
     ralph: dict | None = None  # {iteration, total, chain_base, ancestors} in --ralph
     commit_message: str = ""  # the message the session generated, if it got that far
     ralph_done_script: str | None = None  # the --ralph_done check script, if any
-    include_session: bool = False  # whether the run used --include-session
+    # Whether the run folded its log into the commit. False when the key is
+    # absent: such logs predate the setting, and their runs did not fold it in.
+    include_session: bool = False
 
 
 # Prefix of the message gerbil sends to request a commit message (see

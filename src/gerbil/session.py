@@ -36,7 +36,7 @@ class Session:
         resumed_from: str | None = None,
         ralph: dict[str, Any] | None = None,
         ralph_done_script: str | None = None,
-        include_session: bool = False,
+        include_session: bool = True,
     ):
         self.path = path
         self.model = model
@@ -64,9 +64,9 @@ class Session:
             "project_dir": str(project_dir),
             "prompt_file": str(prompt_file),
             "base_commit": base_commit,
-            # Whether this session's run folded its .jsonl log into the commit
-            # (--include-session). Recorded so `gerbil resume` inherits the setting
-            # without the user re-supplying it.
+            # Whether this session's run folds its .jsonl log into the commit
+            # (the default; --omit-session-log turns it off). Recorded so
+            # `gerbil resume` inherits the setting without the user re-supplying it.
             "include_session": include_session,
         }
         if resumed_from is not None:

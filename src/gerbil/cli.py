@@ -21,8 +21,9 @@ Outputs:
     <project>/.gerbil/gerbil-TIMESTAMP.patch   git format-patch of the session's
                                          commit(s); apply with `git am`
 The patch is also copied to ~/.gerbil/sessions/, so the archive holds all gerbil
-data. The session log only reaches the --at project if --include-session is
-passed (it is folded into the commit, and thus the patch).
+data. The session log is also folded into the commit (and thus the patch) by
+default; pass --omit-session-log to keep it out of the commit. Either way the
+~/.gerbil/sessions/ archive keeps the log.
 
 With --ralph N, N sessions run back-to-back on the same prompt (reusing the
 sandbox); outputs are numbered gerbil-TIMESTAMP-NN and each session builds on
@@ -232,10 +233,11 @@ def main() -> None:
         "--ralph.",
     )
     run_p.add_argument(
-        "--include-session",
+        "--omit-session-log",
         action="store_true",
-        help="Include the session .jsonl log in the commit (folded in via "
-        "commit --amend before the patch is produced).",
+        help="Do not include the session .jsonl log in the commit (by default "
+        "it is folded in via commit --amend before the patch is produced). "
+        "The log is always archived in ~/.gerbil/sessions/ regardless.",
     )
     run_p.set_defaults(func=cmd_run)
 
@@ -280,10 +282,11 @@ def main() -> None:
         "--ralph chain.",
     )
     resume_p.add_argument(
-        "--include-session",
+        "--omit-session-log",
         action="store_true",
-        help="Include the session .jsonl log in the commit. Inherited from the "
-        "resumed session's log if it used --include-session; this flag forces it on.",
+        help="Do not include the session .jsonl log in the commit. The resumed "
+        "session's recorded setting is inherited by default; this flag forces "
+        "the log out. It is always archived in ~/.gerbil/sessions/ regardless.",
     )
     resume_p.set_defaults(func=cmd_resume)
 
@@ -512,14 +515,15 @@ def cmd_summarize(args) -> None:
     out_dir = project_dir / ".gerbil"
     logs = sorted(out_dir.glob("*.jsonl"))
     if not logs:
-        # By default the live session log lands in ~/.gerbil/sessions/, not the
-        # project; it only reaches the project when `run --include-session` is used.
+        # The live session log always lands in ~/.gerbil/sessions/; it also
+        # reaches the project's .gerbil/ (via the committed patch) unless the
+        # run used --omit-session-log.
         archive = Path.home() / ".gerbil" / "sessions"
         msg = f"no session logs (*.jsonl) found in {out_dir}"
         if archive.is_dir() and any(archive.glob("*.jsonl")):
             msg += (
-                f"\nnote: session logs are archived in {archive} -- pass "
-                "`run --include-session` to also keep them in the project."
+                f"\nnote: session logs are archived in {archive} -- runs made "
+                "with --omit-session-log keep them only there."
             )
         sys.exit(msg)
 
@@ -820,7 +824,7 @@ def cmd_run(args) -> None:
                         base_commit=session_base,
                         ralph=ralph_meta,
                         ralph_done_script=ralph_done_script,
-                        include_session=args.include_session,
+                        include_session=not args.omit_session_log,
                     )
                     if mcp_warning:
                         session.record_warning(mcp_warning)
@@ -841,7 +845,7 @@ def cmd_run(args) -> None:
                         sandbox, session_base, result,
                         session_path=session_path, patch_path=patch_path,
                         out_dir=out_dir, archive_dir=archive_dir,
-                        include_session=args.include_session, footer=footer,
+                        include_session=not args.omit_session_log, footer=footer,
                     )
                     # Once a session produces a commit, later sessions in the chain
                     # build on it -- record its patch as an ancestor for resume.
@@ -989,12 +993,12 @@ def cmd_resume(args) -> None:
         print(style(
             f"using --ralph_done check recorded in {resume_file.name}", "gray",
         ), flush=True)
-    # --include-session survives a resume: inherit the setting recorded in the log,
-    # and let `gerbil resume --include-session` still force it on.
-    include_session = parsed.include_session or args.include_session
-    if parsed.include_session and not args.include_session:
+    # The session-log setting survives a resume: inherit the choice recorded in
+    # the log, and let `gerbil resume --omit-session-log` still force it off.
+    include_session = parsed.include_session and not args.omit_session_log
+    if not parsed.include_session and not args.omit_session_log:
         print(style(
-            f"using --include-session recorded in {resume_file.name}", "gray",
+            f"honoring --omit-session-log recorded in {resume_file.name}", "gray",
         ), flush=True)
     anchor, ancestor_patches = _reconstruct_anchor(
         parsed, resume_file, repo_root, patch_dirs

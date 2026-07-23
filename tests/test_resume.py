@@ -159,8 +159,9 @@ def test_ralph_done_script_roundtrip() -> None:
 
 
 def test_include_session_roundtrip() -> None:
-    """--include-session is recovered from the log so a resume inherits it.
-    Defaults to False for an absent field (older logs / runs without the flag)."""
+    """The session-log setting (include_session; off via --omit-session-log) is
+    recovered from the log so a resume inherits it. Defaults to False for an
+    absent field (older logs, which predate the setting and never folded it in)."""
     on = dict(START)
     on["include_session"] = True
     check("include_session recovered", parse_session(write_log([on, USER])).include_session is True)
