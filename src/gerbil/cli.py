@@ -303,7 +303,8 @@ def main() -> None:
     summ_p = sub.add_parser(
         "summarize",
         help="report token usage, estimated cost, and tool stats across the "
-        "project's .gerbil/*.jsonl session logs",
+        "project's .gerbil/*.jsonl session logs, with a per-session breakdown "
+        "tracking cost and lean code growth",
     )
     summ_p.add_argument(
         "--at",
@@ -438,7 +439,7 @@ def _scan_session(path: Path) -> dict:
     prior log by --resume) are skipped so a resumed chain isn't double-counted --
     this mirrors how Session accumulates totals only from live turns.
 
-    Returns: {model, input_tokens, output_tokens, thinking_tokens,
+    Returns: {model, base_commit, input_tokens, output_tokens, thinking_tokens,
     cache_read_tokens, cache_write_tokens, turns, tool_calls (Counter), status}
     where status is 'completed' | 'errored' | 'incomplete', thinking_tokens is
     the reasoning subset of output_tokens, and the cache counts are additional
@@ -446,6 +447,7 @@ def _scan_session(path: Path) -> dict:
     simply lack the fields and read as zero). A garbled log yields a sentinel
     with status 'unreadable' and zero usage."""
     model = "unknown"
+    base_commit = ""
     input_tokens = output_tokens = thinking_tokens = turns = 0
     cache_read_tokens = cache_write_tokens = 0
     tool_calls: collections.Counter = collections.Counter()
@@ -454,8 +456,8 @@ def _scan_session(path: Path) -> dict:
     try:
         lines = path.read_text().splitlines()
     except OSError:
-        return {"model": model, "input_tokens": 0, "output_tokens": 0,
-                "thinking_tokens": 0, "cache_read_tokens": 0,
+        return {"model": model, "base_commit": base_commit, "input_tokens": 0,
+                "output_tokens": 0, "thinking_tokens": 0, "cache_read_tokens": 0,
                 "cache_write_tokens": 0, "turns": 0, "tool_calls": tool_calls,
                 "status": "unreadable"}
 
@@ -474,6 +476,7 @@ def _scan_session(path: Path) -> dict:
         event = e.get("event")
         if event == "session_start":
             model = e.get("model", model)
+            base_commit = e.get("base_commit", base_commit)
         elif event == "turn":
             usage = e.get("usage") or {}
             input_tokens += usage.get("input_tokens", 0)
@@ -489,7 +492,8 @@ def _scan_session(path: Path) -> dict:
         elif event == "error":
             status = "errored"
 
-    return {"model": model, "input_tokens": input_tokens,
+    return {"model": model, "base_commit": base_commit,
+            "input_tokens": input_tokens,
             "output_tokens": output_tokens, "thinking_tokens": thinking_tokens,
             "cache_read_tokens": cache_read_tokens,
             "cache_write_tokens": cache_write_tokens,
@@ -505,9 +509,77 @@ def _cost(s: dict) -> float | None:
     )
 
 
+def _is_project_lean(path: str) -> bool:
+    """Whether a repo-relative path counts as the project's own Lean code:
+    a .lean file that is not inside any .lake/ directory (where Lake checks out
+    dependency packages -- their sources aren't the user's code)."""
+    return (
+        path.endswith(".lean")
+        and not path.startswith(".lake/")
+        and "/.lake/" not in path
+    )
+
+
+def _patch_lean_delta(patch: Path) -> tuple[int, int] | None:
+    """(added, removed) .lean line counts of one format-patch, restricted to
+    project Lean files (see _is_project_lean), or None if the patch is
+    unreadable. Non-lean files -- notably the folded-in .gerbil/*.jsonl session
+    log -- are skipped, as is the commit-message preamble (counting only starts
+    at a `diff --git` header)."""
+    try:
+        lines = patch.read_text().splitlines()
+    except OSError:
+        return None
+    added = removed = 0
+    in_lean_file = False
+    for line in lines:
+        if line == "-- ":
+            # format-patch's trailing signature delimiter; the version line after
+            # it would otherwise be mistaken for diff content.
+            break
+        if line.startswith("diff --git "):
+            # Take the post-image (b/) path; rsplit keeps paths containing
+            # spaces intact (only a path containing " b/" itself would confuse it).
+            in_lean_file = _is_project_lean(line.rsplit(" b/", 1)[-1])
+        elif in_lean_file:
+            if line.startswith("+") and not line.startswith("+++"):
+                added += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                removed += 1
+    return added, removed
+
+
+def _lean_line_count(project_dir: Path, commit: str) -> int | None:
+    """Total project .lean lines at `commit` in the host repo, or None when the
+    commit can't be inspected here (not a git repo, or the base predates/never
+    reached this clone). `git grep -c -e ''` counts every line of every matching
+    blob straight from the object store -- no checkout needed. `:(top)` anchors
+    the pathspecs at the repo root regardless of where the Lake project lives."""
+    if not commit:
+        return None
+    result = subprocess.run(
+        ["git", "-C", str(project_dir), "grep", "-c", "-e", "", commit, "--",
+         ":(top)*.lean", ":(top,exclude).lake/**", ":(top,exclude)**/.lake/**"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        # One "<commit>:<path>:<count>" per file; count follows the last colon.
+        return sum(
+            int(line.rsplit(":", 1)[1])
+            for line in result.stdout.splitlines()
+            if line
+        )
+    if result.returncode == 1 and not result.stderr.strip():
+        return 0  # valid commit, just no .lean files in it
+    return None
+
+
 def cmd_summarize(args) -> None:
     """Aggregate token usage, estimated cost, and tool-call stats across all
-    .gerbil/*.jsonl session logs in the project."""
+    .gerbil/*.jsonl session logs in the project, ending with a per-session
+    breakdown: cost, .lean lines added/removed (from each log's sibling .patch),
+    and a running total of the project's lean code size."""
     project_dir = _resolve_at(args.at)
     if not project_dir.is_dir():
         sys.exit(f"error: {project_dir} is not a directory")
@@ -640,6 +712,70 @@ def cmd_summarize(args) -> None:
             f"{m['input'] + m['cached'] + m['output']:,} tokens"
             f"{cached}{thinking}, {cost_str}"
         )
+    print()
+
+    # Per-session breakdown, in chronological order (the timestamped filenames
+    # sort that way). Each log's sibling <stem>.patch provides the code delta;
+    # the running total is anchored at the first session's base commit when that
+    # commit is inspectable in the host repo, and is a relative net change
+    # otherwise (e.g. logs copied in from another machine).
+    print(bold("Per session") + "  " +
+          style("(lean = .lean lines, excluding .lake packages)", "gray"))
+    baseline = _lean_line_count(project_dir, stats[0]["base_commit"])
+    running = baseline if baseline is not None else 0
+    if baseline is not None:
+        print("  " + style(
+            f"lean baseline: {baseline:,} lines at "
+            f"{stats[0]['base_commit'][:12]}", "gray"))
+    else:
+        print("  " + style(
+            "base commit not inspectable here -- lean total shown as net "
+            "change across sessions", "gray"))
+
+    rows = []
+    for path, s in zip(logs, stats):
+        patch = path.with_suffix(".patch")
+        delta = _patch_lean_delta(patch) if patch.is_file() else None
+        if delta is None:
+            change = "-"  # no patch alongside this log (crashed / no changes)
+        else:
+            a, r = delta
+            running += a - r
+            change = f"+{a:,}/-{r:,}"
+        c = _cost(s)
+        prompt_tokens = (s["input_tokens"] + s["cache_read_tokens"]
+                         + s["cache_write_tokens"])
+        rows.append((
+            path.stem,
+            s["status"],
+            f"{s['turns']:,}",
+            f"{prompt_tokens:,}",
+            f"{s['output_tokens']:,}",
+            "N/A" if c is None else f"~${c:,.4f}",
+            change,
+            f"{running:,}" if baseline is not None else f"{running:+,}",
+        ))
+
+    headers = ("session", "status", "turns", "in", "out", "cost",
+               "lean +/-", "lean total")
+    widths = [max(len(h), *(len(row[i]) for row in rows))
+              for i, h in enumerate(headers)]
+    status_color = {"completed": "green", "errored": "red",
+                    "incomplete": "yellow", "unreadable": "gray"}
+
+    def render(cells, colorize=False):
+        # Pad first, then color: ANSI codes would otherwise skew the alignment.
+        out = []
+        for i, cell in enumerate(cells):
+            pad = f"{cell:<{widths[i]}}" if i < 2 else f"{cell:>{widths[i]}}"
+            if colorize and i == 1:
+                pad = style(pad, status_color.get(cells[1], "gray"))
+            out.append(pad)
+        return ("  " + "  ".join(out)).rstrip()
+
+    print(style(render(headers), "gray"))
+    for row in rows:
+        print(render(row, colorize=True))
 
 
 def _finalize_session(
