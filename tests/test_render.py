@@ -381,6 +381,60 @@ def test_other_tool_unchanged() -> None:
     check("bash keeps name(args)", out.strip() == "-> bash({'command': 'lake build'})", out)
 
 
+def test_zoom_in() -> None:
+    file = "theorem bar : 1 = 1 := by\n  sorry\n"
+    prompt = ("Close the sorry using rfl. " * 8).strip() + "\n\nRULES:\n- no new imports"
+    out = format_tool_call(
+        "zoom_in", {"prompt": prompt, "file": "Foo.lean", "line": 2, "column": 3},
+        lambda p: file,
+    )
+    check("zoom_in shows position", "Foo.lean:2:3" in out, out)
+    check("zoom_in shows source line", "  sorry" in out, out)
+    check("zoom_in has caret", "^" in out, out)
+    check("zoom_in labels the prompt", "prompt:" in out, out)
+    check("zoom_in keeps paragraph breaks", "\n\n" in out, out)
+    check("zoom_in shows rules line", "- no new imports" in out, out)
+    # Prose is wrapped, not clipped: the long paragraph spans multiple display
+    # lines and no clip marker appears (all the text is kept).
+    body = out.split("prompt:")[1]
+    para_lines = [ln for ln in body.splitlines() if "sorry using rfl" in ln]
+    check("zoom_in wraps long prose",
+          len(para_lines) >= 2 and "..." not in body, out)
+
+    # Without a readable file, just the location line (no crash).
+    out2 = format_tool_call(
+        "zoom_in", {"prompt": "p", "file": "Foo.lean", "line": 2}, None
+    )
+    check("zoom_in bare location without reader", "Foo.lean:2" in out2, out2)
+
+    # A very long prompt gets the (generous) head+tail elision.
+    long = "\n".join(f"para {i}: " + "word " * 30 for i in range(40))
+    out3 = format_tool_call("zoom_in", {"prompt": long, "file": "A.lean", "line": 1})
+    check("zoom_in elides a huge prompt", "omitted" in out3, out3)
+    check("zoom_in elision keeps head", "para 0:" in out3, out3)
+    check("zoom_in elision keeps tail", "para 39:" in out3, out3)
+
+    # Missing prompt: still renders, flagged.
+    out4 = format_tool_call("zoom_in", {"file": "A.lean", "line": 1})
+    check("zoom_in flags a missing prompt", "(no prompt)" in out4, out4)
+
+
+def test_zoom_out() -> None:
+    out = format_tool_call(
+        "zoom_out",
+        {"summary": "Closed it with rfl. " * 10 + "\n\nVerified with diagnostics."},
+    )
+    check("zoom_out labels the summary", "summary:" in out, out)
+    wrapped = [ln for ln in out.splitlines() if "it with rfl" in ln]
+    check("zoom_out wraps long prose",
+          len(wrapped) >= 2 and "..." not in out, out)
+    check("zoom_out keeps paragraph breaks", "Verified with diagnostics." in out, out)
+
+    out2 = format_tool_call("zoom_out", {"summary": "  "})
+    check("zoom_out flags an empty summary",
+          out2.strip() == "-> zoom_out (empty summary)", out2)
+
+
 def main() -> None:
     test_write_file_line_numbers()
     test_write_file_summary_when_large()
@@ -400,6 +454,8 @@ def main() -> None:
     test_lean_build()
     test_lean_diagnostic_messages()
     test_other_tool_unchanged()
+    test_zoom_in()
+    test_zoom_out()
     print("\nAll render tests passed.")
 
 

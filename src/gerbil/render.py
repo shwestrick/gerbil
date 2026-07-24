@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+import textwrap
 
 # https://no-color.org/ -- any non-empty NO_COLOR disables color.
 ENABLED = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
@@ -63,6 +64,9 @@ SNIPPET_INLINE_MAX_CHARS = 800       # ...and only if not too large overall
 POSITION_CONTEXT_LINES = 2           # lines of context shown around a queried position
 _BODY_INDENT = "     "               # aligns body lines under "  -> "
 _LINE_CLIP = 200                     # max width of a shown content/diff line
+PROSE_WRAP_WIDTH = 88                # zoom prompt/summary: wrap prose to this width
+ZOOM_PROSE_HEAD_LINES = 20           # zoom prompt/summary: generous head+tail bound
+ZOOM_PROSE_TAIL_LINES = 10           # (these texts are the point, so show more)
 
 # lean_* tools that query the language server at a (file_path, line, column) and
 # read nicely with the source line + a caret at the column.
@@ -115,20 +119,24 @@ def _render_read_result(content: str) -> str:
     return f"{header}\n{_render_file_preview(lines)}"
 
 
-def _elide_middle(lines: list[str]) -> list[str]:
+def _elide_middle(
+    lines: list[str],
+    head: int = PREVIEW_HEAD_LINES,
+    tail: int = PREVIEW_TAIL_LINES,
+) -> list[str]:
     """Apply the head+tail elision policy to a list of already-rendered display
     lines (which carry their own prefix/color -- unlike _render_file_preview,
-    which numbers raw text). At/below PREVIEW_FULL_MAX_LINES the lines are returned
-    unchanged; above it, the first PREVIEW_HEAD_LINES and last PREVIEW_TAIL_LINES
-    with an elision marker between."""
+    which numbers raw text). At/below head+tail lines they are returned
+    unchanged; above it, the first `head` and last `tail` with an elision
+    marker between."""
     total = len(lines)
-    if total <= PREVIEW_FULL_MAX_LINES:
+    if total <= head + tail:
         return lines
-    omitted = total - PREVIEW_HEAD_LINES - PREVIEW_TAIL_LINES
+    omitted = total - head - tail
     marker = _BODY_INDENT + style(
         f"... ({omitted} line{'' if omitted == 1 else 's'} omitted)", "dim"
     )
-    return lines[:PREVIEW_HEAD_LINES] + [marker] + lines[-PREVIEW_TAIL_LINES:]
+    return lines[:head] + [marker] + lines[-tail:]
 
 
 # Diagnostics by severity: the leading symbol and color used to render each line.
@@ -340,6 +348,55 @@ def _render_hover_result(content: str) -> str | None:
     return header + ("\n" + "\n".join(body) if body else "")
 
 
+def _prose_block(text: str) -> list[str]:
+    """Free prose (a zoom_in prompt / zoom_out summary) as indented display
+    lines: each paragraph wrapped to PROSE_WRAP_WIDTH -- these texts are written
+    for a human, so wrap them readably instead of clipping at _LINE_CLIP --
+    blank lines kept as paragraph breaks, and a generous head+tail elision
+    bounding a very long text. Display-only."""
+    out: list[str] = []
+    for para in text.splitlines():
+        if not para.strip():
+            out.append(_BODY_INDENT.rstrip())
+            continue
+        for ln in textwrap.wrap(
+            para, PROSE_WRAP_WIDTH, drop_whitespace=True
+        ) or [""]:
+            out.append(_BODY_INDENT + ln)
+    return _elide_middle(out, ZOOM_PROSE_HEAD_LINES, ZOOM_PROSE_TAIL_LINES)
+
+
+def _render_zoom_in(args: dict, read_file=None) -> str:
+    """zoom_in hands one sorry to the smaller model. Show the sorry's position
+    with the source line + caret (like the position-query lean_* tools), then
+    the full task prompt as wrapped prose under a 'prompt:' label -- the prompt
+    is the interesting part for a human following along."""
+    loc = _render_position(
+        {
+            "file_path": args.get("file", "?"),
+            "line": args.get("line"),
+            "column": args.get("column"),
+        },
+        read_file,
+    )
+    prompt = str(args.get("prompt", "")).strip()
+    if not prompt:
+        return f"{loc}\n{_BODY_INDENT}{style('(no prompt)', 'gray')}"
+    label = _BODY_INDENT + style("prompt:", "bold", "magenta")
+    return "\n".join([loc, label] + _prose_block(prompt))
+
+
+def _render_zoom_out(args: dict) -> str:
+    """zoom_out ends a sub-session; its summary is the whole report the outer
+    model receives, so show it in full as wrapped prose under a 'summary:'
+    label."""
+    summary = str(args.get("summary", "")).strip()
+    if not summary:
+        return " " + style("(empty summary)", "gray")
+    label = _BODY_INDENT + style("summary:", "bold", "magenta")
+    return "\n".join(["", label] + _prose_block(summary))
+
+
 def format_tool_call(name: str, args: dict, read_file=None) -> str:
     """A pretty, single- or multi-line rendering of a tool call for the terminal.
 
@@ -362,6 +419,10 @@ def format_tool_call(name: str, args: dict, read_file=None) -> str:
         return f"{head} {_render_lean_multi_attempt(args)}"
     if name == "lean_run_code" and isinstance(args.get("code"), str):
         return f"{head} {_render_lean_run_code(args)}"
+    if name == "zoom_in":
+        return f"{head} {_render_zoom_in(args, read_file)}"
+    if name == "zoom_out":
+        return f"{head}{_render_zoom_out(args)}"
     if name in _POSITION_TOOLS:
         return f"{head} {_render_position(args, read_file)}"
     if name == "lean_build":
