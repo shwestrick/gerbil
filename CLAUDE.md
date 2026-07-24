@@ -139,8 +139,9 @@ that one sorry until it calls `zoom_out`, whose summary comes back as the
 `zoom_in` tool result. The sub-session's initial prompt is the big model's
 supplied `prompt` plus one appended "YOUR TASK" line naming the sorry and turn
 budget (`prompts.zoom_task_prompt`); its system prompt is the plain gerbil one.
-Each sub-session is capped at `--zoom-max-turns` (default 25; on the cap a
-synthesized "ran out of turns" summary is returned). Inner events are recorded
+Each sub-session is capped at `--zoom-max-turns` (default 100; on the cap one
+final forced turn — zoom_out as the only tool — demands the summary, so the
+big model always gets a real report). Inner events are recorded
 in the same `.jsonl` tagged `"zoom": true` — that tag is what lets resume
 rebuild the two conversations separately (a mid-zoom crash resumes *inside* the
 sub-session via `ParsedSession.pending_zoom`) and lets summarize price each

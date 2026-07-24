@@ -213,8 +213,9 @@ def main() -> None:
         metavar="N",
         default=None,
         help=f"Turn cap for each zoomed-in sub-session (default: "
-        f"{DEFAULT_INNER_MAX_TURNS}). On hitting it the sub-session is "
-        "abandoned and the big model is told so. Requires --small-model.",
+        f"{DEFAULT_INNER_MAX_TURNS}). On hitting it the small model gets one "
+        "final forced turn to report a mandatory zoom_out summary back to the "
+        "big model. Requires --small-model.",
     )
     run_p.add_argument(
         "--max-turns",

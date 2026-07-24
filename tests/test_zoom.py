@@ -120,14 +120,17 @@ def test_zoom_out_returns_summary() -> None:
           any(e["event"] == "tool_result" and e["name"] == "zoom_out" for e in convo))
 
 
-def test_turn_cap_synthesizes_summary() -> None:
-    """A small model that never calls zoom_out is cut off at the cap with a
-    synthesized summary (and the no-tool-calls nudge is recorded, zoom-tagged)."""
+def test_turn_cap_forces_summary() -> None:
+    """A small model that never calls zoom_out gets one final forced turn --
+    zoom_out as the only tool -- and its summary reaches the big model,
+    prefixed with a cap note (and the no-tool-calls nudge is recorded,
+    zoom-tagged)."""
     tmp = Path(tempfile.mkdtemp())
     session = make_session(tmp)
     stub, state = scripted([
         ("thinking hard", []),
         ("still thinking", []),
+        ("", [tc("zoom_out", {"summary": "got halfway: goal is now Nat.le"}, "t9")]),
     ])
     agent._run_turn_with_retry = stub
     agent.get_context_window = lambda *a, **k: None
@@ -138,19 +141,53 @@ def test_turn_cap_synthesizes_summary() -> None:
         {"prompt": "Use only simp lemmas.", "file": "Foo.lean", "line": 3},
         inner_max_turns=2, wip_patch_path=None,
     )
-    check("cap: aborted summary", "zoom_in aborted" in summary, summary)
-    check("cap: mentions the cap", "2 turns" in summary, summary)
-    check("cap: carries last text", "still thinking" in summary, summary)
-    check("cap: exactly 2 turns ran", state["n"] == 2, str(state["n"]))
+    check("cap: notes the cap was hit", "used all 2 turns" in summary, summary)
+    check("cap: forced summary delivered",
+          "got halfway: goal is now Nat.le" in summary, summary)
+    check("cap: 2 turns + 1 forced ran", state["n"] == 3, str(state["n"]))
+    check("cap: forced turn offers zoom_out only",
+          state["calls"][2]["tools"] == ["zoom_out"],
+          str(state["calls"][2]["tools"]))
+    check("cap: forced-turn usage counted", usage.input_tokens == 30, repr(usage))
 
     events = read_events(session)
+    check("cap: forced zoom_out call/result recorded, zoom-tagged",
+          any(e["event"] == "tool_call" and e["name"] == "zoom_out"
+              and e.get("zoom") for e in events)
+          and any(e["event"] == "tool_result" and e["name"] == "zoom_out"
+                  and e.get("zoom") for e in events),
+          json.dumps(events))
     nudges = [e for e in events
               if e["event"] == "turn" and e["role"] == "user"
               and "zoom_out" in e.get("content", "")
               and e is not events[1]]  # skip the initial prompt
-    check("cap: nudges recorded and zoom-tagged",
-          len(nudges) >= 1 and all(e.get("zoom") for e in nudges),
+    check("cap: nudges + forced request recorded and zoom-tagged",
+          len(nudges) >= 2 and all(e.get("zoom") for e in nudges),
           json.dumps(nudges))
+
+
+def test_turn_cap_noncompliant_falls_back_to_text() -> None:
+    """If the forced turn still doesn't call zoom_out, the model's final text
+    stands in as the summary."""
+    tmp = Path(tempfile.mkdtemp())
+    session = make_session(tmp)
+    stub, state = scripted([
+        ("working on it", []),
+        ("i replaced the sorry with omega but could not verify", []),
+    ])
+    agent._run_turn_with_retry = stub
+    agent.get_context_window = lambda *a, **k: None
+
+    summary, _usage = _run_zoom(
+        FakeSandbox(), session, Toolset(FakeSandbox()), None,
+        "claude-haiku-4-5-20251001",
+        {"prompt": "Use only simp lemmas.", "file": "Foo.lean", "line": 3},
+        inner_max_turns=1, wip_patch_path=None,
+    )
+    check("noncompliant: notes the cap", "used all 1 turns" in summary, summary)
+    check("noncompliant: final text stands in",
+          "replaced the sorry with omega" in summary, summary)
+    check("noncompliant: 1 turn + 1 forced ran", state["n"] == 2, str(state["n"]))
 
 
 def test_siblings_after_zoom_out_dropped() -> None:
@@ -197,7 +234,8 @@ def test_schema_advertisement() -> None:
 
 def main() -> None:
     test_zoom_out_returns_summary()
-    test_turn_cap_synthesizes_summary()
+    test_turn_cap_forces_summary()
+    test_turn_cap_noncompliant_falls_back_to_text()
     test_siblings_after_zoom_out_dropped()
     test_schema_advertisement()
     print("\nAll zoom tests passed.")

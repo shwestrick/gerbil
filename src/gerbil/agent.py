@@ -34,7 +34,7 @@ from .render import (
     print_usage,
     style,
 )
-from .tools import Toolset, truncate_tool_output
+from .tools import ZOOM_OUT_TOOL, Toolset, truncate_tool_output
 
 
 @dataclass
@@ -47,7 +47,7 @@ class SessionResult:
 # Turn cap for each zoomed-in sub-session in big-small mode (--zoom-max-turns
 # overrides). Unlike the outer loop, the inner one has no natural "stopped
 # calling tools" exit -- only zoom_out returns control -- so it always needs a cap.
-DEFAULT_INNER_MAX_TURNS = 25
+DEFAULT_INNER_MAX_TURNS = 100
 
 
 def _accumulate(dst: Usage, src: Usage) -> None:
@@ -235,9 +235,10 @@ def _run_zoom(
     """Run a zoomed-in sub-session: the small model works on the single sorry
     named by `zoom_args` (a zoom_in call's arguments) until it calls zoom_out.
 
-    Returns (summary, usage): the zoom_out summary -- or a synthesized one if
-    the sub-session hit `inner_max_turns` -- and the tokens the small model
-    spent. The caller feeds the summary back to the big model as the zoom_in
+    Returns (summary, usage): the zoom_out summary and the tokens the small
+    model spent. Hitting `inner_max_turns` does not skip the summary -- one
+    final forced turn (zoom_out as the only tool) demands it, so the big model
+    always gets a real report. The caller feeds the summary back as the zoom_in
     tool result; the inner conversation itself is discarded (its file edits
     live on in the shared working tree, and its events live on in the log,
     tagged `zoom` so resume/summarize can tell them apart).
@@ -369,19 +370,75 @@ def _run_zoom(
         # snapshot as fresh as the outer loop does.
         _update_wip_patch(sandbox, wip_patch_path, session.base_commit)
 
+    # Cap hit without a zoom_out: don't just abandon the sub-session -- demand
+    # the summary. One final turn where zoom_out is the only tool on offer and
+    # the prompt orders it, mirroring how the outer loop's commit-message turn
+    # constrains its final exchange. If the model still won't call zoom_out,
+    # its final text stands in; either way the big model gets a real report,
+    # prefixed with a note that the cap was hit.
     print(
         "\n" + style(
             f"[zoom: reached the {inner_max_turns}-turn cap without zoom_out; "
-            "returning to the outer model]", "bold", "yellow",
+            "forcing a summary]", "bold", "yellow",
         ),
         flush=True,
     )
-    summary = (
-        f"[zoom_in aborted: the smaller model used all {inner_max_turns} turns "
-        "without calling zoom_out. Its edits (if any) are in the working tree. "
-        f"Its last message was: {_clip(last_text, 500)}]"
+    request = (
+        f"You have run out of turns ({inner_max_turns}). Stop working now. "
+        "You MUST call zoom_out immediately with a summary of what you did, "
+        "what state the sorry is in, and anything else the outer model needs "
+        "to know."
     )
-    return summary, total
+    messages.append({"role": "user", "content": request})
+    session.record_turn("user", request, zoom=True)
+
+    header = style(
+        f"--- zoom turn {inner_max_turns + 1}/{inner_max_turns} "
+        "(forced summary) ---", "bold", "magenta",
+    )
+    print("\n" + header + context_suffix(max_context, last_usage), flush=True)
+    _parts, tool_calls, text, usage = _run_turn_with_retry(
+        small_model, system, messages, [ZOOM_OUT_TOOL], provider,
+        sandbox.read_file, session,
+    )
+    _accumulate(total, usage)
+    session.record_turn(
+        "assistant", text, usage.input_tokens, usage.output_tokens,
+        usage.thinking_tokens, usage.cache_read_tokens,
+        usage.cache_write_tokens, zoom=True,
+    )
+
+    zo = next((tc for tc in tool_calls if tc["name"] == "zoom_out"), None)
+    if zo is not None:
+        session.record_tool_call(
+            "zoom_out", zo["args"],
+            thought_signature=_thought_sig(zo["raw_part"]), zoom=True,
+        )
+        session.record_tool_result(
+            "zoom_out", "[zoom_out received; sub-session ended]", zoom=True
+        )
+        summary = str(zo["args"].get("summary", ""))
+    else:
+        summary = text  # best effort: its final text stands in for the summary
+    if not summary.strip():
+        summary = (
+            "(the smaller model produced no summary; its last message was: "
+            f"{_clip(last_text, 500)})"
+        )
+
+    print(
+        "\n" + style(
+            f"===== zoom out (forced after {inner_max_turns} turns) =====",
+            "bold", "magenta",
+        ),
+        flush=True,
+    )
+    note = (
+        f"[zoom_in: the smaller model used all {inner_max_turns} turns without "
+        "calling zoom_out; this summary was demanded at cutoff. Its edits (if "
+        "any) are in the working tree.]"
+    )
+    return f"{note}\n{summary}", total
 
 
 def run_session(
