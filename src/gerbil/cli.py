@@ -464,10 +464,14 @@ def cmd_commit(args) -> None:
     ))
 
 
-def _scan_session(path: Path) -> dict:
+def _scan_session(path: Path, count_replayed: bool = False) -> dict:
     """Tally one session log into a stats dict. Replayed events (re-emitted from a
-    prior log by --resume) are skipped so a resumed chain isn't double-counted --
-    this mirrors how Session accumulates totals only from live turns.
+    prior log by --resume) are skipped by default so a resumed chain isn't
+    double-counted -- this mirrors how Session accumulates totals only from live
+    turns. `count_replayed` folds them in instead: used when the parent log the
+    events came from is NOT among the scanned logs (a crashed session never
+    commits, so its log never reaches the project's .gerbil/ -- the replay
+    inside its continuation is the only record of that spend).
 
     Returns: {model, small_model, base_commit, input_tokens, output_tokens,
     thinking_tokens, cache_read_tokens, cache_write_tokens, turns,
@@ -486,6 +490,7 @@ def _scan_session(path: Path) -> dict:
     and zero usage."""
     model = "unknown"
     small_model = None
+    resumed_from = None
     base_commit = ""
     input_tokens = output_tokens = thinking_tokens = turns = 0
     cache_read_tokens = cache_write_tokens = 0
@@ -498,6 +503,7 @@ def _scan_session(path: Path) -> dict:
         lines = path.read_text().splitlines()
     except OSError:
         return {"model": model, "small_model": small_model,
+                "resumed_from": resumed_from,
                 "base_commit": base_commit, "input_tokens": 0,
                 "output_tokens": 0, "thinking_tokens": 0, "cache_read_tokens": 0,
                 "cache_write_tokens": 0, "turns": 0,
@@ -515,13 +521,15 @@ def _scan_session(path: Path) -> dict:
         except json.JSONDecodeError:
             # A partial trailing line from an interrupted write; ignore it.
             continue
-        # Replayed events were already counted in the original session's log.
-        if e.get("replayed"):
+        # Replayed events were already counted in the original session's log
+        # (when that log is present -- see count_replayed above).
+        if e.get("replayed") and not count_replayed:
             continue
         event = e.get("event")
         if event == "session_start":
             model = e.get("model", model)
             small_model = e.get("small_model", small_model)
+            resumed_from = e.get("resumed_from", resumed_from)
             base_commit = e.get("base_commit", base_commit)
         elif event == "turn":
             usage = e.get("usage") or {}
@@ -557,6 +565,7 @@ def _scan_session(path: Path) -> dict:
             status = "errored"
 
     return {"model": model, "small_model": small_model,
+            "resumed_from": resumed_from,
             "base_commit": base_commit,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens, "thinking_tokens": thinking_tokens,
@@ -570,6 +579,28 @@ def _scan_session(path: Path) -> dict:
             "zoom_cache_write_tokens": zoom_cache_write_tokens,
             "zoom_turns": zoom_turns,
             "tool_calls": tool_calls, "status": status}
+
+
+def _scan_sessions(logs: list[Path]) -> list[dict]:
+    """Scan a set of session logs with resume-aware accounting.
+
+    A continuation log carries its parent's full pre-crash history as replayed
+    events. When the parent log is among `logs`, those events are skipped (the
+    parent's own row already counts them); when it is absent, they are folded
+    into the continuation's row -- the parent crashed, so it never committed
+    and its log never reached this directory, making the replay the only
+    record of that spend. In practice a parent that IS present is one that
+    completed (an already-complete resume), which is exactly when skipping is
+    right. For a resume-of-a-resume the replay spans every ancestor; absent
+    ancestors all crashed for the same reason, so folding on a missing direct
+    parent stays correct down the chain."""
+    stats = [_scan_session(p) for p in logs]
+    names = {p.name for p in logs}
+    return [
+        _scan_session(p, count_replayed=True)
+        if s["resumed_from"] and s["resumed_from"] not in names else s
+        for p, s in zip(logs, stats)
+    ]
 
 
 def _zoom_any(s: dict) -> bool:
@@ -729,7 +760,7 @@ def cmd_summarize(args) -> None:
             )
         sys.exit(msg)
 
-    stats = [_scan_session(p) for p in logs]
+    stats = _scan_sessions(logs)
 
     # Big-small sessions keep the small model's (zoom) usage in separate
     # buckets for pricing; the overall token totals combine both.

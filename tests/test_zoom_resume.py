@@ -364,6 +364,54 @@ def test_summarize_accounting() -> None:
           f"{c} vs {expected}")
 
 
+def test_summarize_resume_accounting() -> None:
+    """A continuation log's replayed events are the only record of a crashed
+    parent's spend (the parent never committed, so its log never reached the
+    project). Fold them in when the parent log is absent; keep skipping them
+    when it is present, so the two rows stay disjoint."""
+    from gerbil.cli import _scan_sessions
+
+    usage = {"input_tokens": 10, "output_tokens": 1}
+    parent_events = [
+        START, USER,
+        {"event": "turn", "role": "assistant", "content": "a1", "usage": usage},
+        {"event": "turn", "zoom": True, "role": "user", "content": "task"},
+        {"event": "turn", "zoom": True, "role": "assistant", "content": "z1",
+         "usage": usage},
+    ]
+    cont_start = dict(START)
+    cont_start["resumed_from"] = "gerbil-parent.jsonl"
+    cont_events = (
+        [cont_start]
+        + [dict(e, replayed=True) for e in parent_events[1:]]
+        + [{"event": "turn", "role": "assistant", "content": "live",
+            "usage": usage}]
+    )
+
+    d = Path(tempfile.mkdtemp())
+    parent = d / "gerbil-parent.jsonl"
+    cont = d / "gerbil-parent-resume-x.jsonl"
+    for p, evs in ((parent, parent_events), (cont, cont_events)):
+        with p.open("w") as f:
+            for e in evs:
+                f.write(json.dumps(e) + "\n")
+
+    # Parent absent: the continuation's row absorbs the replayed history.
+    [folded] = _scan_sessions([cont])
+    check("resume accounting: parent absent folds replay in",
+          folded["turns"] == 2 and folded["zoom_turns"] == 1, str(folded))
+    check("resume accounting: replayed tokens counted",
+          folded["input_tokens"] == 20 and folded["zoom_input_tokens"] == 10,
+          str(folded))
+
+    # Parent present: rows stay disjoint (no double count).
+    both = _scan_sessions([parent, cont])
+    check("resume accounting: parent present keeps rows disjoint",
+          both[0]["turns"] == 1 and both[0]["zoom_turns"] == 1
+          and both[1]["turns"] == 1 and both[1]["zoom_turns"] == 0,
+          str(both))
+
+
 def main() -> None:
     test_completed_zoom()
     test_crash_mid_inner()
@@ -373,6 +421,7 @@ def main() -> None:
     test_mid_zoom_continuation()
     test_multi_zoom_seed_isolation()
     test_summarize_accounting()
+    test_summarize_resume_accounting()
     print("\nAll zoom resume tests passed.")
 
 
