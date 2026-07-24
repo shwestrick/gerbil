@@ -479,8 +479,11 @@ def _scan_session(path: Path) -> dict:
     remainder; pre-caching logs simply lack the fields and read as zero). In a
     big-small session, zoom-tagged turns (the small model's sub-sessions) land
     in the zoom_* counters so they can be priced at the small model's rates;
-    the plain counters hold only the big model's share. A garbled log yields a
-    sentinel with status 'unreadable' and zero usage."""
+    the plain counters hold only the big model's share. turns/zoom_turns count
+    assistant turns only, matching the live "--- turn N ---" counters (user
+    turn events -- the prompt, nudges, the commit-message request -- carry no
+    model response). A garbled log yields a sentinel with status 'unreadable'
+    and zero usage."""
     model = "unknown"
     small_model = None
     base_commit = ""
@@ -522,20 +525,28 @@ def _scan_session(path: Path) -> dict:
             base_commit = e.get("base_commit", base_commit)
         elif event == "turn":
             usage = e.get("usage") or {}
+            # Count only assistant turns, so the tally matches the live
+            # "--- turn N ---" / "--- zoom turn k/N ---" counters (one per
+            # model response). User-role turn events (the prompt, nudges, the
+            # commit-message request) still contribute their usage -- always
+            # zero today, but that is an accident of who records them.
+            is_assistant = e.get("role") == "assistant"
             if e.get("zoom"):
                 zoom_input_tokens += usage.get("input_tokens", 0)
                 zoom_output_tokens += usage.get("output_tokens", 0)
                 zoom_thinking_tokens += usage.get("thinking_tokens", 0)
                 zoom_cache_read_tokens += usage.get("cache_read_tokens", 0)
                 zoom_cache_write_tokens += usage.get("cache_write_tokens", 0)
-                zoom_turns += 1
+                if is_assistant:
+                    zoom_turns += 1
             else:
                 input_tokens += usage.get("input_tokens", 0)
                 output_tokens += usage.get("output_tokens", 0)
                 thinking_tokens += usage.get("thinking_tokens", 0)
                 cache_read_tokens += usage.get("cache_read_tokens", 0)
                 cache_write_tokens += usage.get("cache_write_tokens", 0)
-                turns += 1
+                if is_assistant:
+                    turns += 1
         elif event == "tool_call":
             # Inner (zoom-tagged) calls count too: they really ran. zoom_in /
             # zoom_out showing up alongside them is desirable visibility.

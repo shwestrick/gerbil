@@ -347,9 +347,10 @@ def test_summarize_accounting() -> None:
     check("summarize: zoom bucket",
           s["zoom_input_tokens"] == 1000 and s["zoom_output_tokens"] == 100,
           str(s))
-    # _scan_session counts user turns too: outer = USER + assistant, zoom =
-    # the sub-session's task prompt + assistant.
-    check("summarize: turn split", s["turns"] == 2 and s["zoom_turns"] == 2,
+    # _scan_session counts assistant turns only (matching the live counters):
+    # one outer assistant turn, one zoom assistant turn -- the USER prompt and
+    # the zoom task prompt don't count.
+    check("summarize: turn split", s["turns"] == 1 and s["zoom_turns"] == 1,
           str(s))
     check("summarize: small model recovered",
           s["small_model"] == "claude-haiku-4-5-20251001")
