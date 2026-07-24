@@ -234,7 +234,9 @@ changes; anything not reachable from that range is lost. You do not need to \
 commit -- any uncommitted changes you leave in the working tree are committed for \
 you -- but do not hide or discard your work: do not run `git reset`, `git \
 checkout`/`git restore`, `git stash`, or `git init`, and do not create another \
-git repository inside this one.
+git repository inside this one. Do not leave behind any .patch files or other \
+artifacts that are not part of the final state. We will create the git patch \
+for you, so do not write it yourself.
 """
 
 
