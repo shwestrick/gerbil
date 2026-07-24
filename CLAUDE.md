@@ -119,8 +119,9 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
 - `gerbil commit` — `git am` the project's `.gerbil/*.patch` in order, skipping
   already-applied (by stable patch-id) and stale (non-applying) patches.
 - `gerbil summarize` — token/cost/tool/status stats across `.gerbil/*.jsonl`,
-  plus a per-session table (cost, `.lean` lines +/- from each sibling `.patch`,
-  running lean-code total excluding `.lake`).
+  plus a per-session table (cost, `.lean` lines +/- from the commit each log
+  was folded into or its uncommitted `.patch`, running lean-code total
+  excluding `.lake`).
 - `gerbil reconstruct-patch LOG` — rebuild a `.patch` by *replaying the logged
   tool calls* (`bash`/`write_file`/`edit_file`; read-only/`lean_*` skipped) in a
   fresh sandbox, no LLM involved.

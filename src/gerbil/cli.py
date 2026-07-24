@@ -549,6 +549,42 @@ def _patch_lean_delta(patch: Path) -> tuple[int, int] | None:
     return added, removed
 
 
+def _committed_lean_delta(project_dir: Path, log_name: str) -> tuple[int, int] | None:
+    """(added, removed) project .lean line counts of the commit that carries a
+    session's folded-in log, or None when no commit contains it. A session log
+    reaches the project's .gerbil/ only by `gerbil commit` (git am) applying the
+    patch the log was folded into, so the commit that added the log IS the
+    session's squashed commit -- and the .patch file itself is typically gone
+    once applied, making history the authoritative record of the diff."""
+    result = subprocess.run(
+        ["git", "-C", str(project_dir), "log", "--diff-filter=A",
+         "--format=%H", "--", f".gerbil/{log_name}"],
+        capture_output=True,
+        text=True,
+    )
+    commits = result.stdout.split()
+    if result.returncode != 0 or not commits:
+        return None
+    # numstat: one "<added>\t<removed>\t<path>" per file, "-" counts for binary.
+    show = subprocess.run(
+        ["git", "-C", str(project_dir), "show", "--numstat", "--format=",
+         commits[0]],
+        capture_output=True,
+        text=True,
+    )
+    if show.returncode != 0:
+        return None
+    added = removed = 0
+    for line in show.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3 or parts[0] == "-":
+            continue
+        if _is_project_lean(parts[2]):
+            added += int(parts[0])
+            removed += int(parts[1])
+    return added, removed
+
+
 def _lean_line_count(project_dir: Path, commit: str) -> int | None:
     """Total project .lean lines at `commit` in the host repo, or None when the
     commit can't be inspected here (not a git repo, or the base predates/never
@@ -578,8 +614,9 @@ def _lean_line_count(project_dir: Path, commit: str) -> int | None:
 def cmd_summarize(args) -> None:
     """Aggregate token usage, estimated cost, and tool-call stats across all
     .gerbil/*.jsonl session logs in the project, ending with a per-session
-    breakdown: cost, .lean lines added/removed (from each log's sibling .patch),
-    and a running total of the project's lean code size."""
+    breakdown: cost, .lean lines added/removed (from the commit each log was
+    folded into, or its sibling .patch when not yet committed), and a running
+    total of the project's lean code size."""
     project_dir = _resolve_at(args.at)
     if not project_dir.is_dir():
         sys.exit(f"error: {project_dir} is not a directory")
@@ -715,10 +752,11 @@ def cmd_summarize(args) -> None:
     print()
 
     # Per-session breakdown, in chronological order (the timestamped filenames
-    # sort that way). Each log's sibling <stem>.patch provides the code delta;
-    # the running total is anchored at the first session's base commit when that
-    # commit is inspectable in the host repo, and is a relative net change
-    # otherwise (e.g. logs copied in from another machine).
+    # sort that way). Each session's code delta comes from the commit its log
+    # was folded into (or a not-yet-committed sibling .patch); the running
+    # total is anchored at the first session's base commit when that commit is
+    # inspectable in the host repo, and is a relative net change otherwise
+    # (e.g. logs copied in from another machine).
     print(bold("Per session") + "  " +
           style("(lean = .lean lines, excluding .lake packages)", "gray"))
     baseline = _lean_line_count(project_dir, stats[0]["base_commit"])
@@ -734,10 +772,16 @@ def cmd_summarize(args) -> None:
 
     rows = []
     for path, s in zip(logs, stats):
-        patch = path.with_suffix(".patch")
-        delta = _patch_lean_delta(patch) if patch.is_file() else None
+        # Git history first: a log lands in .gerbil/ via the commit it was
+        # folded into, so that commit holds the session's diff. A sibling
+        # .patch (not yet committed here, e.g. a hand-copied log) covers the
+        # rest.
+        delta = _committed_lean_delta(project_dir, path.name)
         if delta is None:
-            change = "-"  # no patch alongside this log (crashed / no changes)
+            patch = path.with_suffix(".patch")
+            delta = _patch_lean_delta(patch) if patch.is_file() else None
+        if delta is None:
+            change = "-"  # no commit or patch for this log (crashed / no changes)
         else:
             a, r = delta
             running += a - r
