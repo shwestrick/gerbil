@@ -138,6 +138,27 @@ def detect_provider(model: str) -> str:
     )
 
 
+def _drop_empty_assistant(messages: list) -> list:
+    """A copy of `messages` without part-less assistant messages.
+
+    A glitched provider turn (seen from a gateway-served Gemini: no text, no
+    tool calls, zero usage) leaves {"role": "assistant", "content": []} in the
+    conversation, and a crashed session's log replays it back on resume. Every
+    backend chokes on serializing that -- Vertex Gemini rejects a model turn
+    with no `parts` outright (400 INVALID_ARGUMENT), killing every later
+    request in the session. Such a message carries zero information, so drop
+    it here, once, for every provider, rather than teaching each converter
+    about it. Returns a new list; the caller's conversation is untouched."""
+    return [
+        m for m in messages
+        if not (
+            m.get("role") == "assistant"
+            and isinstance(m.get("content"), list)
+            and not m["content"]
+        )
+    ]
+
+
 def stream(
     model: str,
     system: str,
@@ -150,6 +171,7 @@ def stream(
     messages: unified message dicts (see module docstring)
     tools: tool schema dicts (name, description, input_schema)
     """
+    messages = _drop_empty_assistant(messages)
     provider = provider or detect_provider(model)
     if provider == "gemini":
         yield from _stream_gemini(model, system, messages, tools)
@@ -536,11 +558,15 @@ def _stream_openai_chat(client, model, system, messages, tools):
 
     usage = Usage()
     tool_calls_acc = {}  # index -> {id, name, args_json}
+    emitted = False      # any text/tool-call event reached the caller
+    saw_finish = False   # any chunk carried a finish_reason
 
     def flush_tool_calls():
+        nonlocal emitted
         for idx in sorted(tool_calls_acc.keys()):
             tc = tool_calls_acc[idx]
             args = json.loads(tc["args_json"]) if tc["args_json"] else {}
+            emitted = True
             yield ToolCall(tc["name"], args)
             yield _ToolMeta(tc["id"])
         tool_calls_acc.clear()
@@ -584,6 +610,7 @@ def _stream_openai_chat(client, model, system, messages, tools):
         delta = chunk.choices[0].delta
 
         if delta.content:
+            emitted = True
             yield TextDelta(delta.content)
 
         if delta.tool_calls:
@@ -606,11 +633,21 @@ def _stream_openai_chat(client, model, system, messages, tools):
         # agent look done after its very first turn. Accumulated calls are
         # themselves the proof that tools were requested; the label is not.
         if chunk.choices[0].finish_reason is not None:
+            saw_finish = True
             yield from flush_tool_calls()
 
     # Safety net: some servers end the stream without ever setting a
     # finish_reason (or set it on a choices-less usage chunk we skip above).
     yield from flush_tool_calls()
+
+    # An empty stream with no finish reason at all is a glitched turn, not a
+    # completion -- the same failure mode _check_gemini_finish catches for the
+    # native Gemini provider (this core serves gateway-fronted Gemini too, where
+    # it was seen in the wild). Raise BEFORE Done so the agent loop retries the
+    # turn instead of admitting an empty assistant message. A clean finish with
+    # no content is left alone, as on the Gemini path.
+    if not emitted and not saw_finish:
+        raise TransientProviderError("model returned an empty response")
 
     yield Done(usage)
 

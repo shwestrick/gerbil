@@ -194,6 +194,7 @@ uv run python tests/test_resume.py       # resume logic
 uv run python tests/test_zoom.py         # big-small inner loop + zoom schemas (no Docker)
 uv run python tests/test_zoom_resume.py  # big-small resume + summarize accounting (no Docker)
 uv run python tests/test_render.py       # terminal rendering
+uv run python tests/test_empty_turn.py   # glitched empty-turn guard + filter (no network)
 uv run python tests/test_ollama.py       # ollama provider plumbing (no Docker; live smoke if a server is up)
 uv run python tests/test_portkey.py      # portkey provider plumbing (no Docker/key; live smoke if PORTKEY_API_KEY + PORTKEY_TEST_MODEL set)
 GOOGLE_API_KEY=... uv run python tests/test_gemini.py   # live Gemini backend
