@@ -83,8 +83,56 @@ for you, so do not write it yourself.
 """
 
 
+# Appended to the big (outer) model's system prompt in big-small mode, when the
+# zoom_in tool is available.
+ZOOM_NOTE = """\
+
+You have access to a smaller model that can be used to churn through the \
+mechanical proof details of a single sorry. Use the tool zoom_in to do so. \
+You should avoid writing low-level Lean code yourself; instead, let the small \
+model handle that work. The smaller model it not a replacement for you: it \
+does not have the ability to reason about the big picture or plan a larger \
+proof strategy. It should only be used to resolve a single sorry.
+
+When you invoke zoom_in, you must provide the smaller model a prompt that \
+describes very precisely what it should do. Give it a single sorry to resolve, \
+and provide all the necessary context. Tell it all of the RULES and GUIDELINES \
+it must follow. The smaller model will not be able to ask you questions, so \
+you must give it everything it needs to succeed. 
+
+When the small model is done, it will give you a summary of what it did. At \
+this point, you should verify that the summary is accurate. You may then \
+continue.
+
+You are free to invoke zoom_in multiple times, but only use it for one sorry \
+at a time.
+"""
+
+
+def zoom_task_prompt(args: dict, inner_max_turns: int) -> str:
+    """The small model's initial prompt: the task prompt the big model supplied
+    in its zoom_in call, with one line appended naming the sorry and the turn
+    budget. Tolerates missing fields (the schema requires prompt/file/line, but
+    a model may still omit one) so a malformed call degrades gracefully."""
+    pos = f"{args.get('file', '?')}:{args.get('line', '?')}"
+    col = args.get("column")
+    if col is not None:
+        pos += f":{col}"
+    prompt = str(args.get("prompt", "")).rstrip()
+    return (
+        f"{prompt}\n\n"
+        f"YOUR TASK: based on the instructions above, resolve the sorry at "
+        f"this location: {pos}. You only have {inner_max_turns} turns to do "
+        "so. Use your turns wisely. Keep working until either the sorry is " 
+        "resolved or you are stuck. When you are finished, you MUST call "
+        "zoom_out with a summary of what you did. This will return control to "
+        "the big model."
+    )
+
+
 def build_system_prompt(
-    has_lsp_tools: bool, ralph: bool = False, base_commit: str = ""
+    has_lsp_tools: bool, ralph: bool = False, base_commit: str = "",
+    zoom_in_available: bool = False,
 ) -> str:
     """The system prompt, with notes appended for active features."""
     prompt = SYSTEM_PROMPT
@@ -92,6 +140,8 @@ def build_system_prompt(
         prompt += LSP_TOOLS_NOTE
     if ralph:
         prompt += RALPH_NOTE
+    if zoom_in_available:
+        prompt += ZOOM_NOTE
     if base_commit:
         prompt += GIT_STATE_NOTE.format(base=base_commit)
     return prompt

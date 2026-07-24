@@ -42,7 +42,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from .agent import run_session
+from .agent import DEFAULT_INNER_MAX_TURNS, run_session
 from .pricing import (
     MODEL_PRICING,
     estimate_cost,
@@ -198,6 +198,25 @@ def main() -> None:
         ),
     )
     run_p.add_argument(
+        "--small-model",
+        metavar="MODEL",
+        default=None,
+        help="Enable big-small mode: --model (the big model) drives the session "
+        "and gets a zoom_in tool that hands the mechanical details of a single "
+        "sorry to this smaller model, which works in a focused sub-session "
+        "until it calls zoom_out with a summary. Provider is auto-detected, "
+        "independently of --model.",
+    )
+    run_p.add_argument(
+        "--zoom-max-turns",
+        type=int,
+        metavar="N",
+        default=None,
+        help=f"Turn cap for each zoomed-in sub-session (default: "
+        f"{DEFAULT_INNER_MAX_TURNS}). On hitting it the sub-session is "
+        "abandoned and the big model is told so. Requires --small-model.",
+    )
+    run_p.add_argument(
         "--max-turns",
         type=int,
         default=None,
@@ -262,6 +281,16 @@ def main() -> None:
         type=int,
         default=None,
         help="Safety cap on agent turns (default: unlimited, runs until done).",
+    )
+    resume_p.add_argument(
+        "--zoom-max-turns",
+        type=int,
+        metavar="N",
+        default=None,
+        help="Override the resumed session's per-zoom turn cap (by default the "
+        "cap recorded in the log is reused). Only applies to a big-small "
+        "(--small-model) session; the small model itself always comes from "
+        "the log, like the model and prompt.",
     )
     resume_p.add_argument(
         "--skip-cache",
@@ -439,27 +468,39 @@ def _scan_session(path: Path) -> dict:
     prior log by --resume) are skipped so a resumed chain isn't double-counted --
     this mirrors how Session accumulates totals only from live turns.
 
-    Returns: {model, base_commit, input_tokens, output_tokens, thinking_tokens,
-    cache_read_tokens, cache_write_tokens, turns, tool_calls (Counter), status}
-    where status is 'completed' | 'errored' | 'incomplete', thinking_tokens is
-    the reasoning subset of output_tokens, and the cache counts are additional
-    prompt tokens (input_tokens is the uncached remainder; pre-caching logs
-    simply lack the fields and read as zero). A garbled log yields a sentinel
-    with status 'unreadable' and zero usage."""
+    Returns: {model, small_model, base_commit, input_tokens, output_tokens,
+    thinking_tokens, cache_read_tokens, cache_write_tokens, turns,
+    zoom_input_tokens, zoom_output_tokens, zoom_thinking_tokens,
+    zoom_cache_read_tokens, zoom_cache_write_tokens, zoom_turns,
+    tool_calls (Counter), status} where status is 'completed' | 'errored' |
+    'incomplete', thinking_tokens is the reasoning subset of output_tokens, and
+    the cache counts are additional prompt tokens (input_tokens is the uncached
+    remainder; pre-caching logs simply lack the fields and read as zero). In a
+    big-small session, zoom-tagged turns (the small model's sub-sessions) land
+    in the zoom_* counters so they can be priced at the small model's rates;
+    the plain counters hold only the big model's share. A garbled log yields a
+    sentinel with status 'unreadable' and zero usage."""
     model = "unknown"
+    small_model = None
     base_commit = ""
     input_tokens = output_tokens = thinking_tokens = turns = 0
     cache_read_tokens = cache_write_tokens = 0
+    zoom_input_tokens = zoom_output_tokens = zoom_thinking_tokens = 0
+    zoom_cache_read_tokens = zoom_cache_write_tokens = zoom_turns = 0
     tool_calls: collections.Counter = collections.Counter()
     status = "incomplete"  # no session_end/error recorded => crashed mid-run
 
     try:
         lines = path.read_text().splitlines()
     except OSError:
-        return {"model": model, "base_commit": base_commit, "input_tokens": 0,
+        return {"model": model, "small_model": small_model,
+                "base_commit": base_commit, "input_tokens": 0,
                 "output_tokens": 0, "thinking_tokens": 0, "cache_read_tokens": 0,
-                "cache_write_tokens": 0, "turns": 0, "tool_calls": tool_calls,
-                "status": "unreadable"}
+                "cache_write_tokens": 0, "turns": 0,
+                "zoom_input_tokens": 0, "zoom_output_tokens": 0,
+                "zoom_thinking_tokens": 0, "zoom_cache_read_tokens": 0,
+                "zoom_cache_write_tokens": 0, "zoom_turns": 0,
+                "tool_calls": tool_calls, "status": "unreadable"}
 
     for line in lines:
         line = line.strip()
@@ -476,37 +517,77 @@ def _scan_session(path: Path) -> dict:
         event = e.get("event")
         if event == "session_start":
             model = e.get("model", model)
+            small_model = e.get("small_model", small_model)
             base_commit = e.get("base_commit", base_commit)
         elif event == "turn":
             usage = e.get("usage") or {}
-            input_tokens += usage.get("input_tokens", 0)
-            output_tokens += usage.get("output_tokens", 0)
-            thinking_tokens += usage.get("thinking_tokens", 0)
-            cache_read_tokens += usage.get("cache_read_tokens", 0)
-            cache_write_tokens += usage.get("cache_write_tokens", 0)
-            turns += 1
+            if e.get("zoom"):
+                zoom_input_tokens += usage.get("input_tokens", 0)
+                zoom_output_tokens += usage.get("output_tokens", 0)
+                zoom_thinking_tokens += usage.get("thinking_tokens", 0)
+                zoom_cache_read_tokens += usage.get("cache_read_tokens", 0)
+                zoom_cache_write_tokens += usage.get("cache_write_tokens", 0)
+                zoom_turns += 1
+            else:
+                input_tokens += usage.get("input_tokens", 0)
+                output_tokens += usage.get("output_tokens", 0)
+                thinking_tokens += usage.get("thinking_tokens", 0)
+                cache_read_tokens += usage.get("cache_read_tokens", 0)
+                cache_write_tokens += usage.get("cache_write_tokens", 0)
+                turns += 1
         elif event == "tool_call":
+            # Inner (zoom-tagged) calls count too: they really ran. zoom_in /
+            # zoom_out showing up alongside them is desirable visibility.
             tool_calls[e.get("name", "?")] += 1
         elif event == "session_end":
             status = "completed"
         elif event == "error":
             status = "errored"
 
-    return {"model": model, "base_commit": base_commit,
+    return {"model": model, "small_model": small_model,
+            "base_commit": base_commit,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens, "thinking_tokens": thinking_tokens,
             "cache_read_tokens": cache_read_tokens,
             "cache_write_tokens": cache_write_tokens,
-            "turns": turns, "tool_calls": tool_calls, "status": status}
+            "turns": turns,
+            "zoom_input_tokens": zoom_input_tokens,
+            "zoom_output_tokens": zoom_output_tokens,
+            "zoom_thinking_tokens": zoom_thinking_tokens,
+            "zoom_cache_read_tokens": zoom_cache_read_tokens,
+            "zoom_cache_write_tokens": zoom_cache_write_tokens,
+            "zoom_turns": zoom_turns,
+            "tool_calls": tool_calls, "status": status}
+
+
+def _zoom_any(s: dict) -> bool:
+    """Whether a session's stats dict has any small-model (zoom) usage."""
+    return bool(
+        s["zoom_input_tokens"] or s["zoom_output_tokens"]
+        or s["zoom_cache_read_tokens"] or s["zoom_cache_write_tokens"]
+        or s["zoom_turns"]
+    )
 
 
 def _cost(s: dict) -> float | None:
     """Estimated USD cost of one session's stats dict, or None when the model's
-    pricing is unknown (reported as N/A, never a made-up number)."""
-    return estimate_cost(
+    pricing is unknown (reported as N/A, never a made-up number). A big-small
+    session prices its two buckets at their own models' rates; either bucket
+    unpriced makes the whole session N/A."""
+    main = estimate_cost(
         s["model"], s["input_tokens"], s["output_tokens"],
         s["cache_read_tokens"], s["cache_write_tokens"],
     )
+    if not _zoom_any(s):
+        return main
+    zoom = estimate_cost(
+        s["small_model"] or "unknown",
+        s["zoom_input_tokens"], s["zoom_output_tokens"],
+        s["zoom_cache_read_tokens"], s["zoom_cache_write_tokens"],
+    )
+    if main is None or zoom is None:
+        return None
+    return main + zoom
 
 
 def _is_project_lean(path: str) -> bool:
@@ -638,12 +719,20 @@ def cmd_summarize(args) -> None:
 
     stats = [_scan_session(p) for p in logs]
 
-    total_in = sum(s["input_tokens"] for s in stats)
-    total_out = sum(s["output_tokens"] for s in stats)
-    total_thinking = sum(s["thinking_tokens"] for s in stats)
-    total_cache_read = sum(s["cache_read_tokens"] for s in stats)
-    total_cache_write = sum(s["cache_write_tokens"] for s in stats)
-    total_turns = sum(s["turns"] for s in stats)
+    # Big-small sessions keep the small model's (zoom) usage in separate
+    # buckets for pricing; the overall token totals combine both.
+    total_in = sum(s["input_tokens"] + s["zoom_input_tokens"] for s in stats)
+    total_out = sum(s["output_tokens"] + s["zoom_output_tokens"] for s in stats)
+    total_thinking = sum(
+        s["thinking_tokens"] + s["zoom_thinking_tokens"] for s in stats
+    )
+    total_cache_read = sum(
+        s["cache_read_tokens"] + s["zoom_cache_read_tokens"] for s in stats
+    )
+    total_cache_write = sum(
+        s["cache_write_tokens"] + s["zoom_cache_write_tokens"] for s in stats
+    )
+    total_turns = sum(s["turns"] + s["zoom_turns"] for s in stats)
     costs = [_cost(s) for s in stats]
     total_cost = sum(c for c in costs if c is not None)
     unpriced = sum(1 for c in costs if c is None)
@@ -654,25 +743,41 @@ def cmd_summarize(args) -> None:
 
     status_counts = collections.Counter(s["status"] for s in stats)
 
-    # Per-model rollup of tokens + cost.
+    # Per-model rollup of tokens + cost. A big-small session contributes to two
+    # entries: its outer bucket to the big model's, its zoom bucket to the
+    # small model's -- each priced at that model's own rates.
     by_model: dict[str, dict] = {}
-    for s in stats:
+
+    def _fold_model(name, inp, out, thinking, cache_read, cache_write):
         m = by_model.setdefault(
-            s["model"],
+            name,
             {"sessions": 0, "input": 0, "output": 0, "thinking": 0,
              "cached": 0, "cost": 0.0},
         )
         m["sessions"] += 1
-        m["input"] += s["input_tokens"]
-        m["output"] += s["output_tokens"]
-        m["thinking"] += s["thinking_tokens"]
-        m["cached"] += s["cache_read_tokens"] + s["cache_write_tokens"]
+        m["input"] += inp
+        m["output"] += out
+        m["thinking"] += thinking
+        m["cached"] += cache_read + cache_write
         # None poisons the rollup: one unpriced session makes the model's cost N/A.
-        c = _cost(s)
+        c = estimate_cost(name, inp, out, cache_read, cache_write)
         if c is None:
             m["cost"] = None
         elif m["cost"] is not None:
             m["cost"] += c
+
+    for s in stats:
+        _fold_model(
+            s["model"], s["input_tokens"], s["output_tokens"],
+            s["thinking_tokens"], s["cache_read_tokens"], s["cache_write_tokens"],
+        )
+        if _zoom_any(s):
+            _fold_model(
+                s["small_model"] or "unknown",
+                s["zoom_input_tokens"], s["zoom_output_tokens"],
+                s["zoom_thinking_tokens"], s["zoom_cache_read_tokens"],
+                s["zoom_cache_write_tokens"],
+            )
 
     bold = lambda t: style(t, "bold")
     print(bold(f"gerbil summary -- {len(logs)} session(s) in {out_dir}"))
@@ -787,14 +892,18 @@ def cmd_summarize(args) -> None:
             running += a - r
             change = f"+{a:,}/-{r:,}"
         c = _cost(s)
+        # Combined across both models of a big-small session; the per-model
+        # split lives in the "By model" rollup above.
         prompt_tokens = (s["input_tokens"] + s["cache_read_tokens"]
-                         + s["cache_write_tokens"])
+                         + s["cache_write_tokens"] + s["zoom_input_tokens"]
+                         + s["zoom_cache_read_tokens"]
+                         + s["zoom_cache_write_tokens"])
         rows.append((
             path.stem,
             s["status"],
-            f"{s['turns']:,}",
+            f"{s['turns'] + s['zoom_turns']:,}",
             f"{prompt_tokens:,}",
-            f"{s['output_tokens']:,}",
+            f"{s['output_tokens'] + s['zoom_output_tokens']:,}",
             "N/A" if c is None else f"~${c:,.4f}",
             change,
             f"{running:,}" if baseline is not None else f"{running:+,}",
@@ -908,6 +1017,11 @@ def cmd_run(args) -> None:
                  "(to continue a crashed session, use `gerbil resume SESSION_FILE`).")
     if args.ralph is not None and args.ralph < 1:
         sys.exit("error: --ralph N must be >= 1")
+    if args.zoom_max_turns is not None and not args.small_model:
+        sys.exit("error: --zoom-max-turns only applies with --small-model.")
+    if args.zoom_max_turns is not None and args.zoom_max_turns < 1:
+        sys.exit("error: --zoom-max-turns N must be >= 1")
+    inner_max_turns = args.zoom_max_turns or DEFAULT_INNER_MAX_TURNS
     ralph_done_script = _load_ralph_done_script(
         args.ralph_done, have_ralph=args.ralph is not None
     )
@@ -960,8 +1074,11 @@ def cmd_run(args) -> None:
             with contextlib.ExitStack() as stack:
                 # For an ollama model, make sure a host-side server is up (and the
                 # model is pulled) before any turn runs; torn down on exit if we
-                # started it.
+                # started it. In big-small mode the small model may be the
+                # ollama one (OllamaServer reuses an already-running server).
                 _start_ollama(args.model, stack)
+                if args.small_model:
+                    _start_ollama(args.small_model, stack)
                 mcp, mcp_warning = (
                     _start_mcp(sandbox, stack) if args.mcp else (None, None)
                 )
@@ -1005,6 +1122,10 @@ def cmd_run(args) -> None:
                         ralph=ralph_meta,
                         ralph_done_script=ralph_done_script,
                         include_session=not args.omit_session_log,
+                        small_model=args.small_model,
+                        inner_max_turns=(
+                            inner_max_turns if args.small_model else None
+                        ),
                     )
                     if mcp_warning:
                         session.record_warning(mcp_warning)
@@ -1012,6 +1133,8 @@ def cmd_run(args) -> None:
                     result = run_session(
                         sandbox, session, prompt, args.model, toolset,
                         max_turns=args.max_turns, wip_patch_path=wip_path,
+                        small_model=args.small_model,
+                        inner_max_turns=inner_max_turns,
                     )
                     session.close()
                     session = None
@@ -1180,6 +1303,19 @@ def cmd_resume(args) -> None:
         print(style(
             f"honoring --omit-session-log recorded in {resume_file.name}", "gray",
         ), flush=True)
+    # Big-small mode survives a resume: the small model and per-zoom turn cap
+    # come from the log (like the model and prompt); --zoom-max-turns overrides
+    # just the cap.
+    if args.zoom_max_turns is not None and not parsed.small_model:
+        sys.exit(
+            "error: --zoom-max-turns only applies to a big-small "
+            f"(--small-model) session; {resume_file.name} records none."
+        )
+    if args.zoom_max_turns is not None and args.zoom_max_turns < 1:
+        sys.exit("error: --zoom-max-turns N must be >= 1")
+    inner_max_turns = (
+        args.zoom_max_turns or parsed.inner_max_turns or DEFAULT_INNER_MAX_TURNS
+    )
     anchor, ancestor_patches = _reconstruct_anchor(
         parsed, resume_file, repo_root, patch_dirs
     )
@@ -1224,6 +1360,8 @@ def cmd_resume(args) -> None:
                 # The resumed session's model may be an ollama one; ensure a
                 # host-side server (and the model) is available before continuing.
                 _start_ollama(parsed.model, stack)
+                if parsed.small_model:
+                    _start_ollama(parsed.small_model, stack)
                 mcp, mcp_warning = (
                     _start_mcp(sandbox, stack) if args.mcp else (None, None)
                 )
@@ -1281,6 +1419,10 @@ def cmd_resume(args) -> None:
                         ralph=ralph_meta,
                         ralph_done_script=ralph_done_script,
                         include_session=include_session,
+                        small_model=parsed.small_model,
+                        inner_max_turns=(
+                            inner_max_turns if parsed.small_model else None
+                        ),
                     )
                     if mcp_warning:
                         session.record_warning(mcp_warning)
@@ -1303,6 +1445,11 @@ def cmd_resume(args) -> None:
                         sandbox, session, parsed.prompt, parsed.model, toolset,
                         max_turns=args.max_turns, messages=seed_messages,
                         wip_patch_path=wip_path,
+                        small_model=parsed.small_model,
+                        inner_max_turns=inner_max_turns,
+                        # Only the crashed (seeded) session can be mid-zoom;
+                        # later ralph iterations start fresh.
+                        pending_zoom=parsed.pending_zoom if seeded else None,
                     )
                     session.close()
                     session = None
@@ -1313,6 +1460,8 @@ def cmd_resume(args) -> None:
                         f"--model {parsed.model}\n"
                         f"resume {resume_file.name}"
                     )
+                    if parsed.small_model:
+                        footer += f"\n--small-model {parsed.small_model}"
                     if ralph:
                         footer += f"\n--ralph (session {i}/{total_iters})"
                     patch_name = _finalize_session(
@@ -1337,7 +1486,10 @@ def cmd_resume(args) -> None:
 
 # The tool calls that mutate sandbox state and so must be replayed to reproduce a
 # session's working tree. read_file and the lean_* MCP tools are read-only (and
-# the search tools are rate-limited), so they are skipped.
+# the search tools are rate-limited), so they are skipped. Filtering is by name
+# only, so a big-small session's zoom-tagged (inner) bash/write/edit calls are
+# intentionally replayed too -- the sub-sessions mutate the same working tree --
+# while zoom_in/zoom_out themselves are naturally skipped.
 _REPLAY_TOOLS = {"bash", "write_file", "edit_file"}
 
 
@@ -1585,6 +1737,8 @@ def _run_footer(args, iteration=None, total=None) -> str:
         f"--model {args.model}",
         f"--max-turns {max_turns}",
     ]
+    if getattr(args, "small_model", None):
+        lines.append(f"--small-model {args.small_model}")
     if iteration is not None:
         lines.append(f"--ralph (session {iteration}/{total})")
     return "\n".join(lines)

@@ -11,6 +11,11 @@ Event types:
   session_end     — written once at the bottom with totals
   warning         — non-terminal note about a recoverable problem
   error           — terminal event if the session aborts with an exception
+
+In big-small mode, turn/tool_call/tool_result events belonging to a zoomed-in
+sub-session (the small model working on one sorry) carry `"zoom": true`. The
+log stays a single flat stream; the tag is what lets resume and summarize
+separate the inner conversation from the outer one.
 """
 
 import json
@@ -37,6 +42,8 @@ class Session:
         ralph: dict[str, Any] | None = None,
         ralph_done_script: str | None = None,
         include_session: bool = True,
+        small_model: str | None = None,
+        inner_max_turns: int | None = None,
     ):
         self.path = path
         self.model = model
@@ -47,6 +54,8 @@ class Session:
         self.ralph = ralph
         self.ralph_done_script = ralph_done_script
         self.include_session = include_session
+        self.small_model = small_model
+        self.inner_max_turns = inner_max_turns
         self._total_input_tokens = 0
         self._total_output_tokens = 0
         self._total_thinking_tokens = 0
@@ -83,6 +92,13 @@ class Session:
         # it (a command-line --ralph_done still overrides).
         if ralph_done_script is not None:
             start["ralph_done_script"] = ralph_done_script
+        # Big-small mode: the small (zoom) model and the per-zoom turn cap,
+        # recorded so `gerbil resume` inherits them without the user
+        # re-supplying either (like model and include_session above).
+        if small_model is not None:
+            start["small_model"] = small_model
+        if inner_max_turns is not None:
+            start["inner_max_turns"] = inner_max_turns
         self._append(start)
 
     def record_turn(
@@ -94,6 +110,7 @@ class Session:
         thinking_tokens: int = 0,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
+        zoom: bool = False,
     ) -> None:
         self._total_input_tokens += input_tokens
         self._total_output_tokens += output_tokens
@@ -104,7 +121,7 @@ class Session:
         # output-rate-billed total), recorded for reporting. The cache counts
         # are ADDITIONAL prompt tokens (Anthropic semantics: input_tokens is
         # only the uncached remainder), billed at their own rates.
-        self._append({
+        event = {
             "event": "turn",
             "timestamp": _now(),
             "role": role,
@@ -116,13 +133,17 @@ class Session:
                 "cache_read_tokens": cache_read_tokens,
                 "cache_write_tokens": cache_write_tokens,
             },
-        })
+        }
+        if zoom:
+            event["zoom"] = True
+        self._append(event)
 
     def record_tool_call(
         self,
         name: str,
         args: dict[str, Any],
         thought_signature: str | None = None,
+        zoom: bool = False,
     ) -> None:
         event = {
             "event": "tool_call",
@@ -135,15 +156,20 @@ class Session:
         # whose tool calls are missing their signatures).
         if thought_signature is not None:
             event["thought_signature"] = thought_signature
+        if zoom:
+            event["zoom"] = True
         self._append(event)
 
-    def record_tool_result(self, name: str, result: Any) -> None:
-        self._append({
+    def record_tool_result(self, name: str, result: Any, zoom: bool = False) -> None:
+        event = {
             "event": "tool_result",
             "timestamp": _now(),
             "name": name,
             "result": result,
-        })
+        }
+        if zoom:
+            event["zoom"] = True
+        self._append(event)
 
     def close(self) -> None:
         self._append({

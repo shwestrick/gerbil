@@ -115,11 +115,12 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
 
 ## Subcommands
 
-- `gerbil run --prompt FILE [--model M] [--ralph N] [--ralph_done SCRIPT]
-  [--max-turns N] [--skip-cache] [--no-mcp] [--omit-session-log]`
-- `gerbil resume LOG [--at DIR] [--max-turns N] [--skip-cache] [--no-mcp]
-  [--ralph_done SCRIPT] [--omit-session-log]` — continue a crashed/interrupted
-  session (model and prompt come from the log).
+- `gerbil run --prompt FILE [--model M] [--small-model M] [--zoom-max-turns N]
+  [--ralph N] [--ralph_done SCRIPT] [--max-turns N] [--skip-cache] [--no-mcp]
+  [--omit-session-log]`
+- `gerbil resume LOG [--at DIR] [--max-turns N] [--zoom-max-turns N]
+  [--skip-cache] [--no-mcp] [--ralph_done SCRIPT] [--omit-session-log]` —
+  continue a crashed/interrupted session (model and prompt come from the log).
 - `gerbil commit` — `git am` the project's `.gerbil/*.patch` in order, skipping
   already-applied (by stable patch-id) and stale (non-applying) patches.
 - `gerbil summarize` — token/cost/tool/status stats across `.gerbil/*.jsonl`,
@@ -129,6 +130,21 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
 - `gerbil reconstruct-patch LOG` — rebuild a `.patch` by *replaying the logged
   tool calls* (`bash`/`write_file`/`edit_file`; read-only/`lean_*` skipped) in a
   fresh sandbox, no LLM involved.
+
+**Big-small mode** (`--small-model M`): the big model (`--model`) drives the
+session and gets a `zoom_in(prompt, file, line[, column])` tool; calling it sets
+the big conversation aside and runs an inner sub-session of the small model
+(full toolset plus `zoom_out(summary)`, no `zoom_in` — depth is at most 1) on
+that one sorry until it calls `zoom_out`, whose summary comes back as the
+`zoom_in` tool result. The sub-session's initial prompt is the big model's
+supplied `prompt` plus one appended "YOUR TASK" line naming the sorry and turn
+budget (`prompts.zoom_task_prompt`); its system prompt is the plain gerbil one.
+Each sub-session is capped at `--zoom-max-turns` (default 25; on the cap a
+synthesized "ran out of turns" summary is returned). Inner events are recorded
+in the same `.jsonl` tagged `"zoom": true` — that tag is what lets resume
+rebuild the two conversations separately (a mid-zoom crash resumes *inside* the
+sub-session via `ParsedSession.pending_zoom`) and lets summarize price each
+model's bucket at its own rates.
 
 **Ralph loops** (`--ralph N`): run the same prompt across N back-to-back sessions
 in one sandbox, each building on the previous one's commit. Each session records
@@ -174,6 +190,8 @@ uv run python tests/test_mcp.py          # lean-lsp MCP integration (Docker; slo
 uv run python tests/test_reconstruct.py  # reconstruct-patch end-to-end (Docker)
 uv run python tests/test_commit.py       # gerbil commit end-to-end (Docker)
 uv run python tests/test_resume.py       # resume logic
+uv run python tests/test_zoom.py         # big-small inner loop + zoom schemas (no Docker)
+uv run python tests/test_zoom_resume.py  # big-small resume + summarize accounting (no Docker)
 uv run python tests/test_render.py       # terminal rendering
 uv run python tests/test_ollama.py       # ollama provider plumbing (no Docker; live smoke if a server is up)
 uv run python tests/test_portkey.py      # portkey provider plumbing (no Docker/key; live smoke if PORTKEY_API_KEY + PORTKEY_TEST_MODEL set)

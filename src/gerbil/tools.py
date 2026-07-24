@@ -199,6 +199,71 @@ RESET_LEAN_SERVER_TOOL = {
 }
 
 
+# The big-small mode tools. Both are gerbil-provided and neither is ever
+# dispatched: agent.py intercepts them by name before Toolset.dispatch is
+# reached (zoom_in launches the inner small-model loop; zoom_out ends it).
+# zoom_in is advertised only to the big (outer) model, zoom_out only to the
+# small (inner) model -- see Toolset.schemas(zoom=...).
+ZOOM_IN_TOOL = {
+    "name": "zoom_in",
+    "description": (
+        "Delegate the mechanical proof details of a single sorry to a smaller "
+        "model. Give the exact position of the sorry and a task prompt with "
+        "everything the smaller model needs (context, rules, guidelines -- it "
+        "cannot ask you questions); a focused sub-session works on just that "
+        "sorry, and this call returns a summary of what it accomplished. The "
+        "sub-session shares your working tree, so its edits are visible to "
+        "you afterward."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "The task prompt for the smaller model: precise "
+                               "instructions, all necessary context, and the "
+                               "rules it must follow.",
+            },
+            "file": {
+                "type": "string",
+                "description": "Path of the file containing the sorry, "
+                               "relative to the project root.",
+            },
+            "line": {
+                "type": "integer",
+                "description": "1-indexed line of the sorry.",
+            },
+            "column": {
+                "type": "integer",
+                "description": "1-indexed column of the sorry (optional).",
+            },
+        },
+        "required": ["prompt", "file", "line"],
+    },
+}
+
+ZOOM_OUT_TOOL = {
+    "name": "zoom_out",
+    "description": (
+        "End this zoomed-in sub-session and report back to the outer model. "
+        "Call this exactly once, when the sorry is resolved or you are stuck: "
+        "the summary is all the outer model will see of your work besides the "
+        "file changes themselves."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "What you did, what state the sorry is in now, "
+                               "and anything the outer model must know.",
+            },
+        },
+        "required": ["summary"],
+    },
+}
+
+
 class Toolset:
     """Unified tool registry passed to the agent loop.
 
@@ -230,10 +295,20 @@ class Toolset:
             ]
             self._mcp_names = {t["name"] for t in self._mcp_schemas}
 
-    def schemas(self) -> list[dict]:
-        """Built-in schemas, the reset tool (only when MCP is on), then MCP schemas."""
+    def schemas(self, zoom: str | None = None) -> list[dict]:
+        """Built-in schemas, the reset tool (only when MCP is on), then MCP schemas.
+
+        `zoom` selects the big-small mode variant: "outer" additionally
+        advertises zoom_in (the big model), "inner" advertises zoom_out (the
+        small model's sub-session). None -- the default, and the only value used
+        outside big-small mode -- advertises neither."""
         reset = [RESET_LEAN_SERVER_TOOL] if self._mcp is not None else []
-        return TOOLS + reset + self._mcp_schemas
+        base = TOOLS + reset + self._mcp_schemas
+        if zoom == "outer":
+            return base + [ZOOM_IN_TOOL]
+        if zoom == "inner":
+            return base + [ZOOM_OUT_TOOL]
+        return base
 
     def mcp_tool_names(self) -> set[str]:
         return set(self._mcp_names)
