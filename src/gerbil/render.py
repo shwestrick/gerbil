@@ -255,6 +255,64 @@ def _render_build_result(content: str) -> str | None:
     return header + ("\n" + "\n".join(body) if body else "")
 
 
+# The three standard Lean 4 kernel axioms -- trusted and expected in most
+# mathlib-based proofs. Anything else in a lean_verify report is worth
+# flagging: sorryAx means the proof (transitively) contains a sorry, and any
+# other name is a custom or TCB-extending axiom (e.g. Lean.ofReduceBool from
+# native_decide).
+_STANDARD_AXIOMS = {"propext", "Classical.choice", "Quot.sound"}
+
+
+def _render_verify_result(content: str) -> str | None:
+    """Human-readable preview of a lean_verify *result* -- a JSON
+    {axioms, warnings}. The tool exists to answer one question: does the proof
+    rest only on the standard kernel axioms, or does it smuggle in sorryAx (an
+    unfinished proof) or a custom axiom? Lead with that verdict as a colored
+    header, then list each axiom (standard dimmed, sorryAx red, custom yellow)
+    and any source-scan warnings. Returns None when `content` isn't the
+    expected shape, so the caller falls back to the generic preview.
+    Display-only -- the model still sees the raw JSON."""
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or "axioms" not in data:
+        return None
+    axioms = [a for a in (data.get("axioms") or []) if isinstance(a, str)]
+    warnings = [w for w in (data.get("warnings") or []) if isinstance(w, str)]
+
+    custom = [a for a in axioms if a != "sorryAx" and a not in _STANDARD_AXIOMS]
+    if "sorryAx" in axioms:
+        header = style("✗ depends on sorryAx -- proof incomplete", "red")
+    elif custom:
+        header = style(
+            f"⚠ nonstandard axiom{'' if len(custom) == 1 else 's'}: "
+            f"{', '.join(custom)}", "yellow",
+        )
+    elif axioms:
+        header = style("✓ standard axioms only", "green")
+    else:
+        header = style("✓ no axioms", "green")
+    if warnings:
+        header += " " + style(
+            f"({len(warnings)} warning{'' if len(warnings) == 1 else 's'})", "dim"
+        )
+
+    body: list[str] = []
+    for a in axioms:
+        if a == "sorryAx":
+            body.append(_BODY_INDENT + style(_clip(f"✗ {a}"), "red"))
+        elif a in _STANDARD_AXIOMS:
+            body.append(_BODY_INDENT + style(_clip(f"· {a}"), "gray"))
+        else:
+            body.append(_BODY_INDENT + style(_clip(f"⚠ {a}"), "yellow"))
+    for w in warnings:
+        for ln in (w.splitlines() or [""]):
+            body.append(_BODY_INDENT + style(_clip(f"⚠ {ln}"), "yellow"))
+    body = _elide_middle(body)
+    return header + ("\n" + "\n".join(body) if body else "")
+
+
 def _goal_blocks(goals: list, pad: str = "") -> list[str]:
     """Render pretty-printed goals to display lines: the ⊢ target line highlighted,
     hypotheses dimmed, with a 'goal i/n' separator when there is more than one.
@@ -430,6 +488,8 @@ def format_tool_call(name: str, args: dict, read_file=None) -> str:
         return f"{head} {extra}" if extra else head
     if name == "lean_diagnostic_messages" and isinstance(args.get("file_path"), str):
         return f"{head} {_render_path_with_extras(args)}"
+    if name == "lean_verify" and isinstance(args.get("theorem_name"), str):
+        return f"{head} {_render_lean_verify(args)}"
     return f"{head}({args})"
 
 
@@ -579,6 +639,16 @@ def _render_position(args: dict, read_file=None) -> str:
     return "\n".join(out)
 
 
+def _render_lean_verify(args: dict) -> str:
+    """lean_verify checks a theorem's axiom dependencies. Show the (fully
+    qualified) theorem name prominently with the file appended dimly, instead
+    of echoing the args dict."""
+    out = style(str(args["theorem_name"]), TOOL_COLOR)
+    if isinstance(args.get("file_path"), str):
+        out += " " + style(f"({args['file_path']})", "gray")
+    return out
+
+
 def _render_lean_run_code(args: dict) -> str:
     """lean_run_code runs a standalone Lean snippet. Always show a line-numbered
     preview of the code (head+tail when long), under a line-count header, instead
@@ -625,6 +695,8 @@ def format_tool_result(name: str, content: str, raw_content: str, is_error: bool
             rendered = _render_goal_result(raw_content)
         elif name == "lean_hover_info":
             rendered = _render_hover_result(raw_content)
+        elif name == "lean_verify":
+            rendered = _render_verify_result(raw_content)
     if rendered is None:
         preview = content[:200] + "..." if len(content) > 200 else content
         # Align continuation lines under the content (after "  <- ").

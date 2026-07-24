@@ -8,6 +8,7 @@ import json
 
 from gerbil.render import (
     format_tool_call,
+    format_tool_result,
     _render_build_result,
     _render_diagnostics_result,
     _render_goal_result,
@@ -376,6 +377,49 @@ def test_lean_diagnostic_messages() -> None:
           out2.strip() == "-> lean_diagnostic_messages Foo.lean (line=10)", out2)
 
 
+def test_lean_verify() -> None:
+    import json as _json
+
+    out = format_tool_call("lean_verify", {
+        "theorem_name": "Lang.thm", "file_path": "Foo.lean",
+    })
+    check("verify call shows theorem + file",
+          out.strip() == "-> lean_verify Lang.thm (Foo.lean)", out)
+    out2 = format_tool_call("lean_verify", {"theorem_name": "Lang.thm"})
+    check("verify call works without file",
+          out2.strip() == "-> lean_verify Lang.thm", out2)
+
+    def result(d):
+        raw = _json.dumps(d)
+        return format_tool_result("lean_verify", raw, raw, False)
+
+    sorry = result({"axioms": ["propext", "sorryAx", "Quot.sound"], "warnings": []})
+    check("verify result flags sorryAx", "✗ depends on sorryAx" in sorry, sorry)
+    check("verify result marks the sorry axiom line", "✗ sorryAx" in sorry, sorry)
+    check("verify result dims standard axioms", "· propext" in sorry, sorry)
+
+    clean = result({"axioms": ["propext", "Classical.choice", "Quot.sound"],
+                    "warnings": []})
+    check("verify result clean verdict", "✓ standard axioms only" in clean, clean)
+
+    custom = result({"axioms": ["propext", "My.axiom"],
+                     "warnings": ["uses native_decide"]})
+    check("verify result names custom axiom",
+          "⚠ nonstandard axiom: My.axiom" in custom, custom)
+    check("verify result counts warnings", "(1 warning)" in custom, custom)
+    check("verify result lists warnings", "⚠ uses native_decide" in custom, custom)
+
+    empty = result({"axioms": [], "warnings": []})
+    check("verify result no axioms", "✓ no axioms" in empty, empty)
+
+    fallback = format_tool_result("lean_verify", "not json", "not json", False)
+    check("verify non-json falls back to generic",
+          fallback.strip() == "<- not json", fallback)
+    err = format_tool_result("lean_verify", "boom", "boom", True)
+    check("verify error keeps generic error preview",
+          err.strip() == "<- boom", err)
+
+
 def test_other_tool_unchanged() -> None:
     out = format_tool_call("bash", {"command": "lake build"})
     check("bash keeps name(args)", out.strip() == "-> bash({'command': 'lake build'})", out)
@@ -453,6 +497,7 @@ def main() -> None:
     test_lean_goal_fallbacks()
     test_lean_build()
     test_lean_diagnostic_messages()
+    test_lean_verify()
     test_other_tool_unchanged()
     test_zoom_in()
     test_zoom_out()
