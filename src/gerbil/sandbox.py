@@ -133,7 +133,7 @@ class LeanSandbox:
     def __init__(
         self,
         project_dir: str | Path,
-        image: str = "lean-sandbox:latest",
+        image: str = "gerbil-lean-sandbox:latest",
         fetch_cache: bool = True,
         repo_root: str | Path | None = None,
     ):

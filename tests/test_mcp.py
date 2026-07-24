@@ -9,7 +9,7 @@ via gerbil's tool path, then ask the LSP for diagnostics and confirm it sees the
 new content. This boots `lake serve` and installs the Lean toolchain on first
 use, so it can take a few minutes.
 
-Requires Docker and the lean-sandbox image (built from src/lean-sandbox). No API
+Requires Docker and the gerbil-lean-sandbox image (built from src/lean-sandbox). No API
 key needed. Run:  uv run python tests/test_mcp.py
 """
 

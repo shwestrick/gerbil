@@ -65,7 +65,7 @@ bootstrap_if_needed() {
 }
 
 current_dir() { echo "$VERSIONS_DIR/$(cat "$CURRENT_FILE")"; }
-sandbox_image() { echo "lean-sandbox:$(cat "$CURRENT_FILE")"; }
+sandbox_image() { echo "gerbil-lean-sandbox:$(cat "$CURRENT_FILE")"; }
 
 # Absolute path of this running launcher, following symlinks (portably -- macOS
 # readlink has no -f). This is what `gerbil update` overwrites in place.
@@ -147,6 +147,29 @@ ensure_image() {
     fi
 }
 
+# Remove sandbox images left behind by previous versions, so updates don't
+# accumulate multi-GB images. Only launcher-built images are swept: those in
+# the gerbil-lean-sandbox repo (or the legacy pre-rename lean-sandbox repo)
+# whose tag is a 40-hex commit hash other than the current version's. A dev
+# :latest build is never touched. Images still in use by a container fail to
+# remove; that is reported and otherwise ignored.
+remove_old_images() {
+    local keep img tag
+    keep="$(sandbox_image)"
+    docker image ls --format '{{.Repository}}:{{.Tag}}' \
+        --filter 'reference=gerbil-lean-sandbox' --filter 'reference=lean-sandbox' \
+        2>/dev/null | while IFS= read -r img; do
+        [ "$img" = "$keep" ] && continue
+        tag="${img##*:}"
+        echo "$tag" | grep -qE '^[0-9a-f]{40}$' || continue
+        if docker image rm "$img" >/dev/null 2>&1; then
+            echo "gerbil: removed old sandbox image $img" >&2
+        else
+            echo "gerbil: could not remove old sandbox image $img (in use?)" >&2
+        fi
+    done
+}
+
 usage() {
     sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
 }
@@ -156,6 +179,7 @@ case "$cmd" in
     update)
         new="$(set_current_to_main)"
         ensure_image
+        remove_old_images
         self_update
         echo "gerbil: now at $new"
         ;;

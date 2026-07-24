@@ -14,7 +14,7 @@ sandboxing, a git-based workflow, and built-in Ralph loops.
 The defining design choices:
 
 - **Sandboxed**: every session runs inside a Docker container (the
-  `lean-sandbox` image). The host never executes agent-authored commands.
+  `gerbil-lean-sandbox` image). The host never executes agent-authored commands.
 - **Git-native I/O**: gerbil uploads the *real* repo into the container — the
   tracked files plus a *sanitized* `.git` holding only the current branch's
   history (no other branches, tags, remotes, or reflogs: the agent sees nothing
@@ -148,10 +148,10 @@ uv run python -m gerbil run --prompt prompt.md --at /path/to/lake/project
 ```
 
 When invoked this way (no launcher), the sandbox image defaults to
-`lean-sandbox:latest` and `GERBIL_VERSION` is `unknown`. Build the image with:
+`gerbil-lean-sandbox:latest` and `GERBIL_VERSION` is `unknown`. Build the image with:
 
 ```bash
-docker build -t lean-sandbox:latest src/lean-sandbox
+docker build -t gerbil-lean-sandbox:latest src/lean-sandbox
 ```
 
 Dependencies (managed by `uv`, see pyproject.toml): `docker`, `mcp`, and all
@@ -175,7 +175,7 @@ uv run python tests/test_portkey.py      # portkey provider plumbing (no Docker/
 GOOGLE_API_KEY=... uv run python tests/test_gemini.py   # live Gemini backend
 ```
 
-Most require Docker and the `lean-sandbox` image; `test_gemini.py` needs a real
+Most require Docker and the `gerbil-lean-sandbox` image; `test_gemini.py` needs a real
 API key. `test_ollama.py` and `test_portkey.py` need neither Docker nor a key
 (each runs a live smoke only if its backend is already reachable/configured).
 

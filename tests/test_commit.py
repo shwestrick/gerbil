@@ -7,7 +7,7 @@ exactly as _finalize_session does, the patch dropped into .gerbil/, and then
 `gerbil commit` run on the host: git am applies it, a re-run skips it via the
 patch-id dedup, and the host repo's own git data survives untouched.
 
-Needs Docker and the lean-sandbox image (the mathlib cache fetch is stubbed).
+Needs Docker and the gerbil-lean-sandbox image (the mathlib cache fetch is stubbed).
 """
 
 import subprocess

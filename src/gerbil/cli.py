@@ -901,7 +901,7 @@ def cmd_run(args) -> None:
 
     # The launcher builds a version-matched image and passes its tag here; fall
     # back to the default for direct dev use (uv run python -m gerbil ...).
-    image = os.environ.get("GERBIL_SANDBOX_IMAGE", "lean-sandbox:latest")
+    image = os.environ.get("GERBIL_SANDBOX_IMAGE", "gerbil-lean-sandbox:latest")
 
     session = None  # the in-flight session, for the error handler below
     try:
@@ -1111,7 +1111,7 @@ def cmd_resume(args) -> None:
     archive_dir.mkdir(parents=True, exist_ok=True)
     out_dir = project_dir / ".gerbil"
     version = os.environ.get("GERBIL_VERSION", "unknown")
-    image = os.environ.get("GERBIL_SANDBOX_IMAGE", "lean-sandbox:latest")
+    image = os.environ.get("GERBIL_SANDBOX_IMAGE", "gerbil-lean-sandbox:latest")
     patch_dirs = [resume_file.parent, out_dir]  # where ancestor patches may live
 
     # Resolve the reconstruction plan. For a ralph session, the chain layers on a
@@ -1346,7 +1346,7 @@ def cmd_reconstruct_patch(args) -> None:
     archive_dir = Path.home() / ".gerbil" / "sessions"
     archive_dir.mkdir(parents=True, exist_ok=True)
     out_dir = project_dir / ".gerbil"
-    image = os.environ.get("GERBIL_SANDBOX_IMAGE", "lean-sandbox:latest")
+    image = os.environ.get("GERBIL_SANDBOX_IMAGE", "gerbil-lean-sandbox:latest")
     patch_dirs = [session_file.parent, out_dir]
 
     anchor, ancestor_patches = _reconstruct_anchor(
