@@ -190,6 +190,39 @@ def test_turn_cap_noncompliant_falls_back_to_text() -> None:
     check("noncompliant: 1 turn + 1 forced ran", state["n"] == 2, str(state["n"]))
 
 
+def test_resume_continues_turn_budget() -> None:
+    """A seeded (resumed) sub-session counts its prior turns against the cap:
+    one assistant message per turn already run. A seed that already used the
+    whole budget goes straight to the forced summary instead of getting a
+    fresh cap."""
+    tmp = Path(tempfile.mkdtemp())
+    session = make_session(tmp)
+    seed = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "turn one"}]},
+        {"role": "user", "content": "nudge"},
+        {"role": "assistant", "content": [{"type": "text", "text": "turn two"}]},
+    ]
+    stub, state = scripted([
+        ("", [tc("zoom_out", {"summary": "ran out, here is where things stand"}, "t1")]),
+    ])
+    agent._run_turn_with_retry = stub
+    agent.get_context_window = lambda *a, **k: None
+
+    summary, _usage = _run_zoom(
+        FakeSandbox(), session, Toolset(FakeSandbox()), None,
+        "claude-haiku-4-5-20251001",
+        {"prompt": "Use only simp lemmas.", "file": "Foo.lean", "line": 3},
+        inner_max_turns=2, wip_patch_path=None, seed_messages=seed,
+    )
+    check("resume budget: only the forced turn runs", state["n"] == 1,
+          str(state["n"]))
+    check("resume budget: forced turn offers zoom_out only",
+          state["calls"][0]["tools"] == ["zoom_out"], str(state["calls"][0]))
+    check("resume budget: forced summary returned",
+          "here is where things stand" in summary, summary)
+
+
 def test_siblings_after_zoom_out_dropped() -> None:
     """Tool calls issued alongside (after) zoom_out in the same turn are
     dropped, not dispatched or recorded."""
@@ -236,6 +269,7 @@ def main() -> None:
     test_zoom_out_returns_summary()
     test_turn_cap_forces_summary()
     test_turn_cap_noncompliant_falls_back_to_text()
+    test_resume_continues_turn_budget()
     test_siblings_after_zoom_out_dropped()
     test_schema_advertisement()
     print("\nAll zoom tests passed.")

@@ -254,6 +254,66 @@ def test_mid_zoom_continuation() -> None:
           json.dumps(user_after)[:400])
 
 
+def test_multi_zoom_seed_isolation() -> None:
+    """A log can hold many sub-sessions; the pending_zoom seed must contain
+    ONLY the interrupted (last) one -- its assistant count is what _run_zoom
+    charges against the turn cap on resume, so earlier zooms leaking in would
+    shrink (or exhaust) the resumed budget."""
+
+    def zoom(n_turns, complete):
+        ev = [{"event": "tool_call", "name": "zoom_in",
+               "args": {"prompt": "p", "file": "F.lean", "line": 1}},
+              {"event": "turn", "zoom": True, "role": "user", "content": "task"}]
+        for i in range(n_turns):
+            ev += [
+                {"event": "turn", "zoom": True, "role": "assistant", "content": f"t{i}"},
+                {"event": "tool_call", "zoom": True, "name": "bash",
+                 "args": {"command": "x"}},
+                {"event": "tool_result", "zoom": True, "name": "bash", "result": "ok"},
+            ]
+        if complete:
+            ev += [
+                {"event": "tool_call", "zoom": True, "name": "zoom_out",
+                 "args": {"summary": "done"}},
+                {"event": "tool_result", "zoom": True, "name": "zoom_out",
+                 "result": "[ended]"},
+                {"event": "tool_result", "name": "zoom_in", "result": "done"},
+            ]
+        return ev
+
+    def n_assistant(msgs):
+        return sum(1 for m in msgs if m.get("role") == "assistant")
+
+    # Two completed zooms, then a third interrupted after 3 inner turns.
+    events = ([START, USER, {"event": "turn", "role": "assistant", "content": "z1"}]
+              + zoom(2, complete=True)
+              + [{"event": "turn", "role": "assistant", "content": "z2"}]
+              + zoom(5, complete=True)
+              + [{"event": "turn", "role": "assistant", "content": "z3"}]
+              + zoom(3, complete=False))
+    ps = parse_session(write_log(events))
+    check("multi-zoom: seed holds only the interrupted sub-session",
+          n_assistant(ps.pending_zoom["messages"]) == 3,
+          str(n_assistant(ps.pending_zoom["messages"])))
+
+    # Continuation log (a resume of a resume): the same events replayed, then
+    # the interrupted zoom continued live for 4 more turns before crashing
+    # again. The seed must span both runs of that one sub-session.
+    replayed = [dict(e, replayed=True) for e in events]
+    live = []
+    for i in range(4):
+        live += [
+            {"event": "turn", "zoom": True, "role": "assistant", "content": f"live{i}"},
+            {"event": "tool_call", "zoom": True, "name": "bash",
+             "args": {"command": "y"}},
+            {"event": "tool_result", "zoom": True, "name": "bash", "result": "ok"},
+        ]
+    ps2 = parse_session(write_log(replayed + live))
+    check("multi-zoom: continuation seed spans both runs of the last zoom",
+          n_assistant(ps2.pending_zoom["messages"]) == 7,
+          str(n_assistant(ps2.pending_zoom["messages"])))
+
+
 def test_summarize_accounting() -> None:
     """`gerbil summarize` splits a big-small session's usage into the two
     models' buckets and prices each at its own rates; replayed zoom events are
@@ -310,6 +370,7 @@ def main() -> None:
     test_crash_right_after_zoom_in_call()
     test_plain_log_unaffected()
     test_mid_zoom_continuation()
+    test_multi_zoom_seed_isolation()
     test_summarize_accounting()
     print("\nAll zoom resume tests passed.")
 

@@ -281,7 +281,12 @@ def _run_zoom(
 
     last_usage: Usage | None = None
     last_text = ""
-    turn = 0
+    # Continue the turn count across a resume: the seeded history holds one
+    # assistant message per inner turn already run. Unlike the outer loop's
+    # display-only turn_offset, this counts against the cap -- the task prompt
+    # promised the small model inner_max_turns turns for the whole sub-session,
+    # and a resume must not silently refresh that budget.
+    turn = sum(1 for m in messages if m.get("role") == "assistant")
     while turn < inner_max_turns:
         turn += 1
         header = style(
