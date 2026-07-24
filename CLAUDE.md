@@ -44,8 +44,12 @@ bin/gerbil              self-contained bash launcher (installed on PATH; fetches
 src/gerbil/
   cli.py                argparse entry point + all subcommands (run, commit,
                         summarize, reconstruct-patch) and the resume orchestration
-  agent.py              the agent loop (run_session), system prompts, pricing
-                        table, and pretty terminal rendering of tool calls
+  agent.py              the agent loop (run_session) and transient-error retry
+  prompts.py            system/task prompt text + build_system_prompt
+  pricing.py            MODEL_PRICING table and cost estimation (N/A when unknown)
+  render.py             ALL human-readable terminal rendering: the ANSI style()
+                        helper (respects NO_COLOR / non-TTY) and the pretty
+                        tool-call/result, context, and usage formatting
   providers.py          unified LLM streaming over gemini/anthropic/openai/
                         ollama/portkey
   ollama.py             host-side ollama server detect/start/stop + model check
@@ -57,7 +61,6 @@ src/gerbil/
                         reached via `docker exec -i`)
   session.py            append-only JSONL session recorder
   resume.py             parse a (crashed) session log back into a conversation
-  term.py               tiny ANSI color helper (respects NO_COLOR / non-TTY)
 src/lean-sandbox/
   Dockerfile            debian + elan (no default toolchain) + lean-lsp-mcp venv
 tests/                  standalone scripts (see Testing), not a pytest suite
@@ -92,7 +95,7 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
 ## Key invariants — read before changing git/sandbox logic
 
 - **The base commit is the contract.** The agent's result is `git format-patch
-  base..HEAD`. The system prompt (`agent.GIT_STATE_NOTE`) forbids the agent from
+  base..HEAD`. The system prompt (`prompts.GIT_STATE_NOTE`) forbids the agent from
   running `git reset`/`checkout`/`stash`/`init`. gerbil's own git always goes
   through `sandbox._git`, which pins `GIT_DIR`/`GIT_WORK_TREE` so a stray nested
   repo the agent creates can't hijack gerbil's bookkeeping.
@@ -106,8 +109,9 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   records — keep that property.
 - **Container uid/gid (1000) must match** `SANDBOX_UID`/`SANDBOX_GID` in
   sandbox.py and the `useradd` in the Dockerfile.
-- The terminal rendering in agent.py (`_format_tool_call` and friends) is purely
-  cosmetic — it must never change what is dispatched or recorded.
+- The terminal rendering in render.py (`format_tool_call` and friends) is purely
+  cosmetic — it must never change what is dispatched or recorded. Keep render.py
+  free of gerbil imports (it is a leaf module; agent.py calls in with real data).
 
 ## Subcommands
 

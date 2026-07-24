@@ -85,7 +85,7 @@ class Usage:
     # Prompt-cache token counts, Anthropic semantics: these are IN ADDITION to
     # input_tokens (which then covers only the uncached remainder of the prompt).
     # Total prompt size = input + cache_read + cache_write. Reads bill at ~0.1x
-    # the input rate and writes at ~1.25x (see agent.CACHE_READ_MULTIPLIER /
+    # the input rate and writes at ~1.25x (see pricing.CACHE_READ_MULTIPLIER /
     # CACHE_WRITE_MULTIPLIER). Zero for providers that cache implicitly (Gemini,
     # OpenAI) or not at all -- their caching discounts are invisible here and
     # cost estimates stay conservative.

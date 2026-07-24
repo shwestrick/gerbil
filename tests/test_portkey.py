@@ -70,7 +70,7 @@ def test_model_name() -> None:
 def test_pricing() -> None:
     """A catalog name embeds the real model name, so a unique MODEL_PRICING key
     found inside the string prices it; zero or ambiguous matches mean N/A."""
-    from gerbil.agent import MODEL_PRICING, model_pricing, pricing_match
+    from gerbil.pricing import MODEL_PRICING, model_pricing, pricing_match
 
     priced = "portkey:@vertexai-foo/anthropic.claude-opus-4-7"
     check("unique substring match found", pricing_match(priced) == "claude-opus-4-7")
@@ -454,7 +454,7 @@ def test_native_fallback() -> None:
 def test_estimate_cost() -> None:
     """Cache reads/writes bill at their multiplier of the input rate, on top of
     the uncached input and output."""
-    from gerbil.agent import estimate_cost
+    from gerbil.pricing import estimate_cost
 
     # claude-opus-4-8 prices at (5.0, 25.0) per MTok.
     check("plain input+output",

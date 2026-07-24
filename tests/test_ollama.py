@@ -11,7 +11,7 @@ Run: uv run python tests/test_ollama.py
 import os
 import types
 
-from gerbil.agent import model_pricing
+from gerbil.pricing import model_pricing
 from gerbil.ollama import (
     _server_up,
     is_ollama_model,

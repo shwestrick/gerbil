@@ -44,7 +44,7 @@ class ParsedSession:
 
 
 # Prefix of the message gerbil sends to request a commit message (see
-# agent._commit_request). Used to locate the generated commit message in a log.
+# prompts.commit_request). Used to locate the generated commit message in a log.
 _COMMIT_REQUEST_PREFIX = "The task is complete. Here is the final git diff"
 
 
