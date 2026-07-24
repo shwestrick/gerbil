@@ -167,11 +167,20 @@ class LeanSandbox:
             working_dir=WORKSPACE_DIR,
             environment={"TZ": tz} if tz else None,
         )
-        self._wait_running()
-        self._upload_project()
-        self._configure_git()
-        if self.fetch_cache:
-            self._fetch_mathlib_cache()
+        try:
+            self._wait_running()
+            self._upload_project()
+            self._configure_git()
+            if self.fetch_cache:
+                self._fetch_mathlib_cache()
+        except BaseException:
+            # A crash -- or, far more likely, a Ctrl-C during the slow startup
+            # cache fetch -- lands before the `with` body is entered, so
+            # __exit__ will never run. Without this the container outlives
+            # gerbil, running `sleep infinity` forever. BaseException on
+            # purpose: KeyboardInterrupt/SystemExit are exactly the cases.
+            self.__exit__()
+            raise
         return self
 
     @property
@@ -182,11 +191,25 @@ class LeanSandbox:
         return self._container.id
 
     def __exit__(self, *_) -> None:
-        if self._container:
+        """Stop the container (auto_remove then deletes it). Idempotent -- also
+        called from __enter__'s failure path, where the `with` body was never
+        entered. The graceful stop takes its full 5s timeout (`sleep` as PID 1
+        ignores SIGTERM), so an impatient second Ctrl-C during it is likely;
+        that falls back to an immediate kill rather than leaking the container,
+        then re-raises so the interrupt still wins."""
+        container, self._container = self._container, None
+        if container is None:
+            return
+        try:
+            container.stop(timeout=5)
+        except KeyboardInterrupt:
             try:
-                self._container.stop(timeout=5)
+                container.kill()
             except Exception:
                 pass
+            raise
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Startup helpers

@@ -37,6 +37,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from datetime import datetime
@@ -165,6 +166,18 @@ def _require_docker() -> None:
 
 
 def main() -> None:
+    # SIGTERM (kill, service managers) and SIGHUP (closed terminal) would end
+    # the process without unwinding the `with` blocks that own the sandbox
+    # container and MCP client -- the container would leak, running `sleep
+    # infinity` forever. Convert them to SystemExit so every context manager
+    # tears down on the way out; 128+N is the conventional exit code. SIGINT
+    # already arrives as KeyboardInterrupt and needs no help.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, lambda n, _frame: sys.exit(128 + n))
+        except (ValueError, OSError):
+            pass  # unsupported signal, or not the main thread
+
     parser = argparse.ArgumentParser(
         prog="gerbil",
         description="Sandboxed Lean theorem-proving agent.",
