@@ -149,15 +149,14 @@ ensure_image() {
 
 # Remove sandbox images left behind by previous versions, so updates don't
 # accumulate multi-GB images. Only launcher-built images are swept: those in
-# the gerbil-lean-sandbox repo (or the legacy pre-rename lean-sandbox repo)
-# whose tag is a 40-hex commit hash other than the current version's. A dev
-# :latest build is never touched. Images still in use by a container fail to
-# remove; that is reported and otherwise ignored.
+# the gerbil-lean-sandbox repo whose tag is a 40-hex commit hash other than
+# the current version's. A dev :latest build is never touched. Images still
+# in use by a container fail to remove; that is reported and otherwise ignored.
 remove_old_images() {
     local keep img tag
     keep="$(sandbox_image)"
     docker image ls --format '{{.Repository}}:{{.Tag}}' \
-        --filter 'reference=gerbil-lean-sandbox' --filter 'reference=lean-sandbox' \
+        --filter 'reference=gerbil-lean-sandbox' \
         2>/dev/null | while IFS= read -r img; do
         [ "$img" = "$keep" ] && continue
         tag="${img##*:}"
