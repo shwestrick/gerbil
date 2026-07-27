@@ -62,7 +62,9 @@ def test_normal_crash_at_turn_boundary() -> None:
     call_id = next(c["id"] for c in asst["content"] if c["type"] == "tool_call")
     res_id = ps.messages[2]["content"][0]["tool_use_id"]
     check("ids match across call/result", call_id == res_id, f"{call_id} vs {res_id}")
-    check("replay carries 7 events", len(ps.events) == 7, str(len(ps.events)))
+    # The replay list is the WHOLE log (session_start included), so a
+    # continuation log can carry the full original forward.
+    check("replay carries all 8 events", len(ps.events) == 8, str(len(ps.events)))
 
 
 def test_dangling_tool_call() -> None:
@@ -198,6 +200,39 @@ def test_commit_message_extraction() -> None:
     check("no commit message when crashed early", crashed.commit_message == "")
 
 
+def test_continuation_log_full_replay() -> None:
+    """A continuation log opens with its own session_start, then the parent's
+    FULL log (session_start, error and all) tagged `replayed`, then a `resumed`
+    marker, then live events. Parsing one must take its identity from the live
+    session_start, rebuild the conversation across both halves, and carry every
+    event forward (so a resume-of-a-resume replays the whole lineage)."""
+    parent = [
+        dict(START, model="parent-model"),
+        USER,
+        {"event": "turn", "role": "assistant", "content": "before the crash"},
+        {"event": "tool_call", "name": "bash", "args": {"command": "ls"}},
+        {"event": "tool_result", "name": "bash", "result": "Foo.lean"},
+        {"event": "error", "error_type": "RuntimeError", "message": "boom"},
+    ]
+    cont = (
+        [dict(START, resumed_from="gerbil-parent.jsonl")]
+        + [dict(e, replayed=True) for e in parent]
+        + [{"event": "resumed", "resumed_from": "gerbil-parent.jsonl",
+            "replayed_events": len(parent)}]
+        + [{"event": "turn", "role": "assistant", "content": "continuing"}]
+    )
+    ps = parse_session(write_log(cont))
+    check("continuation: model from the live session_start",
+          ps.model == "claude-sonnet-4-6", ps.model)
+    check("continuation: conversation spans both halves",
+          [m["role"] for m in ps.messages] == ["user", "assistant", "user",
+                                               "assistant"],
+          str([m["role"] for m in ps.messages]))
+    check("continuation: ends complete", ps.complete is True)
+    check("continuation: replay carries every event",
+          len(ps.events) == len(cont), str(len(ps.events)))
+
+
 def test_missing_session_start() -> None:
     p = write_log([USER])
     try:
@@ -216,6 +251,7 @@ def main() -> None:
     test_ralph_done_script_roundtrip()
     test_include_session_roundtrip()
     test_commit_message_extraction()
+    test_continuation_log_full_replay()
     test_missing_session_start()
     print("\nAll resume parser tests passed.")
 

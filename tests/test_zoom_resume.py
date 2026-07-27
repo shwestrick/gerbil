@@ -296,9 +296,11 @@ def test_multi_zoom_seed_isolation() -> None:
           n_assistant(ps.pending_zoom["messages"]) == 3,
           str(n_assistant(ps.pending_zoom["messages"])))
 
-    # Continuation log (a resume of a resume): the same events replayed, then
-    # the interrupted zoom continued live for 4 more turns before crashing
-    # again. The seed must span both runs of that one sub-session.
+    # Continuation log (a resume of a resume): its own session_start, the same
+    # events replayed, then the interrupted zoom continued live for 4 more
+    # turns before crashing again. The seed must span both runs of that one
+    # sub-session.
+    cont_start = dict(START, resumed_from="gerbil-parent.jsonl")
     replayed = [dict(e, replayed=True) for e in events]
     live = []
     for i in range(4):
@@ -308,7 +310,7 @@ def test_multi_zoom_seed_isolation() -> None:
              "args": {"command": "y"}},
             {"event": "tool_result", "zoom": True, "name": "bash", "result": "ok"},
         ]
-    ps2 = parse_session(write_log(replayed + live))
+    ps2 = parse_session(write_log([cont_start] + replayed + live))
     check("multi-zoom: continuation seed spans both runs of the last zoom",
           n_assistant(ps2.pending_zoom["messages"]) == 7,
           str(n_assistant(ps2.pending_zoom["messages"])))
@@ -381,11 +383,18 @@ def test_summarize_resume_accounting() -> None:
     ]
     cont_start = dict(START)
     cont_start["resumed_from"] = "gerbil-parent.jsonl"
+    # The continuation carries the parent's FULL log -- session_start and the
+    # crash's error event included -- then the `resumed` marker, then live work.
     cont_events = (
         [cont_start]
-        + [dict(e, replayed=True) for e in parent_events[1:]]
-        + [{"event": "turn", "role": "assistant", "content": "live",
-            "usage": usage}]
+        + [dict(e, replayed=True) for e in parent_events]
+        + [{"event": "error", "error_type": "RuntimeError", "message": "boom",
+            "replayed": True},
+           {"event": "resumed", "resumed_from": "gerbil-parent.jsonl",
+            "replayed_events": len(parent_events) + 1},
+           {"event": "turn", "role": "assistant", "content": "live",
+            "usage": usage},
+           {"event": "session_end", "total_usage": {}}]
     )
 
     d = Path(tempfile.mkdtemp())
@@ -403,6 +412,11 @@ def test_summarize_resume_accounting() -> None:
     check("resume accounting: replayed tokens counted",
           folded["input_tokens"] == 20 and folded["zoom_input_tokens"] == 10,
           str(folded))
+    # Folding replayed spend in must not let the parent's replayed
+    # session_start/error speak for this row: status comes from the live
+    # session_end, not the parent's crash.
+    check("resume accounting: replayed error does not mark the row errored",
+          folded["status"] == "completed", folded["status"])
 
     # Parent present: rows stay disjoint (no double count).
     both = _scan_sessions([parent, cont])

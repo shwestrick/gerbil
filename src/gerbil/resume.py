@@ -33,7 +33,12 @@ class ParsedSession:
     project_dir: str
     version: str
     messages: list = field(default_factory=list)
-    events: list = field(default_factory=list)  # turn/tool_call/tool_result, to replay
+    # EVERY event of the log, verbatim and in order (session_start, warnings,
+    # the error that killed it, ...). `gerbil resume` re-emits all of them into
+    # the continuation log (tagged `replayed`) so the new log is a complete,
+    # self-contained record of the whole session -- the crashed original never
+    # commits, so the replay is the only copy that reaches the project.
+    events: list = field(default_factory=list)
     complete: bool = False  # the convo already ended on the model (nothing pending)
     ralph: dict | None = None  # {iteration, total, chain_base, ancestors} in --ralph
     commit_message: str = ""  # the message the session generated, if it got that far
@@ -166,7 +171,7 @@ def _rebuild_messages(
                 "tool_use_id": cid,
                 "tool_call_id": cid,
             })
-        # session_start / session_end / warning / error are ignored.
+        # session_start / session_end / warning / error / resumed are ignored.
 
     # A trailing unanswered zoom_in means the crash happened inside the
     # sub-session it launched: hold it (and the same turn's already-answered
@@ -211,7 +216,16 @@ def _rebuild_messages(
 def parse_session(path: Path) -> ParsedSession:
     """Parse a session .jsonl into a ParsedSession ready to continue."""
     events = _load_events(path)
-    start = next((e for e in events if e.get("event") == "session_start"), None)
+    # The log's OWN session_start (always its first line). A continuation log
+    # also carries its parent's session_start among the replayed events; the
+    # replayed tag keeps it from masquerading as this session's identity.
+    start = next(
+        (
+            e for e in events
+            if e.get("event") == "session_start" and not e.get("replayed")
+        ),
+        None,
+    )
     if start is None:
         raise ValueError(f"{path} has no session_start event; not a session log")
 
@@ -273,7 +287,6 @@ def parse_session(path: Path) -> ParsedSession:
             None,
         )
 
-    replay = convo
     commit_message = _extract_commit_message(events)
 
     return ParsedSession(
@@ -284,7 +297,7 @@ def parse_session(path: Path) -> ParsedSession:
         project_dir=start.get("project_dir", ""),
         version=start.get("gerbil_version", "unknown"),
         messages=messages,
-        events=replay,
+        events=events,
         complete=complete,
         ralph=start.get("ralph"),
         commit_message=commit_message,

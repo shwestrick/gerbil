@@ -534,11 +534,16 @@ def _scan_session(path: Path, count_replayed: bool = False) -> dict:
         except json.JSONDecodeError:
             # A partial trailing line from an interrupted write; ignore it.
             continue
-        # Replayed events were already counted in the original session's log
-        # (when that log is present -- see count_replayed above).
-        if e.get("replayed") and not count_replayed:
-            continue
         event = e.get("event")
+        # Replayed events were already counted in the original session's log
+        # (when that log is present -- see count_replayed above). Even when
+        # folding them in, only the conversation events carry countable spend:
+        # a replayed session_start/session_end/error describes the PARENT
+        # session's identity and fate, never this row's.
+        if e.get("replayed") and not (
+            count_replayed and event in ("turn", "tool_call")
+        ):
+            continue
         if event == "session_start":
             model = e.get("model", model)
             small_model = e.get("small_model", small_model)
@@ -1480,14 +1485,20 @@ def cmd_resume(args) -> None:
                             inner_max_turns if parsed.small_model else None
                         ),
                     )
-                    if mcp_warning:
-                        session.record_warning(mcp_warning)
-
                     if seeded:
-                        # Carry the pre-crash history forward so the new log is
-                        # complete (and itself resumable), then continue it.
+                        # Carry the parent log forward IN FULL -- session_start,
+                        # warnings, the error that killed it, and the whole
+                        # conversation -- so the new log is a complete record of
+                        # the session from the beginning (and itself resumable).
+                        # The crashed original never commits, so this replay is
+                        # the only copy of its history that can reach the
+                        # project's .gerbil/. A `resumed` marker then separates
+                        # the carried-over history from the live continuation.
                         for ev in parsed.events:
                             session.record_replayed(ev)
+                        session.record_resumed(
+                            resume_file.name, len(parsed.events)
+                        )
                         print(style(
                             f"resuming {resume_file.name}: base {iter_base[:12]}, "
                             f"{len(parsed.events)} events replayed, "
@@ -1496,6 +1507,10 @@ def cmd_resume(args) -> None:
                         seed_messages = parsed.messages
                     else:
                         seed_messages = None
+                    # After the replay, so a continuation's own MCP warning
+                    # lands in its live region, not amid the parent's history.
+                    if mcp_warning:
+                        session.record_warning(mcp_warning)
 
                     result = run_session(
                         sandbox, session, parsed.prompt, parsed.model, toolset,

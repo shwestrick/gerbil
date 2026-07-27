@@ -11,6 +11,15 @@ Event types:
   session_end     — written once at the bottom with totals
   warning         — non-terminal note about a recoverable problem
   error           — terminal event if the session aborts with an exception
+  resumed         — continuation logs only: the boundary between the replayed
+                    parent history and the live continuation (see below)
+
+A continuation log (written by `gerbil resume`) opens with its own
+session_start, then carries the parent log's events re-emitted verbatim with
+`"replayed": true`, then a `resumed` marker, then its live events. That makes
+the new log a complete, self-contained record of the whole session — important
+because the crashed parent never commits, so its log never reaches the
+project's .gerbil/; the replay is the only copy that does.
 
 In big-small mode, turn/tool_call/tool_result events belonging to a zoomed-in
 sub-session (the small model working on one sorry) carry `"zoom": true`. The
@@ -188,11 +197,24 @@ class Session:
         """Re-emit a prior event verbatim into this (continuation) log, tagged
         `replayed` so it is distinguishable from live activity. Used by --resume
         to make the new log self-contained (and itself resumable) by carrying the
-        full pre-crash history forward. Token totals are intentionally not touched
-        -- the replayed turns were already counted in the original session."""
+        parent log forward in full -- session_start, warnings, and the error that
+        killed it included, not just the conversation. Token totals are
+        intentionally not touched -- the replayed turns were already counted in
+        the original session."""
         e = dict(event)
         e["replayed"] = True
         self._append(e)
+
+    def record_resumed(self, resumed_from: str, replayed_events: int) -> None:
+        """Boundary marker written right after the replayed parent history:
+        everything above it (tagged `replayed`) was carried over from
+        `resumed_from`; everything below is this run's live continuation."""
+        self._append({
+            "event": "resumed",
+            "timestamp": _now(),
+            "resumed_from": resumed_from,
+            "replayed_events": replayed_events,
+        })
 
     def record_warning(self, message: str) -> None:
         """Non-terminal event noting a recoverable problem (e.g. MCP failed to

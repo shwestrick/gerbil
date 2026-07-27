@@ -158,7 +158,12 @@ a ralph chain, `git am` the recorded ancestor patches), reapply the `.wip.patch`
 replay the logged conversation, and continue. Model/prompt come from the log (so
 `gerbil resume` takes neither `--prompt` nor `--model`, and no `--ralph` — a
 resumed ralph chain continues on its own). The continuation is written as its own
-fresh, resumable log/patch. `cmd_resume` in cli.py handles it.
+fresh, resumable log/patch; that log opens with the parent log re-emitted **in
+full** (every event, tagged `"replayed": true`) followed by a `resumed` boundary
+marker, so the one log folded into the eventual commit records the whole session
+from the beginning — the crashed parent never commits, so this replay is the only
+copy of its history that reaches the project's `.gerbil/`. `cmd_resume` in cli.py
+handles it.
 
 ## Development
 
