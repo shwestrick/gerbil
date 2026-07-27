@@ -343,6 +343,18 @@ def main() -> None:
     )
     commit_p.set_defaults(func=cmd_commit)
 
+    cleanup_p = sub.add_parser(
+        "cleanup",
+        help="delete .gerbil/*.patch files whose changes are already committed "
+        "(never touches patches that have not been committed yet)",
+    )
+    cleanup_p.add_argument(
+        "--at",
+        metavar="DIRECTORY",
+        help="Path to the Lean/Lake project (a git repo). Default: current dir.",
+    )
+    cleanup_p.set_defaults(func=cmd_cleanup)
+
     summ_p = sub.add_parser(
         "summarize",
         help="report token usage, estimated cost, and tool stats across the "
@@ -475,6 +487,44 @@ def cmd_commit(args) -> None:
         f"{stale} out of date",
         "bold",
     ))
+
+
+def cmd_cleanup(args) -> None:
+    """Delete each .gerbil/gerbil-*.patch whose changes are already in the
+    repo's history -- the exact patches `gerbil commit` would skip as "already
+    committed" (matched by stable patch-id against every commit reachable from
+    HEAD).
+
+    Deletion is only ever backed by that patch-id match: a patch that has not
+    been committed -- whether it still applies cleanly or has gone stale -- is
+    left strictly alone. The archive copies in ~/.gerbil/sessions/ are never
+    touched, so a deleted patch can still be recovered from there."""
+    project_dir = _resolve_at(args.at)
+    if not project_dir.is_dir():
+        sys.exit(f"error: {project_dir} is not a directory")
+    repo_root = _require_git_repo(project_dir)
+    _require_lake_project(project_dir)
+
+    out_dir = project_dir / ".gerbil"
+    patches = sorted(out_dir.glob("gerbil-*.patch"))
+    if not patches:
+        sys.exit(f"no patches found in {out_dir}")
+
+    committed = _committed_patch_ids(repo_root)
+    removed = kept = 0
+    for patch in patches:
+        pid = _patch_id(repo_root, patch.read_text())
+        # `pid` can be None for a degenerate patch (e.g. an empty diff); that
+        # cannot be proven committed, so it is kept like anything else.
+        if pid and pid in committed:
+            print(f"{style('removing:', 'bold')} {patch.name} (already committed)")
+            patch.unlink()
+            removed += 1
+        else:
+            print(f"{style('keeping:', 'bold', 'gray')}  {patch.name} (not committed)")
+            kept += 1
+
+    print(style(f"done -- {removed} removed, {kept} kept", "bold"))
 
 
 def _scan_session(path: Path, count_replayed: bool = False) -> dict:

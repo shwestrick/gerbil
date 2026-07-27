@@ -123,6 +123,10 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   continue a crashed/interrupted session (model and prompt come from the log).
 - `gerbil commit` — `git am` the project's `.gerbil/*.patch` in order, skipping
   already-applied (by stable patch-id) and stale (non-applying) patches.
+- `gerbil cleanup` — delete the project's `.gerbil/*.patch` files whose changes
+  are already committed (same stable patch-id test as `gerbil commit`); patches
+  not yet committed are never touched, and the `~/.gerbil/sessions/` archive
+  copies are kept.
 - `gerbil summarize` — token/cost/tool/status stats across `.gerbil/*.jsonl`,
   plus a per-session table (cost, `.lean` lines +/- from the commit each log
   was folded into or its uncommitted `.patch`, running lean-code total
