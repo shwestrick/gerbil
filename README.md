@@ -77,18 +77,25 @@ stops; any non-zero exit means keep going.
 fetches its own source from GitHub on first use (requires `git`, `docker` (or
 `podman`, see below), and [`uv`](https://astral.sh/uv)):
 ```console
-$ curl -fsSL https://raw.githubusercontent.com/shwestrick/gerbil/main/bin/gerbil \
-      -o ~/.local/bin/gerbil && chmod +x ~/.local/bin/gerbil
+curl -fsSL https://raw.githubusercontent.com/shwestrick/gerbil/main/bin/gerbil \
+     -o ~/.local/bin/gerbil && chmod +x ~/.local/bin/gerbil
 ```
 The sandbox image is built automatically on the first `gerbil run` (and rebuilt
 by `gerbil update`), tagged to match the gerbil version.
+
+Managing the launcher itself:
+```console
+$ gerbil --version    # current version (commit hash)
+$ gerbil update       # update to latest main: refreshes the source, rebuilds the
+                      # image, and overwrites this launcher script in place
+```
+
+### Docker and/or Podman
 
 Docker must be usable **without sudo** (gerbil talks to the daemon via the
 Docker SDK). On Linux, add yourself to the `docker` group
 (`sudo usermod -aG docker $USER`, then re-login) or use
 [rootless Docker](https://docs.docker.com/engine/security/rootless/).
-
-### Using podman instead of Docker
 
 Where Docker isn't available, set `GERBIL_SANDBOX` to run sessions under
 [podman](https://podman.io) instead:
@@ -99,21 +106,6 @@ Everything else is unchanged: the same launcher builds the same image and runs
 the same sessions, just through `podman` (no daemon or socket service needed --
 gerbil drives podman's CLI directly). Since the image is per-runtime, the first
 `gerbil run` after switching rebuilds it.
-
-No administrator setup is required. Normally the sandbox runs as a non-root user
-(uid 1000) inside the container, which rootless podman can only map if your
-account has a `/etc/subuid` range. When it doesn't (common on shared machines
-with network accounts — check with `grep $USER /etc/subuid`), gerbil detects
-that and builds a sandbox image that runs as root *inside* the container,
-tagged `...-rootuser`. That is not a privilege increase: rootless podman maps
-container-root to your own unprivileged user on the host.
-
-Managing the launcher itself:
-```console
-$ gerbil --version    # current version (commit hash)
-$ gerbil update       # update to latest main: refreshes the source, rebuilds the
-                      # image, and overwrites this launcher script in place
-```
 
 ## API Keys and Backend Models
 
