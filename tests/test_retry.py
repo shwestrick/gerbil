@@ -36,6 +36,37 @@ class StatusError(Exception):
 
 
 def main() -> None:
+    # --- classification: transient, by exception class ---------------------
+    # A stream cut off mid-body raises a transport exception with no status code
+    # and a message matching none of the phrase markers. This is the real
+    # httpx/anthropic/portkey failure that aborted a live session; it must be
+    # retryable on class alone. Built from the real SDKs so the class names this
+    # relies on cannot drift silently.
+    import httpx
+    import openai
+
+    transport = [
+        httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        ),
+        httpx.ReadTimeout("timed out"),
+        httpx.ConnectError("connection failed"),
+        openai.APIConnectionError(request=httpx.Request("POST", "http://x")),
+        ConnectionResetError("Connection reset by peer"),
+    ]
+    for e in transport:
+        check(f"transient class: {type(e).__name__}", _is_transient_error(e), repr(e))
+
+    # ...but a real HTTP response is NOT a transport error: httpx.HTTPStatusError
+    # must stay subject to the status-code rules (permanent for a 401).
+    unauthorized = httpx.HTTPStatusError(
+        "401 Unauthorized",
+        request=httpx.Request("POST", "http://x"),
+        response=httpx.Response(401),
+    )
+    check("permanent: httpx.HTTPStatusError 401", not _is_transient_error(unauthorized))
+
     # --- classification: transient ---
     transient = [
         ServerError("503 UNAVAILABLE. {'error': {'code': 503, 'status': "

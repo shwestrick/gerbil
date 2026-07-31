@@ -136,16 +136,48 @@ _TRANSIENT_MARKERS = (
     "bad gateway", "gateway timeout", "service is currently",
     "connection reset", "connection aborted", "connection error",
     "server disconnected", "remote end closed", "timed out", "timeout",
+    "peer closed connection", "incomplete chunked read", "incomplete read",
 )
+
+# Exception CLASSES that mark a transport-level failure: the HTTP exchange never
+# completed, so no answer was produced and re-running the same turn is safe.
+# Matched by name anywhere in the exception's MRO, so agent.py needs no import of
+# httpx or any provider SDK (and picks up their subclasses for free).
+#
+# These matter because a transport failure carries no status code and its message
+# need not contain any of the phrases above -- the case that motivated this was
+# `httpx.RemoteProtocolError: peer closed connection without sending complete
+# message body (incomplete chunked read)`, a stream cut off mid-body, which
+# aborted a whole session that a retry would have carried through.
+#
+# Note what is NOT covered: httpx.HTTPStatusError is an HTTPError but not a
+# TransportError, so real HTTP responses (401, 400, ...) still fall through to
+# the status-code checks and stay permanent.
+_TRANSIENT_EXC_NAMES = {
+    "TransportError",        # httpx: connect/read/write/pool/protocol failures
+    "ProtocolError",         # httpcore / urllib3 equivalent
+    "APIConnectionError",    # openai + anthropic (APITimeoutError subclasses it)
+    "ChunkedEncodingError",  # requests: stream cut mid-chunk
+    "IncompleteRead",        # http.client: body shorter than advertised
+    "ConnectionError",       # builtin (reset/aborted/refused) and requests'
+    "TimeoutError",          # builtin, incl. socket timeouts
+}
 
 
 def _is_transient_error(exc: BaseException) -> bool:
     """Whether `exc` is a transient provider failure worth retrying (503/
-    UNAVAILABLE, rate limits, 5xx, dropped connections). Conservative: anything
-    not recognized returns False so permanent errors still abort the run."""
+    UNAVAILABLE, rate limits, 5xx, dropped or truncated connections).
+    Conservative: anything not recognized returns False so permanent errors still
+    abort the run.
+
+    Three ways an error qualifies: it is a transport-level exception class
+    (_TRANSIENT_EXC_NAMES), it carries a retryable status (_RETRYABLE_STATUS_*),
+    or its message contains a transient phrase (_TRANSIENT_MARKERS)."""
     # A malformed/empty Gemini turn surfaces as no SDK exception, only a finish
     # reason; providers.py converts it to this, which is always retryable.
     if isinstance(exc, TransientProviderError):
+        return True
+    if any(cls.__name__ in _TRANSIENT_EXC_NAMES for cls in type(exc).__mro__):
         return True
     for attr in ("status_code", "code", "http_status"):
         val = getattr(exc, attr, None)
