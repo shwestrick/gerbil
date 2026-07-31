@@ -6,15 +6,17 @@ Guidance for working in this repository.
 
 gerbil is a teensy, self-contained autonomous coding agent for **Lean 4 / Lake
 projects**. You give it a prompt describing a task (typically "prove this" or
-"fill in these `sorry`s"), and it drives a loop between an LLM and a Docker
-sandbox until the model stops requesting tools. It is inspired by
-[lea-prover](https://github.com/chinmayhegde/lea-prover) but adds Docker-based
+"fill in these `sorry`s"), and it drives a loop between an LLM and a
+containerized sandbox until the model stops requesting tools. It is inspired by
+[lea-prover](https://github.com/chinmayhegde/lea-prover) but adds container-based
 sandboxing, a git-based workflow, and built-in Ralph loops.
 
 The defining design choices:
 
-- **Sandboxed**: every session runs inside a Docker container (the
+- **Sandboxed**: every session runs inside a container (the
   `gerbil-lean-sandbox` image). The host never executes agent-authored commands.
+  The container engine is Docker by default, or podman when
+  `GERBIL_SANDBOX=podman` (see `runtime.py`).
 - **Git-native I/O**: gerbil uploads the *real* repo into the container — the
   tracked files plus a *sanitized* `.git` holding only the current branch's
   history (no other branches, tags, remotes, or reflogs: the agent sees nothing
@@ -54,11 +56,14 @@ src/gerbil/
                         ollama/portkey
   ollama.py             host-side ollama server detect/start/stop + model check
                         (local provider; reuses the OpenAI-compatible stream core)
-  sandbox.py            LeanSandbox — Docker container lifecycle + all git plumbing
+  runtime.py            container-runtime selection (GERBIL_SANDBOX=docker|podman)
+                        + the podman client (a Docker-SDK-shaped façade over the
+                        podman CLI, so sandbox.py never branches on the engine)
+  sandbox.py            LeanSandbox — container lifecycle + all git plumbing
   tools.py              built-in tools (bash/read_file/write_file/edit_file) and
                         the Toolset that merges them with MCP tools
   mcp_client.py         sync façade over the lean-lsp-mcp server (runs in-container,
-                        reached via `docker exec -i`)
+                        reached via `docker`/`podman exec -i`)
   session.py            append-only JSONL session recorder
   resume.py             parse a (crashed) session log back into a conversation
 src/lean-sandbox/
@@ -70,7 +75,8 @@ pyproject.toml          packaging; entry point is gerbil.cli:main
 ## How a run works (the core flow)
 
 1. **Preflight** (`cli.cmd_run`): require a git repo with ≥1 commit, a lakefile,
-   a clean working tree, and a reachable Docker daemon.
+   a clean working tree, and a usable container runtime (`runtime.check_available`
+   — a reachable Docker daemon, or a working `podman`).
 2. **Sandbox boot** (`sandbox.LeanSandbox.__enter__`): start the container, upload
    all git-tracked files + a sanitized single-branch `.git`
    (`sandbox._sanitized_git_dir`), configure a `gerbil` committer identity, and
@@ -108,7 +114,23 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   head+tail) and the *same* truncated text is what the model sees and what the log
   records — keep that property.
 - **Container uid/gid (1000) must match** `SANDBOX_UID`/`SANDBOX_GID` in
-  sandbox.py and the `useradd` in the Dockerfile.
+  sandbox.py and the `useradd` in the Dockerfile. Under podman it is also the
+  uid uploads end up owned by (they are unpacked by the container's own `tar`,
+  running as the image's user). The one exception is the image built with
+  `--build-arg SANDBOX_UID=0`, which runs as container-root: the launcher picks
+  it (tag suffix `-rootuser`) when rootless podman has no subuid range to map
+  uid 1000 with, and there the uploads are simply root-owned inside the
+  container. Nothing on the host is affected either way — gerbil never bind
+  mounts; files enter as a tar and leave as `git format-patch` text.
+- **Engine differences live only in runtime.py.** sandbox.py talks to one
+  Docker-SDK-shaped interface; `runtime.PodmanClient` reimplements exactly the
+  methods it uses over `podman` subprocesses. Two podman quirks are already
+  handled there and are easy to regress: podman is muzzled with
+  `--log-level=error` (its warnings otherwise land in the stderr of every tool
+  result, since `podman exec` cannot separate them), and uploads never go
+  through `podman cp -` (its stdin copier fails at particular payload sizes).
+  The image must also `mkdir` the workspace explicitly — buildah does not
+  materialize a trailing `WORKDIR`, so `podman run --workdir` would fail.
 - The terminal rendering in render.py (`format_tool_call` and friends) is purely
   cosmetic — it must never change what is dispatched or recorded. Keep render.py
   free of gerbil imports (it is a leaf module; agent.py calls in with real data).
@@ -183,6 +205,12 @@ When invoked this way (no launcher), the sandbox image defaults to
 
 ```bash
 docker build -t gerbil-lean-sandbox:latest src/lean-sandbox
+# or, with GERBIL_SANDBOX=podman:
+podman build -t gerbil-lean-sandbox:latest src/lean-sandbox
+# ...and on a host where rootless podman has no /etc/subuid range (uid 1000
+# can be neither chowned to at build time nor mapped at run time), the image
+# has to run as container-root instead:
+podman build --build-arg SANDBOX_UID=0 -t gerbil-lean-sandbox:latest src/lean-sandbox
 ```
 
 Dependencies (managed by `uv`, see pyproject.toml): `docker`, `mcp`, and all
@@ -195,7 +223,9 @@ the selected SDK at runtime. Requires Python ≥ 3.12.
 Tests are **standalone scripts**, not a pytest suite — run each directly:
 
 ```bash
-uv run python tests/smoke_test.py        # Docker plumbing (needs Docker; stubs cache)
+uv run python tests/smoke_test.py        # container plumbing (needs Docker; stubs cache)
+uv run python tests/test_runtime.py      # runtime selection + podman client (no Docker;
+                                         # live phase only if podman is installed)
 uv run python tests/test_mcp.py          # lean-lsp MCP integration (Docker; slow phase 2)
 uv run python tests/test_reconstruct.py  # reconstruct-patch end-to-end (Docker)
 uv run python tests/test_commit.py       # gerbil commit end-to-end (Docker)
@@ -213,6 +243,10 @@ GOOGLE_API_KEY=... uv run python tests/test_gemini.py   # live Gemini backend
 Most require Docker and the `gerbil-lean-sandbox` image; `test_gemini.py` needs a real
 API key. `test_ollama.py` and `test_portkey.py` need neither Docker nor a key
 (each runs a live smoke only if its backend is already reachable/configured).
+
+The container-backed tests run against whichever runtime `GERBIL_SANDBOX`
+selects, so `GERBIL_SANDBOX=podman uv run python tests/smoke_test.py` exercises
+the whole sandbox/git plumbing through podman.
 
 ## Conventions
 

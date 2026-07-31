@@ -43,6 +43,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from . import runtime
 from .agent import DEFAULT_INNER_MAX_TURNS, run_session
 from .pricing import (
     MODEL_PRICING,
@@ -131,38 +132,12 @@ def _require_clean_worktree(repo_root: Path) -> None:
         )
 
 
-_DOCKER_PERMISSION_HELP = """\
-error: cannot connect to Docker -- permission denied.
-
-Docker must be usable without sudo (gerbil talks to the daemon via the Docker
-SDK, which cannot use sudo). To fix:
-  - add yourself to the docker group:  sudo usermod -aG docker $USER
-    then log out and back in (or run: newgrp docker), and verify with:
-    docker run hello-world
-  - or set up rootless Docker: https://docs.docker.com/engine/security/rootless/"""
-
-_DOCKER_DAEMON_HELP = """\
-error: cannot connect to the Docker daemon -- is it running?
-Start it (e.g. `sudo systemctl start docker`) or open Docker Desktop, then \
-retry."""
-
-
-def _require_docker() -> None:
-    """Exit with actionable guidance unless the Docker daemon is reachable."""
-    import docker
-
-    try:
-        docker.from_env().ping()
-        return
-    except Exception as exc:
-        detail = str(exc)
-        msg = detail.lower()
-
-    if "permission denied" in msg:
-        sys.exit(_DOCKER_PERMISSION_HELP)
-    if "connect" in msg or "daemon" in msg:
-        sys.exit(_DOCKER_DAEMON_HELP)
-    sys.exit(f"error: Docker is not usable: {detail}")
+def _require_container_runtime() -> None:
+    """Exit with actionable guidance unless the selected container runtime
+    (Docker by default, podman with GERBIL_SANDBOX=podman) is usable."""
+    problem = runtime.check_available()
+    if problem:
+        sys.exit(problem)
 
 
 def main() -> None:
@@ -1145,7 +1120,7 @@ def cmd_run(args) -> None:
     repo_root = _require_git_repo(project_dir)
     _require_lake_project(project_dir)
     _require_clean_worktree(repo_root)
-    _require_docker()
+    _require_container_runtime()
     if not prompt_file.is_file():
         sys.exit(f"error: {prompt_file} is not a file")
 
@@ -1383,7 +1358,7 @@ def cmd_resume(args) -> None:
     repo_root = _require_git_repo(project_dir)
     _require_lake_project(project_dir)
     _require_clean_worktree(repo_root)
-    _require_docker()
+    _require_container_runtime()
 
     archive_dir = Path.home() / ".gerbil" / "sessions"
     archive_dir.mkdir(parents=True, exist_ok=True)
@@ -1658,7 +1633,7 @@ def cmd_reconstruct_patch(args) -> None:
     repo_root = _require_git_repo(project_dir)
     _require_lake_project(project_dir)
     _require_clean_worktree(repo_root)
-    _require_docker()
+    _require_container_runtime()
 
     archive_dir = Path.home() / ".gerbil" / "sessions"
     archive_dir.mkdir(parents=True, exist_ok=True)

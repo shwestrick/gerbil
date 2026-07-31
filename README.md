@@ -4,8 +4,8 @@
 
 A teensy tiny agent for Lean projects, inspired by
 [lea-prover](https://github.com/chinmayhegde/lea-prover), but with
-Docker-based sandboxing, a git-based workflow, and built-in support for
-Ralph loops.
+container-based sandboxing (Docker or podman), a git-based workflow, and
+built-in support for Ralph loops.
 
 gerbil sessions are self-contained and sandboxed: each session is run
 in a container and produces a git commit. The container only ever sees
@@ -74,19 +74,39 @@ stops; any non-zero exit means keep going.
 ## Setup and Install
 
 `gerbil` is a single self-contained launcher script. Put it on your `PATH`; it
-fetches its own source from GitHub on first use (requires `git`, `docker`, and
-[`uv`](https://astral.sh/uv)):
+fetches its own source from GitHub on first use (requires `git`, `docker` (or
+`podman`, see below), and [`uv`](https://astral.sh/uv)):
 ```console
 $ curl -fsSL https://raw.githubusercontent.com/shwestrick/gerbil/main/bin/gerbil \
       -o ~/.local/bin/gerbil && chmod +x ~/.local/bin/gerbil
 ```
-The sandbox Docker image is built automatically on the first `gerbil run` (and
-rebuilt by `gerbil update`), tagged to match the gerbil version.
+The sandbox image is built automatically on the first `gerbil run` (and rebuilt
+by `gerbil update`), tagged to match the gerbil version.
 
 Docker must be usable **without sudo** (gerbil talks to the daemon via the
 Docker SDK). On Linux, add yourself to the `docker` group
 (`sudo usermod -aG docker $USER`, then re-login) or use
 [rootless Docker](https://docs.docker.com/engine/security/rootless/).
+
+### Using podman instead of Docker
+
+Where Docker isn't available, set `GERBIL_SANDBOX` to run sessions under
+[podman](https://podman.io) instead:
+```console
+$ export GERBIL_SANDBOX=podman     # "docker" (the default) or "podman"
+```
+Everything else is unchanged: the same launcher builds the same image and runs
+the same sessions, just through `podman` (no daemon or socket service needed --
+gerbil drives podman's CLI directly). Since the image is per-runtime, the first
+`gerbil run` after switching rebuilds it.
+
+No administrator setup is required. Normally the sandbox runs as a non-root user
+(uid 1000) inside the container, which rootless podman can only map if your
+account has a `/etc/subuid` range. When it doesn't (common on shared machines
+with network accounts — check with `grep $USER /etc/subuid`), gerbil detects
+that and builds a sandbox image that runs as root *inside* the container,
+tagged `...-rootuser`. That is not a privilege increase: rootless podman maps
+container-root to your own unprivileged user on the host.
 
 Managing the launcher itself:
 ```console
@@ -148,7 +168,7 @@ By default, gerbil enables the
 and local declaration search (`lean_local_search`) — alongside the built-in
 `bash`/`read_file`/`write_file`/`edit_file` tools. The MCP server runs inside the
 sandbox container (where the Lean toolchain lives); gerbil connects to it over
-`docker exec`.
+`docker exec` (or `podman exec`).
 
 A few lean-lsp tools are intentionally disabled for better sandboxing:
 `lean_leansearch`, `lean_loogle`, `lean_leanfinder`, `lean_state_search`,

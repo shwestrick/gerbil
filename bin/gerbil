@@ -17,7 +17,8 @@
 #   gerbil --version                                        show current version
 #
 # The source is kept under ~/.gerbil/versions/<commit>/ and run with `uv`.
-# Requires: git, uv.
+# Requires: git, uv, and a container runtime (docker, or podman when
+# GERBIL_SANDBOX=podman).
 set -euo pipefail
 
 GERBIL_HOME="${GERBIL_HOME:-$HOME/.gerbil}"
@@ -27,6 +28,18 @@ VERSIONS_DIR="$GERBIL_HOME/versions"    # versions/<commit>/ source checkouts
 CURRENT_FILE="$GERBIL_HOME/current"     # holds the active commit hash
 
 die() { echo "gerbil: $*" >&2; exit 1; }
+
+# Container runtime: docker (default) or podman, chosen with GERBIL_SANDBOX --
+# the same variable the Python side reads (see src/gerbil/runtime.py), so the
+# image the launcher builds always lands in the engine that will run it.
+# CTR is the command prefix; podman is muzzled to errors because it warns
+# chattily (e.g. about an NFS-backed graph root) on every invocation.
+SANDBOX_RUNTIME="${GERBIL_SANDBOX:-docker}"
+case "$SANDBOX_RUNTIME" in
+    docker) CTR=(docker) ;;
+    podman) CTR=(podman --log-level=error) ;;
+    *) die "GERBIL_SANDBOX must be 'docker' or 'podman' (got '$SANDBOX_RUNTIME')" ;;
+esac
 
 ensure_repo() {
     command -v git >/dev/null || die "git is required"
@@ -66,7 +79,33 @@ bootstrap_if_needed() {
 }
 
 current_dir() { echo "$VERSIONS_DIR/$(cat "$CURRENT_FILE")"; }
-sandbox_image() { echo "gerbil-lean-sandbox:$(cat "$CURRENT_FILE")"; }
+
+# The uid the sandbox image runs as (see src/lean-sandbox/Dockerfile), and the
+# image tag that goes with it. Both are set by ensure_image, which every
+# container-using command calls first.
+SANDBOX_UID=1000
+SANDBOX_IMAGE=""
+
+# Normally the image runs as the non-root `gerbil` user, uid 1000. Rootless
+# podman can only do that if this account has a /etc/subuid range covering that
+# uid: with the single mapped uid a bare rootless setup gets, the build cannot
+# chown to 1000 and the runtime cannot map it (`crun: setresgid to '1000':
+# Invalid argument`). Rather than requiring an administrator to hand out a subuid
+# range, fall back to an image that runs as container-root -- which rootless
+# podman maps straight back to this unprivileged user, so nothing on the host
+# gains privilege. Docker and rootful podman always get the non-root image.
+detect_sandbox_uid() {
+    [ "$SANDBOX_RUNTIME" = podman ] || { echo 1000; return; }
+    [ "$("${CTR[@]}" info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = "true" ] \
+        || { echo 1000; return; }
+    if "${CTR[@]}" info \
+            --format '{{range .Host.IDMappings.UIDMap}}{{.ContainerID}}:{{.Size}} {{end}}' \
+            2>/dev/null \
+        | awk -v u=1000 '{for (i=1; i<=NF; i++) {split($i, m, ":");
+                          if (u >= m[1] && u < m[1]+m[2]) found=1}}
+                         END {exit !found}'
+    then echo 1000; else echo 0; fi
+}
 
 # Absolute path of this running launcher, following symlinks (portably -- macOS
 # readlink has no -f). This is what `gerbil update` overwrites in place.
@@ -109,7 +148,8 @@ self_update() {
 # actionable guidance. gerbil's Python side uses the Docker SDK (direct socket),
 # which cannot use sudo, so Docker must be usable unprivileged.
 check_docker() {
-    command -v docker >/dev/null || die "docker is required (https://docs.docker.com/get-docker/)"
+    command -v docker >/dev/null || die "docker is required (https://docs.docker.com/get-docker/).
+If Docker is not available, use podman instead:  export GERBIL_SANDBOX=podman"
     local err
     err="$(docker ps 2>&1 >/dev/null)" && return 0
     case "$err" in
@@ -121,11 +161,13 @@ SDK, which cannot use sudo). To fix:
   - add yourself to the docker group:  sudo usermod -aG docker \$USER
     then log out and back in (or run: newgrp docker), and verify with:
     docker run hello-world
-  - or set up rootless Docker: https://docs.docker.com/engine/security/rootless/"
+  - or set up rootless Docker: https://docs.docker.com/engine/security/rootless/
+  - or, if Docker is unavailable, use podman:  export GERBIL_SANDBOX=podman"
             ;;
         *"Cannot connect to the Docker daemon"*|*"daemon running"*)
             die "cannot connect to the Docker daemon -- is it running?
-Start it (e.g. \`sudo systemctl start docker\`) or open Docker Desktop, then retry."
+Start it (e.g. \`sudo systemctl start docker\`) or open Docker Desktop, then retry.
+If Docker is unavailable, use podman instead:  export GERBIL_SANDBOX=podman"
             ;;
         *)
             die "Docker is not usable:
@@ -134,35 +176,74 @@ $err"
     esac
 }
 
+# Podman has no daemon to reach, so `podman info` is the equivalent probe: it
+# exercises the local storage config and the rootless user-namespace setup,
+# which is where podman actually fails.
+check_podman() {
+    command -v podman >/dev/null || die "podman is required when GERBIL_SANDBOX=podman \
+(https://podman.io/docs/installation).
+Unset GERBIL_SANDBOX to use Docker instead."
+    local err
+    err="$("${CTR[@]}" info 2>&1 >/dev/null)" && return 0
+    die "podman is not usable:
+$err"
+}
+
+check_runtime() {
+    case "$SANDBOX_RUNTIME" in
+        podman) check_podman ;;
+        *)      check_docker ;;
+    esac
+}
+
 # Build the version-matched sandbox image if it isn't already present. The image
 # is tagged with the version's commit; its reference is recorded in versions/.
+# Build the version-matched sandbox image if it isn't already present, and set
+# SANDBOX_IMAGE to its tag. The tag carries the sandbox uid when it isn't the
+# usual 1000, so the two variants never get mistaken for each other.
 ensure_image() {
-    check_docker
-    local tag vdir
-    tag="$(sandbox_image)"
+    check_runtime
+    local vdir
     vdir="$(current_dir)"
-    if ! docker image inspect "$tag" >/dev/null 2>&1; then
-        echo "gerbil: building sandbox image $tag (first time for this version)..." >&2
-        docker build -t "$tag" "$vdir/src/lean-sandbox" >&2
-        echo "$tag" > "$vdir/sandbox-image"
+    SANDBOX_UID="$(detect_sandbox_uid)"
+    SANDBOX_IMAGE="gerbil-lean-sandbox:$(cat "$CURRENT_FILE")"
+    [ "$SANDBOX_UID" = 0 ] && SANDBOX_IMAGE="$SANDBOX_IMAGE-rootuser"
+    if ! "${CTR[@]}" image inspect "$SANDBOX_IMAGE" >/dev/null 2>&1; then
+        echo "gerbil: building sandbox image $SANDBOX_IMAGE (first time for this version)..." >&2
+        [ "$SANDBOX_UID" = 0 ] && echo "gerbil: rootless podman here has no subuid range for uid 1000 --\
+ building a sandbox that runs as root inside the container (still your own\
+ unprivileged user on the host)." >&2
+        "${CTR[@]}" build --build-arg "SANDBOX_UID=$SANDBOX_UID" \
+            -t "$SANDBOX_IMAGE" "$vdir/src/lean-sandbox" >&2
+        echo "$SANDBOX_IMAGE" > "$vdir/sandbox-image"
     fi
 }
 
 # Remove sandbox images left behind by previous versions, so updates don't
 # accumulate multi-GB images. Only launcher-built images are swept: those in
-# the gerbil-lean-sandbox repo whose tag is a 40-hex commit hash other than
-# the current version's. A dev :latest build is never touched. Images still
-# in use by a container fail to remove; that is reported and otherwise ignored.
+# the gerbil-lean-sandbox repo whose tag is a 40-hex commit hash (optionally
+# with the -rootuser suffix ensure_image adds) other than the current version's.
+# A dev :latest build is never touched. Images still in use by a container fail
+# to remove; that is reported and otherwise ignored. Runs after ensure_image,
+# which is what sets SANDBOX_IMAGE.
+#
+# The listing is filtered here rather than with `image ls --filter reference=`
+# because the two engines name images differently: podman stores a locally
+# built `gerbil-lean-sandbox:X` under the fully-qualified `localhost/`-prefixed
+# name, which neither matches docker's bare reference filter nor compares equal
+# to the tag we want to keep. Stripping everything up to the last "/" (the
+# registry/namespace prefix) normalizes both.
 remove_old_images() {
-    local keep img tag
-    keep="$(sandbox_image)"
-    docker image ls --format '{{.Repository}}:{{.Tag}}' \
-        --filter 'reference=gerbil-lean-sandbox' \
-        2>/dev/null | while IFS= read -r img; do
-        [ "$img" = "$keep" ] && continue
-        tag="${img##*:}"
-        echo "$tag" | grep -qE '^[0-9a-f]{40}$' || continue
-        if docker image rm "$img" >/dev/null 2>&1; then
+    local keep img name tag
+    keep="$SANDBOX_IMAGE"
+    "${CTR[@]}" image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+        | while IFS= read -r img; do
+        name="${img##*/}"
+        case "$name" in gerbil-lean-sandbox:*) ;; *) continue ;; esac
+        [ "$name" = "$keep" ] && continue
+        tag="${name##*:}"
+        echo "$tag" | grep -qE '^[0-9a-f]{40}(-rootuser)?$' || continue
+        if "${CTR[@]}" image rm "$img" >/dev/null 2>&1; then
             echo "gerbil: removed old sandbox image $img" >&2
         else
             echo "gerbil: could not remove old sandbox image $img (in use?)" >&2
@@ -195,7 +276,7 @@ case "$cmd" in
         # project) so --at defaults to it. GERBIL_CWD carries it explicitly,
         # GERBIL_SANDBOX_IMAGE selects the version-matched image, and
         # GERBIL_VERSION records the running version in the session log.
-        exec env GERBIL_CWD="$PWD" GERBIL_SANDBOX_IMAGE="$(sandbox_image)" \
+        exec env GERBIL_CWD="$PWD" GERBIL_SANDBOX_IMAGE="$SANDBOX_IMAGE" \
             GERBIL_VERSION="$(cat "$CURRENT_FILE")" \
             uv run --project "$(current_dir)" python -m gerbil run "$@"
         ;;
@@ -204,7 +285,7 @@ case "$cmd" in
         ensure_image
         shift
         # Boots a sandbox to replay + continue a session, so it needs the image.
-        exec env GERBIL_CWD="$PWD" GERBIL_SANDBOX_IMAGE="$(sandbox_image)" \
+        exec env GERBIL_CWD="$PWD" GERBIL_SANDBOX_IMAGE="$SANDBOX_IMAGE" \
             GERBIL_VERSION="$(cat "$CURRENT_FILE")" \
             uv run --project "$(current_dir)" python -m gerbil resume "$@"
         ;;
@@ -234,7 +315,7 @@ case "$cmd" in
         ensure_image
         shift
         # Replays a session's tool calls in a container, so it needs the image.
-        exec env GERBIL_CWD="$PWD" GERBIL_SANDBOX_IMAGE="$(sandbox_image)" \
+        exec env GERBIL_CWD="$PWD" GERBIL_SANDBOX_IMAGE="$SANDBOX_IMAGE" \
             GERBIL_VERSION="$(cat "$CURRENT_FILE")" \
             uv run --project "$(current_dir)" python -m gerbil reconstruct-patch "$@"
         ;;

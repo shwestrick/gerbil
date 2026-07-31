@@ -1,9 +1,10 @@
 """Synchronous client for an MCP server running inside the sandbox container.
 
-The Lean toolchain lives inside the Docker container, so the lean-lsp-mcp server
-must run there too. We connect from the host over stdio by spawning
-`docker exec -i <container> lean-lsp-mcp --transport stdio` as the MCP subprocess
-(no `-t`: a TTY would corrupt the JSON-RPC framing).
+The Lean toolchain lives inside the sandbox container, so the lean-lsp-mcp
+server must run there too. We connect from the host over stdio by spawning
+`<runtime> exec -i <container> lean-lsp-mcp --transport stdio` as the MCP
+subprocess (no `-t`: a TTY would corrupt the JSON-RPC framing), where <runtime>
+is `docker` or `podman` per GERBIL_SANDBOX (see runtime.py).
 
 The `mcp` SDK is asyncio-based but gerbil's agent loop is synchronous, so we run
 the client's event loop in a background daemon thread and submit calls to it via
@@ -24,6 +25,7 @@ from mcp.types import (
     ClientNotification,
 )
 
+from . import runtime
 from .sandbox import WORKSPACE_DIR
 from .tools import RESET_HINT, ToolResult
 
@@ -84,9 +86,12 @@ class McpClient:
     ):
         # server_params lets tests point the client at a local mock MCP server
         # over stdio; production always connects to lean-lsp-mcp in the container.
+        # ["docker"], or ["podman", "--log-level=error"] -- global flags and all.
+        cli = runtime.cli_argv()
         self._params = server_params or StdioServerParameters(
-            command="docker",
+            command=cli[0],
             args=[
+                *cli[1:],
                 "exec",
                 "-i",  # keep stdin open; NO -t (a TTY corrupts JSON-RPC framing)
                 "-w", project_path,
@@ -94,8 +99,9 @@ class McpClient:
                 sandbox.container_id,
                 "lean-lsp-mcp", "--transport", "stdio",
             ],
-            # Inherit the host environment so `docker` resolves exactly as it does
-            # for the rest of gerbil (PATH, DOCKER_HOST, contexts, ...).
+            # Inherit the host environment so the runtime CLI resolves exactly as
+            # it does for the rest of gerbil (PATH, DOCKER_HOST / CONTAINER_HOST,
+            # contexts, podman's storage config, ...).
             env=dict(os.environ),
         )
         # Kept so restart() can sweep orphaned Lean processes in the container.

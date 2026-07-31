@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import docker
+from . import runtime
 
 WORKSPACE_DIR = "/workspace/project"
 
@@ -90,6 +90,9 @@ def _sanitized_git_dir(repo_root: Path, scratch: Path) -> Path:
 
 # Must match the uid/gid of the user created in the Dockerfile, so files we
 # upload land owned by that user and git operations don't hit ownership errors.
+# (Under podman it is also the uid/gid uploads end up owned by: they are
+# unpacked by the container's own tar, running as that same user -- see
+# runtime._PodmanContainer.put_archive.)
 SANDBOX_UID = 1000
 SANDBOX_GID = 1000
 
@@ -106,10 +109,13 @@ class CommandResult:
 
 
 class LeanSandbox:
-    """Sandboxed Lean environment running inside a Docker container.
+    """Sandboxed Lean environment running inside a container.
 
-    Isolation is provided entirely by Docker. We talk to the container directly
-    via the Docker SDK: exec_run for commands, put_archive/cat for file I/O.
+    Isolation is provided entirely by the container runtime -- Docker by
+    default, or podman when GERBIL_SANDBOX=podman (see runtime.py). We talk to
+    the container directly through a Docker-SDK-shaped client: exec_run for
+    commands, put_archive/cat for file I/O. Podman is driven through its CLI
+    behind that same interface, so nothing below branches on the runtime.
 
     The Lake project need not be the git repo root: we upload the whole repo
     (rooted at repo_root) into WORKSPACE_DIR, and operate on the Lake project at
@@ -144,7 +150,7 @@ class LeanSandbox:
         self._subdir = "" if rel == "." else rel
         self.image = image
         self.fetch_cache = fetch_cache
-        self._docker = docker.from_env()
+        self._client = runtime.client()
         self._container = None
 
     @property
@@ -159,7 +165,7 @@ class LeanSandbox:
         # `date` the agent runs) match the user's wall clock instead of UTC. The
         # image ships full tzdata, so the IANA name resolves inside the container.
         tz = _host_timezone()
-        self._container = self._docker.containers.run(
+        self._container = self._client.containers.run(
             self.image,
             command="sleep infinity",
             detach=True,
@@ -185,7 +191,8 @@ class LeanSandbox:
 
     @property
     def container_id(self) -> str:
-        """The running container's id (used to `docker exec` into the sandbox)."""
+        """The running container's id (used to `docker`/`podman exec` into the
+        sandbox)."""
         if self._container is None:
             raise RuntimeError("sandbox is not running")
         return self._container.id

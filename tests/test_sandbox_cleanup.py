@@ -3,8 +3,9 @@
 The container must never outlive gerbil. The leak windows: a Ctrl-C during
 __enter__ (the slow startup cache fetch) lands before the `with` body is
 entered, so __exit__ would never run; and a second Ctrl-C during __exit__'s
-graceful 5s stop would abort teardown. Both are driven here with a fake docker
-client -- no Docker needed. Run with: uv run python tests/test_sandbox_cleanup.py
+graceful 5s stop would abort teardown. Both are driven here with a fake
+container client -- no Docker/podman needed.
+Run with: uv run python tests/test_sandbox_cleanup.py
 """
 
 from types import SimpleNamespace
@@ -40,15 +41,15 @@ class FakeContainer:
 
 
 def make_sandbox(container):
-    """A LeanSandbox wired to a fake docker client (restores docker.from_env)."""
-    orig = sandbox_mod.docker.from_env
-    sandbox_mod.docker.from_env = lambda: SimpleNamespace(
+    """A LeanSandbox wired to a fake container client (restores runtime.client)."""
+    orig = sandbox_mod.runtime.client
+    sandbox_mod.runtime.client = lambda: SimpleNamespace(
         containers=SimpleNamespace(run=lambda *a, **k: container)
     )
     try:
         return LeanSandbox(project_dir=".", fetch_cache=False)
     finally:
-        sandbox_mod.docker.from_env = orig
+        sandbox_mod.runtime.client = orig
 
 
 def test_interrupt_during_enter_stops_container() -> None:
