@@ -172,9 +172,18 @@ the built-in tools.
 
 ## Mathlib caching
 
-By default, gerbil assumes the Lake project includes Mathlib, and starts
-every sandbox session with `lake exe cache get`. Use `gerbil run --skip-cache`
-to disable the initial `lake exe cache get`.
+If the Lake project depends on Mathlib, gerbil starts every sandbox session
+with `lake exe cache get` to pull down precompiled oleans. Projects that don't
+use Mathlib skip it automatically -- `cache` is an executable Mathlib itself
+provides, so running it elsewhere just fails.
+
+Detection reads `lake-manifest.json` (which catches Mathlib arriving indirectly,
+through some other package that requires it) plus the `require`s in
+`lakefile.toml` / `lakefile.lean`. If none of those can be read, gerbil fetches
+anyway; the skip is only taken on positive evidence that Mathlib is absent.
+
+Use `gerbil run --skip-cache` to suppress the fetch for a Mathlib project too --
+faster to start, but Mathlib then rebuilds from source on first use.
 
 ## Using your own sandbox image
 

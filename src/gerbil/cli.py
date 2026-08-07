@@ -312,7 +312,8 @@ def main() -> None:
         "--skip-cache",
         action="store_true",
         help="Skip 'lake exe cache get' at startup (faster, but mathlib will "
-        "rebuild from source on first use).",
+        "rebuild from source on first use). Only relevant to projects that use "
+        "mathlib -- the fetch is skipped automatically for those that do not.",
     )
     run_p.add_argument(
         "--no-mcp",
@@ -386,7 +387,8 @@ def main() -> None:
     resume_p.add_argument(
         "--skip-cache",
         action="store_true",
-        help="Skip 'lake exe cache get' at startup.",
+        help="Skip 'lake exe cache get' at startup (skipped automatically "
+        "for projects that do not use mathlib).",
     )
     resume_p.add_argument(
         "--no-mcp",
@@ -468,7 +470,8 @@ def main() -> None:
     recon_p.add_argument(
         "--skip-cache",
         action="store_true",
-        help="Skip 'lake exe cache get' at startup.",
+        help="Skip 'lake exe cache get' at startup (skipped automatically "
+        "for projects that do not use mathlib).",
     )
     recon_p.add_argument(
         "--force",
