@@ -31,6 +31,14 @@ class FakeContainer:
     def reload(self):
         pass
 
+    def exec_run(self, cmd, demux=False, **kwargs):
+        """Enough of exec_run for the boot-time image check: report a conforming
+        image, so __enter__ reaches the part these tests are actually about."""
+        if kwargs.get("user") == "root":
+            return 0, b"0\n"
+        out = f"uid:{sandbox_mod.SANDBOX_UID}\n".encode()
+        return (0, (out, b"")) if demux else (0, out)
+
     def stop(self, timeout=None):
         self.stop_calls += 1
         if self._stop_raises:

@@ -61,7 +61,8 @@ src/gerbil/
   runtime.py            container-runtime selection (GERBIL_SANDBOX=docker|podman)
                         + the podman client (a Docker-SDK-shaped façade over the
                         podman CLI, so sandbox.py never branches on the engine)
-  sandbox.py            LeanSandbox — container lifecycle + all git plumbing
+  sandbox.py            LeanSandbox — container lifecycle, the sandbox-image
+                        compatibility check, and all git plumbing
   tools.py              built-in tools (bash/read_file/write_file/edit_file) and
                         the Toolset that merges them with MCP tools
   mcp_client.py         sync façade over the lean-lsp-mcp server (runs in-container,
@@ -115,9 +116,10 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   agent. Never reintroduce a raw copy of the host `.git`.
 - **Submodules go in whole and never come out.** gerbil supports repos that *use*
   submodules; the agent does no submodule manipulation. Contents are uploaded
-  from the host's already-initialized working tree (the sandbox has no network,
-  and gerbil never writes to the host repo — preflight refuses an uninitialized,
-  moved, or dirty submodule instead), each with a `.git` of its own built by the
+  from the host's already-initialized working tree (cloning in the container
+  would need the `.gitmodules` URLs' credentials and availability, and gerbil
+  never writes to the host repo — preflight refuses an uninitialized, moved, or
+  dirty submodule instead), each with a `.git` of its own built by the
   same `_sanitized_git_dir`. That `.git` is deliberately a real *directory* at
   `<sub>/.git` — the pre-1.7.8 layout — not the `.git/modules` + gitdir-file
   arrangement: nested submodules then need no module-path juggling. On the way
@@ -157,10 +159,10 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
 ## Subcommands
 
 - `gerbil run --prompt FILE [--model M] [--small-model M] [--zoom-max-turns N]
-  [--ralph N] [--ralph_done SCRIPT] [--max-turns N] [--skip-cache] [--no-mcp]
-  [--omit-session-log]`
-- `gerbil resume LOG [--at DIR] [--max-turns N] [--zoom-max-turns N]
-  [--skip-cache] [--no-mcp] [--ralph_done SCRIPT] [--omit-session-log]` —
+  [--ralph N] [--ralph_done SCRIPT] [--max-turns N] [--image IMAGE]
+  [--skip-cache] [--no-mcp] [--omit-session-log]`
+- `gerbil resume LOG [--at DIR] [--max-turns N] [--zoom-max-turns N] [--image
+  IMAGE] [--skip-cache] [--no-mcp] [--ralph_done SCRIPT] [--omit-session-log]` —
   continue a crashed/interrupted session (model and prompt come from the log).
 - `gerbil commit` — `git am` the project's `.gerbil/*.patch` in order, skipping
   already-applied (by stable patch-id) and stale (non-applying) patches.
@@ -172,7 +174,7 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   plus a per-session table (cost, `.lean` lines +/- from the commit each log
   was folded into or its uncommitted `.patch`, running lean-code total
   excluding `.lake`).
-- `gerbil reconstruct-patch LOG` — rebuild a `.patch` by *replaying the logged
+- `gerbil reconstruct-patch LOG [--image IMAGE]` — rebuild a `.patch` by *replaying the logged
   tool calls* (`bash`/`write_file`/`edit_file`; read-only/`lean_*` skipped) in a
   fresh sandbox, no LLM involved.
 
@@ -209,6 +211,41 @@ marker, so the one log folded into the eventual commit records the whole session
 from the beginning — the crashed parent never commits, so this replay is the only
 copy of its history that reaches the project's `.gerbil/`. `cmd_resume` in cli.py
 handles it.
+
+**Sandbox image** (`--image IMAGE`): a project may need pre-built artifacts, extra
+packages, or a pinned toolchain that gerbil's stock image does not carry, so the
+image is selectable. `cli._resolve_image` picks it, highest precedence first:
+`--image`, then `image = "..."` in `<project>/.gerbil/config.toml` (stdlib
+`tomllib`; unknown keys ignored so the file can grow), then
+`GERBIL_SANDBOX_IMAGE` (what the launcher sets to its version-matched build),
+then `gerbil-lean-sandbox:latest` for direct dev use. The project config
+deliberately outranks the environment — the launcher *always* exports
+`GERBIL_SANDBOX_IMAGE`, so a project could otherwise never state its own image.
+The resolved image is recorded on `session_start` for provenance, but `gerbil
+resume` re-resolves rather than reusing it: gerbil's own tag is version-pinned
+and the launcher's `remove_old_images` prunes superseded ones, so a recorded
+default would go stale the moment the user updates.
+
+`sandbox._check_image` vets the image at boot, between `_wait_running` and the
+upload, so a bad one fails before any work. Every problem is collected and
+reported at once (a hand-rolled image is usually wrong in several ways), from a
+single POSIX-`sh` probe — deliberately *not* `LeanSandbox.run`, which wraps
+everything in `timeout ... bash -c`, two of the very things under test. The
+contract an image must satisfy:
+
+| Requirement | Why |
+| --- | --- |
+| `sh`, `bash`, `timeout` | every `LeanSandbox.run` is `timeout N bash -c CMD` |
+| `git`, `tar`, `chown`, `id`, `mktemp` | git plumbing; podman's `put_archive` unpacks with the container's own `tar`; the post-upload `chown -R`; `--ralph_done` uses `mktemp` |
+| `lake` on `PATH` | `_fetch_mathlib_cache` and every build |
+| writable `/workspace/project` | `WORKSPACE_DIR`; podman will not create a missing `--workdir` |
+| runs as uid 1000 or 0 | uploads are tarred as `SANDBOX_UID` and `chown -R`ed to it |
+| root `exec` works | the post-upload `chown` runs with `user="root"` |
+| no `ENTRYPOINT` swallowing the command | the container runs `sleep infinity` and must stay up |
+| `lean-lsp-mcp` on `PATH` | **optional** — warns, then runs built-in tools only |
+
+`sandbox._image_problems` is a pure function over the probe output, so the whole
+matrix is testable without building deliberately-broken images.
 
 ## Development
 
@@ -252,6 +289,7 @@ uv run python tests/test_resume.py       # resume logic
 uv run python tests/test_zoom.py         # big-small inner loop + zoom schemas (no Docker)
 uv run python tests/test_zoom_resume.py  # big-small resume + summarize accounting (no Docker)
 uv run python tests/test_submodule.py    # submodule upload + containment (phase 2 needs Docker)
+uv run python tests/test_image_config.py # image selection + compatibility check (phase 2 needs Docker)
 uv run python tests/test_render.py       # terminal rendering
 uv run python tests/test_empty_turn.py   # glitched empty-turn guard + filter (no network)
 uv run python tests/test_sandbox_cleanup.py  # container cleanup on interrupt (no Docker)

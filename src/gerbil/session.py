@@ -53,6 +53,7 @@ class Session:
         include_session: bool = True,
         small_model: str | None = None,
         inner_max_turns: int | None = None,
+        image: str = "",
     ):
         self.path = path
         self.model = model
@@ -65,6 +66,7 @@ class Session:
         self.include_session = include_session
         self.small_model = small_model
         self.inner_max_turns = inner_max_turns
+        self.image = image
         self._total_input_tokens = 0
         self._total_output_tokens = 0
         self._total_thinking_tokens = 0
@@ -87,6 +89,13 @@ class Session:
             # `gerbil resume` inherits the setting without the user re-supplying it.
             "include_session": include_session,
         }
+        # The sandbox image this session ran in (--image / .gerbil/config.toml
+        # / the launcher's version-matched build). Recorded for provenance
+        # only -- unlike model and prompt, `gerbil resume` resolves the image
+        # fresh, since a recorded default tag is version-pinned and the
+        # launcher prunes superseded ones.
+        if image:
+            start["image"] = image
         if resumed_from is not None:
             start["resumed_from"] = resumed_from
         # In --ralph mode: {iteration, total, chain_base, ancestors}. chain_base

@@ -130,6 +130,70 @@ def submodule_entries(repo_root: Path, prefix: str = "") -> list[tuple[str, str]
 SANDBOX_UID = 1000
 SANDBOX_GID = 1000
 
+# Programs gerbil itself runs inside the container. bash + timeout wrap every
+# LeanSandbox.run; git is all of the bookkeeping; tar is what podman's
+# put_archive unpacks uploads with; chown reasserts ownership after an upload;
+# mktemp backs --ralph_done; lake fetches the mathlib cache and builds. Anything
+# else the agent needs is the image's business, not gerbil's.
+IMAGE_REQUIRED_PROGRAMS = ("bash", "timeout", "git", "tar", "chown", "id", "mktemp", "lake")
+
+# Probed under plain `sh`, so it must stay POSIX. Emits one token per problem
+# plus the container user's uid; _image_problems turns that into English.
+_IMAGE_PROBE = "\n".join(
+    [f'for b in {" ".join(IMAGE_REQUIRED_PROGRAMS)}; do',
+     '  command -v "$b" >/dev/null 2>&1 || echo "missing:$b"',
+     'done',
+     'command -v lean-lsp-mcp >/dev/null 2>&1 || echo "optional-missing:lean-lsp-mcp"',
+     f'if [ ! -d {WORKSPACE_DIR} ]; then echo workspace-missing',
+     f'elif [ ! -w {WORKSPACE_DIR} ]; then echo workspace-unwritable',
+     'fi',
+     'echo "uid:$(id -u 2>/dev/null)"']
+)
+
+
+def _image_problems(probe: str, root_uid: str) -> tuple[list[str], list[str]]:
+    """Turn _IMAGE_PROBE's output (and the uid a root exec reported) into
+    (fatal problems, warnings), both as human-readable sentences.
+
+    Split out as a pure function so the whole compatibility matrix is testable
+    without building deliberately-broken container images."""
+    tokens = probe.split()
+    problems, warnings = [], []
+
+    missing = [t.split(":", 1)[1] for t in tokens if t.startswith("missing:")]
+    if missing:
+        problems.append(f"missing required program(s): {', '.join(missing)}")
+    if "workspace-missing" in tokens:
+        problems.append(
+            f"{WORKSPACE_DIR} does not exist in the image -- it must be created "
+            "there (podman does not materialize a missing --workdir)"
+        )
+    if "workspace-unwritable" in tokens:
+        problems.append(f"{WORKSPACE_DIR} is not writable by the container user")
+
+    uid = next((t.split(":", 1)[1] for t in tokens if t.startswith("uid:")), "")
+    if not uid:
+        problems.append("could not determine the container user's uid")
+    elif uid not in ("0", str(SANDBOX_UID)):
+        # Uploads are tarred as SANDBOX_UID and chowned to it afterwards, so any
+        # other uid gets a workspace it cannot write to.
+        problems.append(
+            f"the image runs as uid {uid}; gerbil uploads files owned by uid "
+            f"{SANDBOX_UID}, so the image must run as uid {SANDBOX_UID} (or 0)"
+        )
+    if root_uid.strip() != "0":
+        problems.append(
+            "cannot exec as root in the container (needed once after upload, to "
+            "reassert ownership of the workspace)"
+        )
+
+    if "optional-missing:lean-lsp-mcp" in tokens:
+        warnings.append(
+            "lean-lsp-mcp is not on PATH in this image; the session will run "
+            "with gerbil's built-in tools only (no Lean LSP tools)"
+        )
+    return problems, warnings
+
 
 @dataclass
 class CommandResult:
@@ -212,6 +276,7 @@ class LeanSandbox:
         )
         try:
             self._wait_running()
+            self._check_image()
             self._upload_project()
             self._configure_git()
             if self.fetch_cache:
@@ -264,8 +329,67 @@ class LeanSandbox:
             self._container.reload()
             if self._container.status == "running":
                 return
+            # An image with an ENTRYPOINT is the usual cause: the container is
+            # started with `sleep infinity` as its *command*, which an ENTRYPOINT
+            # swallows as arguments instead of running. Say so rather than
+            # sitting out the full retry budget to report a bare timeout.
+            if self._container.status == "exited":
+                raise RuntimeError(
+                    f"sandbox container from image {self.image} exited immediately.\n"
+                    "gerbil runs the container as `sleep infinity` and drives it "
+                    "with exec, so the image must not define an ENTRYPOINT that "
+                    "swallows that command."
+                )
             time.sleep(delay)
         raise TimeoutError("sandbox container did not reach running state")
+
+    def _check_image(self) -> None:
+        """Verify the image can host a gerbil session, before any upload happens.
+
+        Custom images (--image / .gerbil/config.toml) are the reason this exists:
+        an image that is subtly wrong otherwise fails deep into a session, as an
+        unwritable upload or a missing `lake`. Every problem is collected and
+        reported at once, since a hand-rolled image is usually wrong in more than
+        one way and one round trip should say so.
+
+        Deliberately does NOT go through self.run(): that wraps everything in
+        `timeout ... bash -c`, two of the very things being checked. The probe
+        runs under plain `sh` instead, and an image without even that fails here
+        with its own message."""
+        try:
+            code, streams = self._container.exec_run(
+                ["sh", "-c", _IMAGE_PROBE], demux=True
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"image {self.image} is not usable as a gerbil sandbox: could not "
+                f"run `sh` in it ({exc})."
+            ) from exc
+        probe = (streams[0] or b"").decode(errors="replace")
+        if code != 0 and not probe.strip():
+            stderr = (streams[1] or b"").decode(errors="replace").strip()
+            raise RuntimeError(
+                f"image {self.image} is not usable as a gerbil sandbox: its `sh` "
+                f"could not run the compatibility probe.\n{stderr}"
+            )
+        # The post-upload chown runs as root; confirm that exec works at all.
+        root_code, root_out = self._container.exec_run(["id", "-u"], user="root")
+        root_uid = (root_out or b"").decode(errors="replace") if root_code == 0 else ""
+
+        problems, warnings = _image_problems(probe, root_uid)
+        if problems:
+            listed = "\n".join(f"  - {p}" for p in problems)
+            raise RuntimeError(
+                f"image {self.image} is not compatible with gerbil:\n{listed}\n\n"
+                "A sandbox image must provide bash/timeout/git/tar/chown/mktemp "
+                f"and lake, must own a writable {WORKSPACE_DIR}, and must run as "
+                f"uid {SANDBOX_UID} or 0. If this is gerbil's own image, rebuild "
+                "it (see src/lean-sandbox/Dockerfile)."
+            )
+        # Only once the image is known good -- a warning alongside a refusal is
+        # noise about a session that is not going to run.
+        for warning in warnings:
+            print(f"warning: {warning}")
 
     def _upload_project(self) -> None:
         """Upload the repository into the container: the tracked files plus a

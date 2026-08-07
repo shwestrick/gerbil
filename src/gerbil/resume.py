@@ -49,6 +49,10 @@ class ParsedSession:
     # Big-small mode (--small-model): the small model and per-zoom turn cap
     # recorded at session_start, so a resume restores them automatically.
     small_model: str | None = None
+
+    # The sandbox image recorded at session_start, for provenance. Resume
+    # does NOT reuse it -- see Session's note at the recording site.
+    image: str = ""
     inner_max_turns: int | None = None
     # Set when the log ends inside a zoomed-in sub-session (the crash happened
     # while the small model was working). The outer `messages` then end on the
@@ -304,6 +308,7 @@ def parse_session(path: Path) -> ParsedSession:
         ralph_done_script=start.get("ralph_done_script"),
         include_session=bool(start.get("include_session", False)),
         small_model=start.get("small_model"),
+        image=start.get("image", ""),
         inner_max_turns=start.get("inner_max_turns"),
         pending_zoom=pending_zoom,
     )

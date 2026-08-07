@@ -176,6 +176,41 @@ By default, gerbil assumes the Lake project includes Mathlib, and starts
 every sandbox session with `lake exe cache get`. Use `gerbil run --skip-cache`
 to disable the initial `lake exe cache get`.
 
+## Using your own sandbox image
+
+By default, gerbil builds and runs its own sandbox image. If your project needs
+something that image doesn't carry -- pre-built artifacts, extra system packages,
+a pinned toolchain, private tooling -- you can point gerbil at your own:
+
+```
+$ gerbil run --image my-lean-sandbox:v1 --prompt prompt.md
+```
+
+To make it the default for one project, write it into that project's
+`.gerbil/config.toml`:
+
+```toml
+image = "my-lean-sandbox:v1"
+```
+
+`--image` overrides the config file, and both work with `gerbil run`, `gerbil
+resume`, and `gerbil reconstruct-patch`.
+
+Your image has to fit how gerbil drives the container, so gerbil checks it at
+startup and refuses -- listing everything that's wrong at once -- rather than
+failing halfway through a session. It must:
+
+- provide `bash`, `timeout`, `git`, `tar`, `chown`, `id`, `mktemp`, and `lake`;
+- own a `/workspace/project` directory writable by the container user;
+- run as uid 1000 (or 0), since gerbil uploads files owned by uid 1000;
+- allow `exec` as root, used once after upload to fix ownership;
+- not define an `ENTRYPOINT` -- gerbil runs the container as `sleep infinity`
+  and drives it with `exec`.
+
+`lean-lsp-mcp` is optional: without it you get a warning and the session runs
+with gerbil's built-in tools only. The simplest way to satisfy all of this is to
+build `FROM` gerbil's own image (`src/lean-sandbox/Dockerfile`).
+
 ## Turn limits
 
 Use `gerbil run --max-turns N` to forcibly terminate sessions after `N` turns.

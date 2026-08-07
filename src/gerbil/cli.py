@@ -40,6 +40,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tomllib
 from datetime import datetime
 from pathlib import Path
 
@@ -136,8 +137,9 @@ def _require_clean_submodules(repo_root: Path) -> None:
     """Exit unless every submodule is initialized and clean.
 
     gerbil uploads submodule contents straight from the host's already-checked-out
-    working tree (the sandbox has no network to clone them, and initializing them
-    here would mean writing into the user's repo, which gerbil never does). So an
+    working tree: cloning them in the container would need whatever credentials
+    and remote availability the .gitmodules URLs imply, and initializing them here
+    would mean writing into the user's repo, which gerbil never does. So an
     uninitialized submodule is simply not something we can populate, and a dirty
     or moved one would put contents in the container that do not match the commit
     the session builds on.
@@ -184,6 +186,42 @@ def _require_clean_submodules(repo_root: Path) -> None:
     if dirty:
         lines.append("  # then commit or stash the changes inside the submodule(s)")
     sys.exit("\n".join(lines))
+
+
+DEFAULT_SANDBOX_IMAGE = "gerbil-lean-sandbox:latest"
+
+
+def _resolve_image(args, project_dir: Path) -> str:
+    """The container image this run should use, highest precedence first:
+
+      1. --image on the command line
+      2. `image = "..."` in <project>/.gerbil/config.toml
+      3. GERBIL_SANDBOX_IMAGE -- what the launcher sets to its version-matched
+         build, so gerbil's own image stays the default
+      4. the dev fallback, for `uv run python -m gerbil ...` with no launcher
+
+    A project config outranks the environment on purpose: the launcher always
+    exports GERBIL_SANDBOX_IMAGE, so a project that needs its own image could
+    otherwise never express it."""
+    if getattr(args, "image", None):
+        return args.image
+
+    config = project_dir / ".gerbil" / "config.toml"
+    if config.exists():
+        try:
+            settings = tomllib.loads(config.read_text())
+        except (tomllib.TOMLDecodeError, OSError) as exc:
+            sys.exit(f"error: could not read {config}:\n  {exc}")
+        image = settings.get("image")
+        if image is not None:
+            if not isinstance(image, str) or not image.strip():
+                sys.exit(
+                    f"error: `image` in {config} must be a non-empty string "
+                    f"(got {image!r})."
+                )
+            return image
+
+    return os.environ.get("GERBIL_SANDBOX_IMAGE", DEFAULT_SANDBOX_IMAGE)
 
 
 def _require_container_runtime() -> None:
@@ -266,6 +304,11 @@ def main() -> None:
         help="Safety cap on agent turns (default: unlimited, runs until done).",
     )
     run_p.add_argument(
+        "--image",
+        metavar="IMAGE",
+        help="Container image for the sandbox (default: gerbil's own gerbil-lean-sandbox). Overrides `image` in .gerbil/config.toml. The image must satisfy gerbil's execution model; it is checked at startup.",
+    )
+    run_p.add_argument(
         "--skip-cache",
         action="store_true",
         help="Skip 'lake exe cache get' at startup (faster, but mathlib will "
@@ -334,6 +377,11 @@ def main() -> None:
         "cap recorded in the log is reused). Only applies to a big-small "
         "(--small-model) session; the small model itself always comes from "
         "the log, like the model and prompt.",
+    )
+    resume_p.add_argument(
+        "--image",
+        metavar="IMAGE",
+        help="Container image for the sandbox (default: gerbil's own gerbil-lean-sandbox). Overrides `image` in .gerbil/config.toml. The image must satisfy gerbil's execution model; it is checked at startup.",
     )
     resume_p.add_argument(
         "--skip-cache",
@@ -411,6 +459,11 @@ def main() -> None:
         metavar="DIRECTORY",
         help="Path to the Lean/Lake project (a git repo). Default: the project "
         "recorded in the session.",
+    )
+    recon_p.add_argument(
+        "--image",
+        metavar="IMAGE",
+        help="Container image for the sandbox (default: gerbil's own gerbil-lean-sandbox). Overrides `image` in .gerbil/config.toml. The image must satisfy gerbil's execution model; it is checked at startup.",
     )
     recon_p.add_argument(
         "--skip-cache",
@@ -1198,9 +1251,7 @@ def cmd_run(args) -> None:
         # In --ralph mode, number the per-session output files; otherwise a single set.
         return f"gerbil-{timestamp}-{i:0{width}d}" if args.ralph else f"gerbil-{timestamp}"
 
-    # The launcher builds a version-matched image and passes its tag here; fall
-    # back to the default for direct dev use (uv run python -m gerbil ...).
-    image = os.environ.get("GERBIL_SANDBOX_IMAGE", "gerbil-lean-sandbox:latest")
+    image = _resolve_image(args, project_dir)
 
     session = None  # the in-flight session, for the error handler below
     try:
@@ -1267,6 +1318,7 @@ def cmd_run(args) -> None:
                         inner_max_turns=(
                             inner_max_turns if args.small_model else None
                         ),
+                        image=image,
                     )
                     if mcp_warning:
                         session.record_warning(mcp_warning)
@@ -1420,7 +1472,7 @@ def cmd_resume(args) -> None:
     archive_dir.mkdir(parents=True, exist_ok=True)
     out_dir = project_dir / ".gerbil"
     version = os.environ.get("GERBIL_VERSION", "unknown")
-    image = os.environ.get("GERBIL_SANDBOX_IMAGE", "gerbil-lean-sandbox:latest")
+    image = _resolve_image(args, project_dir)
     patch_dirs = [resume_file.parent, out_dir]  # where ancestor patches may live
 
     # Resolve the reconstruction plan. For a ralph session, the chain layers on a
@@ -1565,6 +1617,7 @@ def cmd_resume(args) -> None:
                         inner_max_turns=(
                             inner_max_turns if parsed.small_model else None
                         ),
+                        image=image,
                     )
                     if seeded:
                         # Carry the parent log forward IN FULL -- session_start,
@@ -1695,7 +1748,7 @@ def cmd_reconstruct_patch(args) -> None:
     archive_dir = Path.home() / ".gerbil" / "sessions"
     archive_dir.mkdir(parents=True, exist_ok=True)
     out_dir = project_dir / ".gerbil"
-    image = os.environ.get("GERBIL_SANDBOX_IMAGE", "gerbil-lean-sandbox:latest")
+    image = _resolve_image(args, project_dir)
     patch_dirs = [session_file.parent, out_dir]
 
     anchor, ancestor_patches = _reconstruct_anchor(
