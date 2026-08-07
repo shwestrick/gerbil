@@ -27,6 +27,8 @@ def check(label: str, ok: bool, detail: str = "") -> None:
 class FakeSandbox:
     """The bits of LeanSandbox that _run_zoom touches."""
 
+    submodule_paths: list[str] = []
+
     def read_file(self, path: str) -> str:
         return "theorem foo : True := by sorry\n"
 

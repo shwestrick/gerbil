@@ -291,7 +291,8 @@ def _run_zoom(
     # it has no zoom_in). Everything zoom-specific lives in the task prompt the
     # big model supplied.
     system = build_system_prompt(
-        bool(toolset.mcp_tool_names()), base_commit=session.base_commit
+        bool(toolset.mcp_tool_names()), base_commit=session.base_commit,
+        submodules=sandbox.submodule_paths,
     )
     tools = toolset.schemas(zoom="inner")
     max_context = get_context_window(small_model, provider)
@@ -520,6 +521,7 @@ def run_session(
         bool(toolset.mcp_tool_names()), ralph=toolset.ralph,
         base_commit=session.base_commit,
         zoom_in_available=small_model is not None,
+        submodules=sandbox.submodule_paths,
     )
     tools = toolset.schemas(zoom="outer" if small_model is not None else None)
 

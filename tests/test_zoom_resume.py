@@ -187,6 +187,7 @@ def test_mid_zoom_continuation() -> None:
     ps = parse_session(write_log(OUTER_PREFIX + inner_partial))
 
     class FakeSandbox:
+        submodule_paths = []
         def read_file(self, path):
             return ""
         def get_diff(self):

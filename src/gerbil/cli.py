@@ -51,7 +51,7 @@ from .pricing import (
     model_pricing,
     pricing_match,
 )
-from .sandbox import LeanSandbox
+from .sandbox import LeanSandbox, submodule_entries
 from .session import Session
 from .render import style
 from .tools import Toolset
@@ -130,6 +130,60 @@ def _require_clean_worktree(repo_root: Path) -> None:
             "gerbil runs on top of a clean commit. Commit or stash them first:\n"
             "  git stash       # then re-run gerbil, and `git stash pop` after"
         )
+
+
+def _require_clean_submodules(repo_root: Path) -> None:
+    """Exit unless every submodule is initialized and clean.
+
+    gerbil uploads submodule contents straight from the host's already-checked-out
+    working tree (the sandbox has no network to clone them, and initializing them
+    here would mean writing into the user's repo, which gerbil never does). So an
+    uninitialized submodule is simply not something we can populate, and a dirty
+    or moved one would put contents in the container that do not match the commit
+    the session builds on.
+
+    Two checks, because they catch different things: the recorded gitlink versus
+    the submodule's actual HEAD, and the submodule's own working tree. The
+    superproject's `status --porcelain` sees the second only when .gitmodules
+    does not set `ignore`, so it cannot be relied on here. Untracked files inside
+    a submodule are fine -- like the superproject's, they are simply not
+    uploaded."""
+    uninitialized, moved, dirty = [], [], []
+    for sub, sha in submodule_entries(repo_root):
+        path = repo_root / sub
+        if not (path / ".git").exists():
+            uninitialized.append(sub)
+            continue
+        head = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if head != sha:
+            moved.append(sub)
+        if subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True,
+        ).stdout.strip():
+            dirty.append(sub)
+    if not (uninitialized or moved or dirty):
+        return
+
+    lines = ["error: this repository's submodules are not in a usable state.\n"]
+    if uninitialized:
+        lines.append("  not initialized: " + ", ".join(uninitialized))
+    if moved:
+        lines.append("  checked out at a different commit than recorded: " + ", ".join(moved))
+    if dirty:
+        lines.append("  uncommitted changes: " + ", ".join(dirty))
+    lines.append(
+        "\ngerbil uploads submodule contents from your working tree, so they must\n"
+        "be present and match the commit you are running on. To fix:"
+    )
+    if uninitialized or moved:
+        lines.append("  git submodule update --init --recursive")
+    if dirty:
+        lines.append("  # then commit or stash the changes inside the submodule(s)")
+    sys.exit("\n".join(lines))
 
 
 def _require_container_runtime() -> None:
@@ -1120,6 +1174,7 @@ def cmd_run(args) -> None:
     repo_root = _require_git_repo(project_dir)
     _require_lake_project(project_dir)
     _require_clean_worktree(repo_root)
+    _require_clean_submodules(repo_root)
     _require_container_runtime()
     if not prompt_file.is_file():
         sys.exit(f"error: {prompt_file} is not a file")
@@ -1358,6 +1413,7 @@ def cmd_resume(args) -> None:
     repo_root = _require_git_repo(project_dir)
     _require_lake_project(project_dir)
     _require_clean_worktree(repo_root)
+    _require_clean_submodules(repo_root)
     _require_container_runtime()
 
     archive_dir = Path.home() / ".gerbil" / "sessions"
@@ -1633,6 +1689,7 @@ def cmd_reconstruct_patch(args) -> None:
     repo_root = _require_git_repo(project_dir)
     _require_lake_project(project_dir)
     _require_clean_worktree(repo_root)
+    _require_clean_submodules(repo_root)
     _require_container_runtime()
 
     archive_dir = Path.home() / ".gerbil" / "sessions"

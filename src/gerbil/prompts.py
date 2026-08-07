@@ -83,6 +83,26 @@ for you, so do not write it yourself.
 """
 
 
+# Appended to the system prompt when the repository contains git submodules.
+# They are uploaded fully populated so the project builds, but gerbil's output is
+# a single `git format-patch`, which can only carry a submodule's *pointer* (one
+# "Subproject commit <sha>" line), never its contents -- so nothing done inside
+# one can ever leave the sandbox, and gerbil strips such changes before emitting
+# the patch. Say so plainly, so the agent does not waste a session on work that
+# will be discarded. {paths} is a comma-separated list of the submodule paths.
+SUBMODULE_NOTE = """\
+
+This repository contains git submodules, at these paths: {paths}. Their full \
+contents are present and you can read them and build against them, but they are \
+pinned dependencies: treat them as strictly read-only. Any change you make \
+inside a submodule -- editing its files, committing in it -- CANNOT be exported \
+and will be silently discarded, so do not attempt it. Do not run any `git \
+submodule` command, do not add or remove a submodule, and do not edit \
+.gitmodules. If you conclude that the task cannot be completed without changing \
+a submodule, stop and say so in your final message instead of trying.
+"""
+
+
 # Appended to the big (outer) model's system prompt in big-small mode, when the
 # zoom_in tool is available.
 ZOOM_NOTE = """\
@@ -132,7 +152,7 @@ def zoom_task_prompt(args: dict, inner_max_turns: int) -> str:
 
 def build_system_prompt(
     has_lsp_tools: bool, ralph: bool = False, base_commit: str = "",
-    zoom_in_available: bool = False,
+    zoom_in_available: bool = False, submodules: list[str] | None = None,
 ) -> str:
     """The system prompt, with notes appended for active features."""
     prompt = SYSTEM_PROMPT
@@ -144,6 +164,8 @@ def build_system_prompt(
         prompt += ZOOM_NOTE
     if base_commit:
         prompt += GIT_STATE_NOTE.format(base=base_commit)
+    if submodules:
+        prompt += SUBMODULE_NOTE.format(paths=", ".join(submodules))
     return prompt
 
 

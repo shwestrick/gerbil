@@ -88,6 +88,40 @@ def _sanitized_git_dir(repo_root: Path, scratch: Path) -> Path:
     (clone / ".git" / "FETCH_HEAD").unlink(missing_ok=True)
     return clone / ".git"
 
+
+def submodule_entries(repo_root: Path, prefix: str = "") -> list[tuple[str, str]]:
+    """Every submodule in the repo, recursively: (path relative to repo_root,
+    the commit sha recorded for it in its parent's tree). Parents come before
+    their children -- the order the upload needs.
+
+    Read straight out of the index (mode 160000 entries) rather than parsed from
+    `git submodule status`: that keeps it NUL-safe for paths with spaces, and it
+    sees gitlinks that have no .gitmodules entry at all.
+
+    Recursion stops at an uninitialized submodule -- there is no repo there to
+    read an index from. cli._require_clean_submodules rejects those before any
+    run, so in practice callers always get the whole tree.
+
+    Returns [] for the overwhelmingly common no-submodule repo, which leaves the
+    entire submodule code path inert."""
+    out = subprocess.run(
+        ["git", "ls-files", "-s", "-z"],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        return []
+    entries: list[tuple[str, str]] = []
+    for record in out.stdout.split("\0"):
+        if not record.startswith("160000 "):
+            continue
+        # "<mode> <sha> <stage>\t<path>"
+        meta, _, path = record.partition("\t")
+        sub = prefix + path
+        entries.append((sub, meta.split(" ")[1]))
+        if (repo_root / path / ".git").exists():
+            entries.extend(submodule_entries(repo_root / path, sub + "/"))
+    return entries
+
 # Must match the uid/gid of the user created in the Dockerfile, so files we
 # upload land owned by that user and git operations don't hit ownership errors.
 # (Under podman it is also the uid/gid uploads end up owned by: they are
@@ -152,6 +186,9 @@ class LeanSandbox:
         self.fetch_cache = fetch_cache
         self._client = runtime.client()
         self._container = None
+        # Submodule paths (relative to repo_root), filled in by _upload_project.
+        # Empty for the common no-submodule repo.
+        self.submodule_paths: list[str] = []
 
     @property
     def project_path(self) -> str:
@@ -237,7 +274,11 @@ class LeanSandbox:
         Rooted at repo_root, which may be an ancestor of the Lake project. The
         working tree is required to be clean (see the CLI preflight), so the
         tracked files match HEAD and no untracked files are uploaded -- the agent
-        commits on top of a clean, known baseline."""
+        commits on top of a clean, known baseline.
+
+        Submodules are uploaded separately (_upload_submodule): git reports each
+        one here as a single gitlink entry -- a directory on disk, not a file --
+        and its contents live in a repo of its own."""
         out = subprocess.run(
             ["git", "ls-files", "-z"],
             cwd=self.repo_root,
@@ -246,15 +287,22 @@ class LeanSandbox:
         ).stdout
         rels = [p for p in out.decode().split("\0") if p]
 
+        self.submodule_paths = [p for p, _ in submodule_entries(self.repo_root)]
+        subs = set(self.submodule_paths)
+
         buf = io.BytesIO()
         with tempfile.TemporaryDirectory() as scratch:
             gitdir = _sanitized_git_dir(self.repo_root, Path(scratch))
             with tarfile.open(fileobj=buf, mode="w") as tar:
                 for rel in rels:
+                    if rel in subs:
+                        continue
                     local = self.repo_root / rel
                     if local.is_file():
                         tar.add(local, arcname=rel, filter=_own_by_sandbox)
                 tar.add(gitdir, arcname=".git", filter=_own_by_sandbox)
+                for i, sub in enumerate(self.submodule_paths):
+                    self._upload_submodule(tar, sub, Path(scratch) / f"sub{i}")
         buf.seek(0)
         self._container.put_archive(WORKSPACE_DIR, buf.getvalue())
 
@@ -265,6 +313,39 @@ class LeanSandbox:
         self._container.exec_run(
             ["chown", "-R", f"{SANDBOX_UID}:{SANDBOX_GID}", WORKSPACE_DIR],
             user="root",
+        )
+
+    def _upload_submodule(self, tar: tarfile.TarFile, sub: str, scratch: Path) -> None:
+        """Add one submodule to the upload tar: its tracked files plus a .git of
+        its own, so it lands in the container fully populated -- exactly as if
+        `git submodule update --init --recursive` had been run there, but sourced
+        from the host's already-initialized working tree, so no network is needed
+        (the sandbox has none) and nothing on the host is touched.
+
+        The .git goes in as a real *directory* at <sub>/.git, not the modern
+        gitdir-file-plus-.git/modules layout. Git still supports that (pre-1.7.8)
+        arrangement, and it keeps this simple: nested submodules need no
+        module-path juggling -- each just gets its own .git inside its own path --
+        and _sanitized_git_dir is reused verbatim, so a submodule's history is
+        stripped exactly like the superproject's (only the current commit's
+        history; no other branches, tags, remotes, or reflogs).
+
+        The submodule's own gitlink entries, if it has any, are skipped here for
+        the same reason as in _upload_project: each is uploaded by its own pass."""
+        root = self.repo_root / sub
+        out = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True
+        ).stdout
+        for rel in (p for p in out.decode().split("\0") if p):
+            local = root / rel
+            if local.is_file():
+                tar.add(
+                    local, arcname=posixpath.join(sub, rel), filter=_own_by_sandbox
+                )
+        tar.add(
+            _sanitized_git_dir(root, scratch),
+            arcname=posixpath.join(sub, ".git"),
+            filter=_own_by_sandbox,
         )
 
     def _configure_git(self) -> None:
@@ -280,6 +361,25 @@ class LeanSandbox:
         # otherwise the agent's first `git status` would show every file as a
         # staged deletion plus an untracked file.
         self._git("read-tree HEAD")
+
+        for sub in self.submodule_paths:
+            # Same story one level down: each uploaded submodule .git was built
+            # by fetch, so it has no index either.
+            self._git_at(sub, "read-tree HEAD")
+            self.run(
+                "git config --global --add safe.directory "
+                f"{posixpath.join(WORKSPACE_DIR, sub)}"
+            )
+        if self.submodule_paths:
+            # Present submodules to the agent as pinned, fixed dependencies: this
+            # keeps `git status` clean and stops `git add -A` from staging a moved
+            # gitlink if the agent commits inside one. It is only the polite half
+            # of the rule the system prompt states -- _reset_submodule_state is
+            # what actually guarantees no submodule change ever reaches a patch.
+            # Repo-wide, so it needs no submodule names and covers nested ones.
+            self._git("config diff.ignoreSubmodules all")
+            for sub in self.submodule_paths:
+                self._git_at(sub, "config diff.ignoreSubmodules all")
 
     def _fetch_mathlib_cache(self) -> None:
         """Download precompiled mathlib oleans. Runs once per session."""
@@ -381,13 +481,24 @@ class LeanSandbox:
         every later command run from there -- so gerbil's diff/commit/format-patch
         would silently operate on the wrong repository. Setting GIT_DIR and
         GIT_WORK_TREE explicitly makes gerbil's own git immune to that."""
-        return f"GIT_DIR={posixpath.join(WORKSPACE_DIR, '.git')} GIT_WORK_TREE={WORKSPACE_DIR}"
+        return self._git_env_at("")
+
+    def _git_env_at(self, sub: str) -> str:
+        """_git_env, scoped to a submodule (sub == "" is the repo itself). Every
+        repo gerbil touches in the container gets the same pinned-env treatment,
+        submodules included."""
+        root = posixpath.join(WORKSPACE_DIR, sub) if sub else WORKSPACE_DIR
+        return f"GIT_DIR={posixpath.join(root, '.git')} GIT_WORK_TREE={root}"
 
     def _git(self, args: str, timeout: float = 60.0) -> CommandResult:
         """Run a git command against gerbil's real repository (see _git_env). All
         of gerbil's internal git -- never the agent's bash tool -- goes through
         here, so the agent cannot redirect gerbil's bookkeeping to a stray repo."""
         return self.run(f"{self._git_env} git {args}", timeout=timeout)
+
+    def _git_at(self, sub: str, args: str, timeout: float = 60.0) -> CommandResult:
+        """_git, against one of the repo's submodules."""
+        return self.run(f"{self._git_env_at(sub)} git {args}", timeout=timeout)
 
     # ------------------------------------------------------------------
     # Output
@@ -413,6 +524,49 @@ class LeanSandbox:
         self._git("add -A")
         return self._git(f"diff --cached {_quote(base)}").stdout
 
+    def _listing(self, args: str) -> list[tuple[str, str]]:
+        """(mode, path) for every entry of a `ls-files -s -z` / `ls-tree -r -z`
+        listing -- both put the mode first and the path after a tab. -z keeps
+        paths literal (git would otherwise quote unusual ones)."""
+        entries = []
+        for record in self._git(args).stdout.split("\0"):
+            meta, tab, path = record.partition("\t")
+            if tab:
+                entries.append((meta.split(" ", 1)[0], path))
+        return entries
+
+    def _reset_submodule_state(self, base: str) -> None:
+        """Undo, in the index only, anything the agent did to a submodule:
+        restore every gitlink to the commit `base` records, drop any gitlink base
+        did not have, and restore .gitmodules (editing it is submodule
+        manipulation too).
+
+        This is what makes "the agent does no submodule manipulation" a guarantee
+        rather than a request, and it has to be enforced rather than asked for,
+        because a patch cannot carry submodule work in the first place:
+        format-patch renders a gitlink as a single `Subproject commit <sha>` line,
+        and commits the agent makes inside a submodule live only in this container
+        and die with it. Exporting a moved gitlink would yield a patch that
+        `git am` applies happily and that leaves the user's repo pointing at a
+        commit existing nowhere -- breaking only much later, at someone else's
+        `git submodule update`.
+
+        Index-only on purpose: `git reset <tree-ish> -- <path>` does not touch the
+        working tree, so whatever the agent wrote inside a submodule stays on disk
+        for the rest of the session. Paths absent from base are dropped from the
+        index outright, which is exactly right for a submodule the agent added.
+
+        A no-op on a repo with no gitlinks in either the index or base."""
+        index = self._listing("ls-files -s -z")
+        tree = self._listing(f"ls-tree -r -z {_quote(base)}")
+        paths = sorted({p for mode, p in index + tree if mode == "160000"})
+        if not paths:
+            return
+        if any(p == ".gitmodules" for _, p in index + tree):
+            paths.append(".gitmodules")
+        spec = " ".join(_quote(p) for p in paths)
+        self._git(f"reset -q {_quote(base)} -- {spec}")
+
     def squash_commit(self, base: str, message: str) -> bool:
         """Collapse everything from `base` to the current working tree -- the
         agent's intermediate commits AND its uncommitted changes -- into a SINGLE
@@ -422,6 +576,10 @@ class LeanSandbox:
         Stages the full working tree, soft-resets HEAD back to base (which keeps
         that staged state), and commits once."""
         self._git("add -A")
+        # Before the emptiness check, not after: a session whose only change was
+        # to a submodule has, after this, changed nothing at all, and must be
+        # reported as such rather than producing an empty patch.
+        self._reset_submodule_state(base)
         if self._git(f"diff --cached --quiet {_quote(base)}").exit_code == 0:
             return False  # working tree identical to base -> nothing to commit
         reset = self._git(f"reset --soft {_quote(base)}")
@@ -449,6 +607,7 @@ class LeanSandbox:
         the result onto a clean `base` (git apply / git am) reproduces the full
         tree. Returns "" when nothing differs from base."""
         self._git("add -A")
+        self._reset_submodule_state(base)
         tree = self._git("write-tree").stdout.strip()
         if not tree:
             return ""

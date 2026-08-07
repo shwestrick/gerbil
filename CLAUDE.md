@@ -24,7 +24,9 @@ The defining design choices:
   a single commit and emits a `git format-patch` (`.patch`). Nothing touches the
   host repo until the user runs `gerbil commit` (`git am`). The agent's output is
   read *purely* as `git format-patch <base>..HEAD` — anything not reachable from
-  that range is lost.
+  that range is lost. Submodules are uploaded fully populated so the project
+  builds, but are read-only to the agent: a patch cannot carry submodule work, so
+  gerbil strips any submodule change before emitting one (see the invariants).
 - **Provider-agnostic**: one unified streaming interface over Gemini, Anthropic,
   OpenAI, ollama (local models, `--model ollama:<NAME>`), and Portkey AI
   gateways (`--model portkey:<MODEL>` or a bare `@provider/model` catalog name;
@@ -75,11 +77,13 @@ pyproject.toml          packaging; entry point is gerbil.cli:main
 ## How a run works (the core flow)
 
 1. **Preflight** (`cli.cmd_run`): require a git repo with ≥1 commit, a lakefile,
-   a clean working tree, and a usable container runtime (`runtime.check_available`
-   — a reachable Docker daemon, or a working `podman`).
+   a clean working tree, submodules (if any) initialized and clean
+   (`cli._require_clean_submodules`), and a usable container runtime
+   (`runtime.check_available` — a reachable Docker daemon, or a working `podman`).
 2. **Sandbox boot** (`sandbox.LeanSandbox.__enter__`): start the container, upload
    all git-tracked files + a sanitized single-branch `.git`
-   (`sandbox._sanitized_git_dir`), configure a `gerbil` committer identity, and
+   (`sandbox._sanitized_git_dir`), upload each submodule fully populated
+   (`sandbox._upload_submodule`), configure a `gerbil` committer identity, and
    `lake exe cache get` (skip with `--skip-cache`).
 3. **MCP start** (`cli._start_mcp`): launch lean-lsp-mcp inside the container; on
    failure, warn and continue with built-in tools only. The network-backed search
@@ -109,6 +113,21 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   by `sandbox._sanitized_git_dir` — a fetch of HEAD into a fresh repo, so no
   other branches, tags, remotes, reflogs, or unreachable objects reach the
   agent. Never reintroduce a raw copy of the host `.git`.
+- **Submodules go in whole and never come out.** gerbil supports repos that *use*
+  submodules; the agent does no submodule manipulation. Contents are uploaded
+  from the host's already-initialized working tree (the sandbox has no network,
+  and gerbil never writes to the host repo — preflight refuses an uninitialized,
+  moved, or dirty submodule instead), each with a `.git` of its own built by the
+  same `_sanitized_git_dir`. That `.git` is deliberately a real *directory* at
+  `<sub>/.git` — the pre-1.7.8 layout — not the `.git/modules` + gitdir-file
+  arrangement: nested submodules then need no module-path juggling. On the way
+  out, `sandbox._reset_submodule_state` restores every gitlink (and
+  `.gitmodules`) to its base state in the index before `squash_commit` and
+  `wip_patch` snapshot the tree, so no submodule change can reach a patch. This
+  is enforced, not merely asked for in `prompts.SUBMODULE_NOTE`, because a patch
+  *cannot* carry submodule work: format-patch renders a gitlink as one
+  `Subproject commit <sha>` line, the objects behind it die with the container,
+  and `git am` would silently commit a pointer to a commit that exists nowhere.
 - **Built-in tool names win** over colliding MCP tool names (today none collide).
 - **Tool output is truncated once** (`tools.truncate_tool_output`, 10k chars,
   head+tail) and the *same* truncated text is what the model sees and what the log
@@ -232,6 +251,7 @@ uv run python tests/test_commit.py       # gerbil commit end-to-end (Docker)
 uv run python tests/test_resume.py       # resume logic
 uv run python tests/test_zoom.py         # big-small inner loop + zoom schemas (no Docker)
 uv run python tests/test_zoom_resume.py  # big-small resume + summarize accounting (no Docker)
+uv run python tests/test_submodule.py    # submodule upload + containment (phase 2 needs Docker)
 uv run python tests/test_render.py       # terminal rendering
 uv run python tests/test_empty_turn.py   # glitched empty-turn guard + filter (no network)
 uv run python tests/test_sandbox_cleanup.py  # container cleanup on interrupt (no Docker)
