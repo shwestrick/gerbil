@@ -51,10 +51,12 @@ src/gerbil/
   agent.py              the agent loop (run_session) and transient-error retry
   prompts.py            system/task prompt text + build_system_prompt
   pricing.py            MODEL_PRICING table and cost estimation (N/A when unknown)
-  context_windows.py    CONTEXT_WINDOWS table — the static fallback for when a
-                        provider won't report its own context window (snapshot
-                        of benchlm.ai/llm-pricing; consulted only after the live
-                        query fails)
+  context_windows.py    everything about a model's context window: the static
+                        CONTEXT_WINDOWS table (snapshot of benchlm.ai/llm-pricing)
+                        plus ~/.gerbil/context-windows.jsonl, the append-only log
+                        of what providers have actually reported. Resolution is
+                        live query > observation > table; table_drift compares
+                        the last two
   model_match.py        table_match — the one rule both tables are keyed by
                         (longest substring match, but only when it subsumes the
                         others; ambiguity -> None). A leaf module.
@@ -144,6 +146,13 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   subsumes the rest; callers then report N/A rather than invent a figure. Keep
   new entries API-ID-shaped, and never hand-enter a value the upstream snapshot
   doesn't list — it would silently survive every refresh.
+- **The context-window observation log records changes, not runs.**
+  `record_observation` appends to `~/.gerbil/context-windows.jsonl` only when the
+  value differs from the last one logged for that model, so a model whose window
+  never moves has exactly one line ever and the log stays readable as a history.
+  It is append-only (last line wins) like a session log, and every read is
+  failure-tolerant — a corrupt line is skipped and an unwritable home costs the
+  observation, never the session.
 - **Built-in tool names win** over colliding MCP tool names (today none collide).
 - **Tool output is truncated once** (`tools.truncate_tool_output`, 10k chars,
   head+tail) and the *same* truncated text is what the model sees and what the log

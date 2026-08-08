@@ -99,28 +99,27 @@ def get_context_window(model: str, provider: str | None = None) -> int | None:
     -- and those used to report nothing, leaving the session banner and the
     context-usage line with no denominator.
 
-    So a live answer falls back to the static snapshot in context_windows.py.
-    Only in that order: the table can go stale, and a stale number is worth
-    having only when the alternative is no number. It matches on the model
-    string itself, which is what lets a Portkey catalog name (whose embedded
-    model gerbil can't ask about) resolve at all.
+    Every live answer is logged to context_windows.OBSERVATIONS_PATH, so a model
+    queried once stays known afterwards. When the query can't be made, that log
+    answers first and the static table only after it -- gerbil's own observation
+    of a provider outranks a snapshot of a third-party site. See
+    context_windows.known_window.
 
     Cached, so a --ralph chain queries at most once; never raises (any failure
-    -> the table, then None)."""
-    from .context_windows import context_window
+    -> what gerbil already knows, then None)."""
+    from .context_windows import known_window, record_observation
 
     try:
         provider = provider or detect_provider(model)
     except ValueError:
-        return context_window(model)
+        return known_window(model)
     try:
+        limit = None
         if provider == "gemini":
             from google import genai
 
             client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
             limit = getattr(client.models.get(model=model), "input_token_limit", None)
-            if limit:
-                return int(limit)
         elif provider == "anthropic":
             import anthropic
 
@@ -128,11 +127,12 @@ def get_context_window(model: str, provider: str | None = None) -> int | None:
                 api_key=os.environ["ANTHROPIC_API_KEY"], **_timeout_kwargs()
             )
             limit = getattr(client.models.retrieve(model), "max_input_tokens", None)
-            if limit:
-                return int(limit)
+        if limit:
+            record_observation(model, int(limit), provider)
+            return int(limit)
     except Exception:
         pass
-    return context_window(model)
+    return known_window(model)
 
 
 @dataclass

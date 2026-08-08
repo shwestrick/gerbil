@@ -81,18 +81,49 @@ quiet for minutes while loading a model and there is no metered cache to lose.
 
 ## Context window
 
-gerbil shows how much of the model's context window a session is using. It asks
-the provider for the number first, so it can't go stale -- but only Gemini and
-Anthropic publish one. For everything else (OpenAI, gateway models, local
-ollama models) gerbil falls back to a built-in table snapshotted from
-[benchlm.ai/llm-pricing](https://benchlm.ai/llm-pricing), matched against the
-model name -- including a name buried inside a Portkey catalog string like
-`@vertexai-foo/anthropic.claude-opus-4-8`.
+gerbil shows how much of the model's context window a session is using. It
+works out the number from three sources, most trustworthy first:
 
-A model the table doesn't list, or one whose name matches several entries
-ambiguously, reports no context window at all rather than a guessed one; the
-usage line then shows raw token totals. Refresh the table from that site's
-`/api/data/pricing` endpoint (see `src/gerbil/context_windows.py`).
+1. **The provider**, asked live. Only Gemini and Anthropic publish a context
+   window; the OpenAI models endpoint doesn't, gateways don't, and a local
+   ollama model has no endpoint to ask.
+2. **`~/.gerbil/context-windows.jsonl`**, gerbil's own record of every answer
+   it has ever gotten from step 1. A model queried once stays known afterwards
+   -- on a later run with no API key, or through a gateway.
+3. **A built-in table**, snapshotted from
+   [benchlm.ai/llm-pricing](https://benchlm.ai/llm-pricing), for a model never
+   seen live.
+
+All three match against the model name, including a name buried inside a
+Portkey catalog string like `@vertexai-foo/anthropic.claude-opus-4-8` -- which
+is how an observation logged for `claude-opus-4-8` also answers for the gateway
+route to it.
+
+A model none of them covers, or one whose name matches several table entries
+ambiguously, reports no context window rather than a guessed one; the usage
+line then shows raw token totals.
+
+### The observation log
+
+Each line is one *change*: `{"timestamp", "model", "context_window",
+"provider"}`. A model whose window never moves gets one line ever, so the file
+stays a readable history of when windows actually changed rather than a
+per-run journal.
+
+When a logged observation contradicts the built-in table, every `gerbil run`
+and `gerbil resume` says so up front:
+
+```
+warning: 1 model(s) report a context window that disagrees with gerbil's built-in table:
+  claude-opus-4-8: provider says 500,000, table says 1,000,000 (last seen 2026-08-08)
+  using the provider's number; refresh CONTEXT_WINDOWS in context_windows.py to silence this
+```
+
+The warning is advisory -- gerbil already prefers the provider's number. It
+means the shipped table has gone stale, which is worth knowing because a model
+gerbil has never queried live is still being sized against it. Refresh the
+table from that site's `/api/data/pricing` endpoint (see
+`src/gerbil/context_windows.py`), or delete the log to start the history over.
 
 ## Cost
 

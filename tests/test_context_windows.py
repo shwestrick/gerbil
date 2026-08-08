@@ -112,6 +112,10 @@ def test_shared_matcher():
 
 def test_fallback_order():
     print("\n-- the live query wins; the table is only a backup --")
+    import tempfile
+
+    from gerbil import context_windows
+
     providers.get_context_window.cache_clear()
     calls = []
 
@@ -130,8 +134,13 @@ def test_fallback_order():
 
     real = anthropic.Anthropic
     old_key = os.environ.get("ANTHROPIC_API_KEY")
+    real_log = context_windows.OBSERVATIONS_PATH
+    tmp = tempfile.TemporaryDirectory()
+    # Redirect the observation log: a live query records what it learns, and a
+    # test must never write into the user's real ~/.gerbil.
+    context_windows.OBSERVATIONS_PATH = Path(tmp.name) / "context-windows.jsonl"
     # get_context_window reads the key before constructing the client, and a
-    # missing one is just another failed query -> the table.
+    # missing one is just another failed query.
     os.environ["ANTHROPIC_API_KEY"] = "test-key"
     anthropic.Anthropic = StubAnthropic
     try:
@@ -139,8 +148,13 @@ def test_fallback_order():
         # 123456 is the stub's answer; 1000000 would be the table's.
         check("provider's answer is preferred", got == 123_456, f"got {got}")
         check("provider was actually asked", calls == ["claude-opus-4-8"])
+        check(
+            "the answer was logged",
+            context_windows.observed_window("claude-opus-4-8") == 123_456,
+        )
 
-        # Now make the provider fail: the table has to cover for it.
+        # Now make the provider fail. The logged observation, not the table,
+        # is what covers for it -- that is the point of keeping the log.
         providers.get_context_window.cache_clear()
 
         class BrokenAnthropic:
@@ -149,9 +163,17 @@ def test_fallback_order():
 
         anthropic.Anthropic = BrokenAnthropic
         got = providers.get_context_window("claude-opus-4-8", "anthropic")
-        check("table covers a failed query", got == 1_000_000, f"got {got}")
+        check("a failed query falls back to the observation", got == 123_456, f"got {got}")
+
+        # With no observation either, the table is the last resort.
+        providers.get_context_window.cache_clear()
+        context_windows.OBSERVATIONS_PATH = Path(tmp.name) / "empty.jsonl"
+        got = providers.get_context_window("claude-opus-4-8", "anthropic")
+        check("table covers a failed query with no history", got == 1_000_000, f"got {got}")
     finally:
         anthropic.Anthropic = real
+        context_windows.OBSERVATIONS_PATH = real_log
+        tmp.cleanup()
         if old_key is None:
             os.environ.pop("ANTHROPIC_API_KEY", None)
         else:
@@ -177,11 +199,85 @@ def test_fallback_order():
     providers.get_context_window.cache_clear()
 
 
+def test_observation_log():
+    print("\n-- the observation log --")
+    import tempfile
+
+    from gerbil.context_windows import (
+        known_window,
+        observed_window,
+        read_observations,
+        record_observation,
+        table_drift,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "nested" / "context-windows.jsonl"
+
+        check("missing file reads as empty", read_observations(log) == {})
+        check("...and answers None", observed_window("claude-opus-4-8", log) is None)
+
+        check("first observation is recorded",
+              record_observation("claude-opus-4-8", 1_000_000, "anthropic", log))
+        check("the parent dir is created", log.is_file())
+        # The whole point of "only on change": a daily run must not add a line.
+        check("an unchanged repeat is not recorded",
+              not record_observation("claude-opus-4-8", 1_000_000, "anthropic", log))
+        check("a changed value is recorded",
+              record_observation("claude-opus-4-8", 500_000, "anthropic", log))
+        check("log has exactly the two changes",
+              len(log.read_text().strip().splitlines()) == 2,
+              log.read_text())
+        check("latest value wins", observed_window("claude-opus-4-8", log) == 500_000)
+
+        entry = read_observations(log)["claude-opus-4-8"]
+        check("entry is timestamped", entry["timestamp"].startswith("20"))
+        check("entry records the provider", entry["provider"] == "anthropic")
+
+        print("\n-- observations outrank the table --")
+        # The table says 1,000,000 for this model; the observation says otherwise.
+        check("known_window prefers the observation",
+              known_window("claude-opus-4-8", log) == 500_000)
+        check("a gateway name finds the bare id's observation",
+              observed_window("@vertexai-x/anthropic.claude-opus-4-8", log) == 500_000)
+        check("an unobserved model still falls to the table",
+              known_window("gpt-5.4", log) == 1_050_000)
+
+        print("\n-- drift detection --")
+        drift = table_drift(log)
+        check("the contradiction is reported", len(drift) == 1, str(drift))
+        check("...with both numbers",
+              drift and drift[0]["observed"] == 500_000 and drift[0]["table"] == 1_000_000)
+
+        # An observation that agrees with the table is not drift.
+        record_observation("gpt-5.4", 1_050_000, "openai", log)
+        check("agreement is not drift",
+              [d["model"] for d in table_drift(log)] == ["claude-opus-4-8"])
+
+        # Neither is filling a gap the table never covered.
+        record_observation("o3", 200_000, "openai", log)
+        check("a model absent from the table is not drift",
+              [d["model"] for d in table_drift(log)] == ["claude-opus-4-8"])
+        check("...but it is now known", known_window("o3", log) == 200_000)
+
+        print("\n-- a damaged log never takes a session down --")
+        with log.open("a") as f:
+            f.write("{not json\n\n{\"model\": \"x\"}\n")
+        check("garbage lines are skipped",
+              observed_window("claude-opus-4-8", log) == 500_000)
+        check("read_observations still works", "gpt-5.4" in read_observations(log))
+
+    # An unwritable path costs the observation, not the run.
+    check("unwritable path returns False rather than raising",
+          not record_observation("m", 1, "p", Path("/proc/nope/x.jsonl")))
+
+
 if __name__ == "__main__":
     test_table_shape()
     test_real_model_strings()
     test_family_subsumption()
     test_shared_matcher()
+    test_observation_log()
     test_fallback_order()
     print()
     if failures:

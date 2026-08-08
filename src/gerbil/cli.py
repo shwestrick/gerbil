@@ -25,6 +25,11 @@ data. The session log is also folded into the commit (and thus the patch) by
 default; pass --omit-session-log to keep it out of the commit. Either way the
 ~/.gerbil/sessions/ archive keeps the log.
 
+One more user-level file, not per-session: ~/.gerbil/context-windows.jsonl, an
+append-only record of every context window a provider has reported (see
+context_windows.py). A run compares it against the built-in table and warns
+about disagreements.
+
 With --ralph N, N sessions run back-to-back on the same prompt (reusing the
 sandbox); outputs are numbered gerbil-TIMESTAMP-NN and each session builds on
 the previous one's commit.
@@ -46,6 +51,7 @@ from pathlib import Path
 
 from . import runtime
 from .agent import DEFAULT_INNER_MAX_TURNS, run_session
+from .context_windows import OBSERVATIONS_PATH, table_drift
 from .pricing import (
     MODEL_PRICING,
     estimate_cost,
@@ -230,6 +236,38 @@ def _require_container_runtime() -> None:
     problem = runtime.check_available()
     if problem:
         sys.exit(problem)
+
+
+def _warn_context_window_drift() -> None:
+    """Warn when a provider has told gerbil a context window that contradicts
+    the static table in context_windows.py.
+
+    Every successful live query is logged, so this compares gerbil's own
+    observations against the snapshot it ships with. A mismatch means the table
+    is out of date -- and that until the model was first queried, gerbil was
+    sizing the context against a wrong denominator. Purely advisory: the
+    resolution order already prefers the observation, so nothing here changes
+    what the session does. Never raises; a warning is not worth a failed run."""
+    try:
+        drift = table_drift()
+    except Exception:
+        return
+    if not drift:
+        return
+    print(style(
+        f"warning: {len(drift)} model(s) report a context window that "
+        f"disagrees with gerbil's built-in table:", "bold", "yellow",
+    ), file=sys.stderr)
+    for d in drift:
+        seen = d["timestamp"][:10] or "unknown date"
+        print(style(
+            f"  {d['model']}: provider says {d['observed']:,}, "
+            f"table says {d['table']:,} (last seen {seen})", "yellow",
+        ), file=sys.stderr)
+    print(style(
+        "  using the provider's number; refresh CONTEXT_WINDOWS in "
+        f"context_windows.py to silence this ({OBSERVATIONS_PATH})", "gray",
+    ), file=sys.stderr)
 
 
 def main() -> None:
@@ -1232,6 +1270,7 @@ def cmd_run(args) -> None:
     _require_clean_worktree(repo_root)
     _require_clean_submodules(repo_root)
     _require_container_runtime()
+    _warn_context_window_drift()
     if not prompt_file.is_file():
         sys.exit(f"error: {prompt_file} is not a file")
 
@@ -1470,6 +1509,7 @@ def cmd_resume(args) -> None:
     _require_clean_worktree(repo_root)
     _require_clean_submodules(repo_root)
     _require_container_runtime()
+    _warn_context_window_drift()
 
     archive_dir = Path.home() / ".gerbil" / "sessions"
     archive_dir.mkdir(parents=True, exist_ok=True)

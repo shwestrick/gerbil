@@ -1,17 +1,24 @@
-"""Context-window sizes for known models -- the fallback for when the provider
-won't tell us.
+"""What gerbil knows about models' context windows: a static table, plus a log
+of what providers have actually reported.
 
-`providers.get_context_window` asks the provider's own model-info endpoint
-first, so the number can't drift out of date. But only Gemini and Anthropic
-expose one: the OpenAI models endpoint doesn't, gateways don't, and a local
-ollama model has no endpoint to ask. Those used to report nothing at all, which
-means the session banner and the context-usage line had no denominator.
+Three sources, most trustworthy first, resolved by `known_window`:
 
-This table is the backup for exactly those cases. It is a snapshot, so it *can*
-go stale -- which is why it is consulted only after the live query has failed,
-never instead of it.
+  1. A live query of the provider's model-info endpoint. Only Gemini and
+     Anthropic expose one -- the OpenAI models endpoint doesn't, a gateway
+     model isn't ours to query, and a local ollama model has no endpoint at all.
+     `providers.get_context_window` runs this, and hands every success to
+     `record_observation` below.
+  2. OBSERVATIONS_PATH -- the append-only log of those successes. A model
+     queried once stays known afterwards, even on a later run with no API key,
+     or through a gateway whose catalog name gerbil can't ask about.
+  3. CONTEXT_WINDOWS -- the static table, for a model never seen live.
 
-Source: https://benchlm.ai/llm-pricing (its `/api/data/pricing` endpoint),
+The point of the ordering is that gerbil's own observations outrank a snapshot
+somebody took months ago. When the two disagree, `table_drift` says so: the
+table is stale, and every model it's stale for was silently reporting a wrong
+denominator until now.
+
+Source of the table: https://benchlm.ai/llm-pricing (its `/api/data/pricing` endpoint),
 snapshot of August 7, 2026 -- the same source pricing.py's table comes from. To
 refresh, re-read that endpoint; `contextWindow` arrives as a display string
 ("200K", "1.05M") which is expanded to tokens here.
@@ -30,6 +37,10 @@ They report None, as they did before this table existed. Nothing is entered
 here by hand from memory -- an invented context window is worse than no
 denominator, and it would silently survive every refresh of the snapshot.
 """
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 
 from .model_match import table_match
 
@@ -251,3 +262,115 @@ def context_window(model: str) -> int | None:
     the name is ambiguous between entries). Never raises."""
     key = table_match(model, CONTEXT_WINDOWS)
     return CONTEXT_WINDOWS[key] if key is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Observations: what providers have actually reported
+# ---------------------------------------------------------------------------
+
+# Append-only JSONL, one line per *change*: {"timestamp", "model",
+# "context_window", "provider"}. Append-only for the same reason session logs
+# are -- the history is the useful part. A model whose window never moves gets
+# exactly one line ever, so this file grows only when the world does.
+OBSERVATIONS_PATH = Path.home() / ".gerbil" / "context-windows.jsonl"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def read_observations(path: Path | None = None) -> dict[str, dict]:
+    """The latest observation per model, as {model: entry}.
+
+    Last line wins, which is what makes this an append-only log rather than a
+    file to rewrite. Corrupt or half-written lines are skipped rather than
+    fatal: this is a cache of a diagnostic, and losing it must never take a
+    session down. A missing file is simply an empty history."""
+    path = path or OBSERVATIONS_PATH
+    latest: dict[str, dict] = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return latest
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+            model, window = entry["model"], entry["context_window"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        if isinstance(model, str) and isinstance(window, int):
+            latest[model] = entry
+    return latest
+
+
+def record_observation(
+    model: str, window: int, provider: str | None = None, path: Path | None = None
+) -> bool:
+    """Log that the provider reported `window` for `model`. Returns whether a
+    line was actually appended.
+
+    Only a *change* is recorded -- re-appending the same number on every run
+    would bury the one thing the log is for (when a window moved) under
+    thousands of identical lines. Never raises: an unwritable home directory
+    costs the observation, not the session."""
+    path = path or OBSERVATIONS_PATH
+    try:
+        if read_observations(path).get(model, {}).get("context_window") == window:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "timestamp": _now(),
+            "model": model,
+            "context_window": window,
+            "provider": provider,
+        }
+        with path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def observed_window(model: str, path: Path | None = None) -> int | None:
+    """The most recent provider-reported window for `model`, or None.
+
+    Matched by the same rule as the table, so an observation logged under a bare
+    API id (`claude-opus-4-8`) also answers for the gateway name that embeds it
+    (`@vertexai-foo/anthropic.claude-opus-4-8`) -- the one gerbil could never
+    have queried directly."""
+    observations = read_observations(path)
+    key = table_match(model, observations)
+    return observations[key]["context_window"] if key is not None else None
+
+
+def known_window(model: str, path: Path | None = None) -> int | None:
+    """The best context window gerbil knows for `model` without asking the
+    provider: its own most recent observation, else the static table, else None.
+
+    Observations outrank the table because they came from the provider itself,
+    and more recently than the snapshot."""
+    observed = observed_window(model, path)
+    return observed if observed is not None else context_window(model)
+
+
+def table_drift(path: Path | None = None) -> list[dict]:
+    """Models whose logged observation contradicts CONTEXT_WINDOWS, as
+    [{model, observed, table, timestamp}] sorted by model.
+
+    Only genuine contradictions count. A model the table doesn't list (or lists
+    ambiguously) isn't drift -- it's a gap the observation has filled, which is
+    the system working."""
+    drift = []
+    for model, entry in read_observations(path).items():
+        listed = context_window(model)
+        if listed is not None and listed != entry["context_window"]:
+            drift.append({
+                "model": model,
+                "observed": entry["context_window"],
+                "table": listed,
+                "timestamp": entry.get("timestamp", ""),
+            })
+    return sorted(drift, key=lambda d: d["model"])
