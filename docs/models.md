@@ -53,6 +53,32 @@ A bare catalog name beginning with `@` (for example `@anthropic/claude-opus-4-5`
 is recognized as Portkey too, so the `portkey:` prefix is optional in that
 case. `PORTKEY_BASE_URL` is only needed for a self-hosted gateway.
 
+## Stalled streams
+
+A gateway (or a proxy in front of one) can finish a response upstream and then
+sit on it, leaving gerbil's connection open but silent. gerbil gives up on a
+stream that produces nothing for **120 seconds** and retries the turn.
+
+The limit is on *silence between chunks*, not on the length of a response -- a
+turn that streams for ten minutes is fine. It is deliberately far below the
+provider SDKs' own 600s default, because the wait is not just lost time: the
+retry re-runs the same turn, and Anthropic's prompt cache expires after about
+five minutes, so a ten-minute stall guarantees the retry re-writes the whole
+conversation prefix at the cache-write premium instead of re-reading it at a
+tenth of the input rate. Catching the stall at 120s keeps the retry inside the
+cache's lifetime.
+
+`GERBIL_STREAM_TIMEOUT` overrides the number of seconds; `0` restores the SDK
+default of effectively waiting it out. The retry warning reports how long the
+failed attempt ran, so a stall is easy to tell apart from an instant `503`:
+
+```
+[provider unavailable after 120s: ReadTimeout: The read operation timed out; retrying in 5s (attempt 1)]
+```
+
+This does not apply to `ollama:` models, where a local server legitimately goes
+quiet for minutes while loading a model and there is no metered cache to lose.
+
 ## Cost
 
 gerbil prints a running token count and an estimated cost at the end of each

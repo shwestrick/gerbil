@@ -308,6 +308,7 @@ uv run python tests/test_empty_turn.py   # glitched empty-turn guard + filter (n
 uv run python tests/test_sandbox_cleanup.py  # container cleanup on interrupt (no Docker)
 uv run python tests/test_ollama.py       # ollama provider plumbing (no Docker; live smoke if a server is up)
 uv run python tests/test_portkey.py      # portkey provider plumbing (no Docker/key; live smoke if PORTKEY_API_KEY + PORTKEY_TEST_MODEL set)
+uv run python tests/test_stream_timeout.py  # stalled-stream idle timeout reaches every metered client (no network)
 GOOGLE_API_KEY=... uv run python tests/test_gemini.py   # live Gemini backend
 ```
 
@@ -326,4 +327,15 @@ the whole sandbox/git plumbing through podman.
   small focused helpers, no external formatter config.
 - Provider streaming yields a fixed event vocabulary (`TextDelta`, `ToolCall`,
   `_ToolMeta`, `Done`); keep new providers conforming to it.
+- **Every metered provider client gets `providers._timeout_kwargs()`** (or, where
+  the SDK takes no `timeout=`, an `httpx.Client` carrying `_stream_timeout()`).
+  The SDKs default to a 600s read timeout, and a stalled stream — a gateway
+  sitting on a finished response, the observed Portkey failure — is not merely
+  slow but *expensive*: `_run_turn_with_retry` re-runs the same turn, and
+  Anthropic's prompt cache expires in ~5 minutes, so a 600s stall guarantees the
+  retry re-writes the whole conversation prefix at 1.25x instead of re-reading it
+  at 0.1x. `STREAM_IDLE_TIMEOUT` (120s, `GERBIL_STREAM_TIMEOUT` to override) is
+  set to catch the stall while the cache is still alive; it bounds the *gap
+  between chunks*, never the length of a response. ollama is deliberately exempt
+  (a local server goes quiet while loading a model, and nothing is metered).
 - Session events are append-only JSONL; never rewrite a log in place.

@@ -209,6 +209,7 @@ def _run_turn_with_retry(
     BaseException, not caught here)."""
     attempt = 0
     while True:
+        started = time.monotonic()
         try:
             return _run_turn(model, system, messages, tools, provider, read_file)
         except Exception as exc:
@@ -216,9 +217,13 @@ def _run_turn_with_retry(
                 raise
             attempt += 1
             detail = _clip(f"{type(exc).__name__}: {exc}", 200)
+            # How long the failed attempt ran is the tell for *which* kind of
+            # failure this was -- an instant 503 is the provider bouncing us, but
+            # a wait that matches providers.STREAM_IDLE_TIMEOUT is a stream that
+            # went silent (typically a gateway sitting on a finished response).
             msg = (
-                f"[provider unavailable: {detail}; retrying in "
-                f"{RETRY_DELAY_SECONDS}s (attempt {attempt})]"
+                f"[provider unavailable after {time.monotonic() - started:.0f}s: "
+                f"{detail}; retrying in {RETRY_DELAY_SECONDS}s (attempt {attempt})]"
             )
             print("\n" + style(msg, "bold", "yellow"), flush=True)
             if session is not None:

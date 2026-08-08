@@ -28,6 +28,52 @@ from functools import lru_cache
 
 ANTHROPIC_MAX_TOKENS = 16384
 
+# How long a streaming response may go SILENT before we abandon it, in seconds.
+# This is httpx's read timeout: the gap between two chunks, not the length of the
+# whole response -- a turn that streams for ten minutes is fine, a turn that
+# produces nothing for STREAM_IDLE_TIMEOUT is not.
+#
+# Why override the SDKs' 600s default: a stream that stalls (an AI gateway or a
+# proxy in front of one holding a completed response, which is the observed
+# failure mode through Portkey) is not merely slow, it is *expensive*. The agent
+# loop retries a transient failure by re-running the same turn, and Anthropic's
+# prompt cache has a ~5 minute TTL, so a 600s stall guarantees the retry misses
+# a cache the original request had just paid to write -- the whole conversation
+# prefix gets re-written at the 1.25x premium instead of re-read at 0.1x. At 120s
+# the stall is caught, retried, and re-served from a cache that is still alive.
+# Anything sane keeps the socket busier than this: Anthropic emits SSE `ping`
+# events throughout a turn, so even a long silent think does not go 2 minutes
+# without bytes.
+#
+# GERBIL_STREAM_TIMEOUT overrides it (seconds); 0 or a negative value restores the
+# SDK default of no gerbil-imposed limit.
+STREAM_IDLE_TIMEOUT = 120.0
+
+
+def _stream_timeout():
+    """The httpx.Timeout to hand a provider SDK client, or None to keep the SDK's
+    own default. Read/write get STREAM_IDLE_TIMEOUT (see above); connect stays
+    short, since a gateway that will not even accept the connection is worth
+    failing fast on."""
+    import httpx
+
+    try:
+        idle = float(os.environ.get("GERBIL_STREAM_TIMEOUT", STREAM_IDLE_TIMEOUT))
+    except ValueError:
+        idle = STREAM_IDLE_TIMEOUT
+    if idle <= 0:
+        return None
+    return httpx.Timeout(idle, connect=10.0)
+
+
+def _timeout_kwargs() -> dict:
+    """`{"timeout": ...}` for an anthropic/openai client constructor, or `{}` when
+    the SDK default is wanted. It has to be an absent kwarg rather than
+    `timeout=None`: in both SDKs an explicit None means "no timeout at all",
+    which is the opposite of falling back to their default."""
+    timeout = _stream_timeout()
+    return {"timeout": timeout} if timeout is not None else {}
+
 
 class TransientProviderError(RuntimeError):
     """A provider failure that is safe to retry by re-running the same turn.
@@ -334,7 +380,9 @@ def _check_gemini_finish(finish_reason, emitted: bool) -> None:
 def _stream_anthropic(model, system, messages, tools):
     import anthropic
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    client = anthropic.Anthropic(
+        api_key=os.environ["ANTHROPIC_API_KEY"], **_timeout_kwargs()
+    )
     yield from _stream_anthropic_chat(client, model, system, messages, tools)
 
 
@@ -500,7 +548,11 @@ def _stream_openai(model, system, messages, tools):
 
     from openai import OpenAI
 
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], base_url=os.environ.get("OPENAI_BASE_URL", None))
+    client = OpenAI(
+        api_key=os.environ["OPENAI_API_KEY"],
+        base_url=os.environ.get("OPENAI_BASE_URL", None),
+        **_timeout_kwargs(),
+    )
     yield from _stream_openai_chat(client, model, system, messages, tools)
 
 
@@ -663,6 +715,9 @@ def _stream_ollama(model, system, messages, tools):
 
     from .ollama import ollama_base_url, ollama_model_name
 
+    # No _timeout_kwargs() here, deliberately: a local server legitimately goes
+    # silent for minutes while it pulls a model off disk into VRAM, and there is
+    # no metered prompt cache to lose by waiting it out.
     client = OpenAI(api_key="ollama", base_url=ollama_base_url() + "/v1")
     yield from _stream_openai_chat(
         client, ollama_model_name(model), system, messages, tools
@@ -730,6 +785,7 @@ def _stream_portkey_anthropic(api_key, base_url, name, system, messages, tools):
         auth_token=api_key,
         base_url=_portkey_gateway_root(base_url),
         default_headers=headers,
+        **_timeout_kwargs(),
     )
     yield from _stream_anthropic_chat(client, bare_model, system, messages, tools)
 
@@ -792,6 +848,14 @@ def _stream_portkey(model, system, messages, tools):
     client_kwargs = {"api_key": api_key, "strict_open_ai_compliance": True}
     if base_url:
         client_kwargs["base_url"] = base_url
+    # The Portkey SDK takes no `timeout=`; its own `request_timeout` is a
+    # *gateway-side* deadline sent as a header, not a client-side one. The
+    # client-side idle limit therefore has to ride in on an http_client.
+    timeout = _stream_timeout()
+    if timeout is not None:
+        import httpx
+
+        client_kwargs["http_client"] = httpx.Client(timeout=timeout)
     client = Portkey(**client_kwargs)
     yield from _stream_openai_chat(client, name, system, messages, tools)
 
@@ -802,7 +866,7 @@ def _stream_openai_responses(model, system, messages, tools):
 
     from openai import OpenAI
 
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], **_timeout_kwargs())
 
     # Responses API tool schema: flat, no "function" wrapper.
     openai_tools = [
