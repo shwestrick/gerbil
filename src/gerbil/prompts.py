@@ -150,6 +150,55 @@ def zoom_task_prompt(args: dict, inner_max_turns: int) -> str:
     )
 
 
+# How full the context window may get before gerbil starts winding the session
+# down, as a fraction. Escalating, because a single hard stop wastes whatever
+# the model was midway through: warned early it can choose a stopping point,
+# ordered late it can still land one, and only at the last threshold does gerbil
+# take the decision away. See agent.run_session and context_pressure_note.
+#
+# Only reachable when the model's context window is known (see
+# context_windows.py) -- with no denominator there is no percentage, and gerbil
+# runs exactly as it did before.
+CONTEXT_WIND_DOWN = 0.75    # advise wrapping up
+CONTEXT_URGENT = 0.85       # order it
+CONTEXT_TERMINAL = 0.95     # take over: commit message, then end the session
+
+
+def context_pressure_note(level: float, used: int, limit: int) -> str:
+    """The message appended to a tool-result turn when the conversation crosses
+    a context threshold. `level` is the threshold crossed (one of the three
+    constants above).
+
+    Written as an operational fact the model must plan around, not as a
+    suggestion: an agent told "you are running low" will often acknowledge it and
+    then keep working exactly as before. Each level states the number, what
+    happens next, and what to do with the remaining room."""
+    pct = used / limit * 100
+    status = f"[CONTEXT: {used:,} of {limit:,} tokens used ({pct:.0f}%).]"
+    if level >= CONTEXT_TERMINAL:
+        return (
+            f"{status} This session is over. gerbil is ending it now -- no "
+            "further tool calls will be executed, so anything not already "
+            "written to disk is lost. Your next message must be the commit "
+            "message requested below."
+        )
+    if level >= CONTEXT_URGENT:
+        return (
+            f"{status} You MUST wrap up this session NOW. Stop starting new "
+            "work. Finish or abandon the edit you are in the middle of, make "
+            "sure every file you have changed is in a state that compiles (a "
+            "`sorry` is far better than a broken proof), and stop calling "
+            f"tools. At {CONTEXT_TERMINAL:.0%} gerbil will end the session for "
+            "you, mid-thought if necessary."
+        )
+    return (
+        f"{status} Your context window is nearly exhausted. Start wrapping up: "
+        "prefer finishing what is already in progress over opening anything "
+        "new, and leave the tree compiling. Note that reading large files or "
+        "running verbose commands now costs you the room you need to finish."
+    )
+
+
 def build_system_prompt(
     has_lsp_tools: bool, ralph: bool = False, base_commit: str = "",
     zoom_in_available: bool = False, submodules: list[str] | None = None,

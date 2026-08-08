@@ -9,8 +9,13 @@ Every provider yields the same stream of events from a unified interface:
 
 This lets the agent loop stay provider-agnostic. The unified message format is:
 
-    {"role": "user", "content": str | [ {"type": "tool_result", ...} ]}
+    {"role": "user", "content": str | [ {"type": "tool_result"|"text", ...} ]}
     {"role": "assistant", "content": [ {"type": "text"|"tool_call", ...} ]}
+
+A user list normally holds one tool_result per call the assistant just made. A
+`text` item may ride along after them (gerbil appends its context-pressure
+notes that way, since the providers require the results to answer the assistant
+turn immediately -- a separate user message would break the alternation).
 
 Tool schemas are dicts with name, description, and input_schema (JSON Schema) --
 the same shape gerbil's tools.py produces.
@@ -154,6 +159,23 @@ class Usage:
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
 
+    @property
+    def context_tokens(self) -> int:
+        """Tokens that had to fit in the context window at once for this turn.
+
+        The whole prompt plus what the model generated from it. Cached prompt
+        tokens count: caching changes what a token *costs*, not whether it
+        occupies the window, and input_tokens alone is just the uncached
+        remainder when explicit caching is on.
+
+        The single definition of "how full is the context" -- render.py shows it
+        and agent.py decides when to wind a session down by it, and those two
+        must never disagree."""
+        return (
+            self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+            + self.output_tokens
+        )
+
 
 @dataclass
 class TextDelta:
@@ -280,6 +302,11 @@ def _stream_gemini(model, system, messages, tools):
                         parts.append(types.Part.from_function_response(
                             name=item["tool_name"], response={"result": item["content"]},
                         ))
+                    elif item.get("type") == "text":
+                        # Text alongside tool results (the context-pressure
+                        # note). Without this it would fall to the str(item)
+                        # below and reach the model as a printed Python dict.
+                        parts.append(types.Part.from_text(text=item["text"]))
                     else:
                         parts.append(types.Part.from_text(text=str(item)))
                 contents.append(types.Content(role="user", parts=parts))
@@ -598,6 +625,13 @@ def _stream_openai_chat(client, model, system, messages, tools):
             if isinstance(msg["content"], str):
                 openai_messages.append({"role": "user", "content": msg["content"]})
             elif isinstance(msg["content"], list):
+                # Text riding along with tool results (gerbil's context-pressure
+                # note) can't go in a "tool" message -- Chat Completions keys
+                # those to one tool_call_id. It becomes a plain user message
+                # after them, which is where it has to be anyway: every
+                # tool_call in the preceding assistant message must be answered
+                # by a tool message before anything else.
+                texts = []
                 for item in msg["content"]:
                     if item.get("type") == "tool_result":
                         openai_messages.append({
@@ -605,6 +639,12 @@ def _stream_openai_chat(client, model, system, messages, tools):
                             "tool_call_id": item["tool_call_id"],
                             "content": item["content"],
                         })
+                    elif item.get("type") == "text":
+                        texts.append(item["text"])
+                if texts:
+                    openai_messages.append(
+                        {"role": "user", "content": "\n\n".join(texts)}
+                    )
         elif msg["role"] == "assistant":
             oai_msg = {"role": "assistant", "content": None}
             tool_calls = []

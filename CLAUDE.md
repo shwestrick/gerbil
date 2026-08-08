@@ -49,7 +49,8 @@ src/gerbil/
   cli.py                argparse entry point + all subcommands (run, commit,
                         summarize, reconstruct-patch) and the resume orchestration
   agent.py              the agent loop (run_session) and transient-error retry
-  prompts.py            system/task prompt text + build_system_prompt
+  prompts.py            system/task prompt text + build_system_prompt, plus the
+                        context-pressure thresholds and their notes
   pricing.py            MODEL_PRICING table and cost estimation (N/A when unknown)
   context_windows.py    everything about a model's context window: the static
                         CONTEXT_WINDOWS table (snapshot of benchlm.ai/llm-pricing)
@@ -140,6 +141,28 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   *cannot* carry submodule work: format-patch renders a gitlink as one
   `Subproject commit <sha>` line, the objects behind it die with the container,
   and `git am` would silently commit a pointer to a commit that exists nowhere.
+- **Context pressure escalates, and the terminal threshold must leave room to
+  land.** When the window size is known, `agent.run_session` advises the model to
+  wrap up at `CONTEXT_WIND_DOWN` (75%), orders it at `CONTEXT_URGENT` (85%), and
+  at `CONTEXT_TERMINAL` (95%) stops the loop itself — but still runs the
+  commit-message turn, shortening the diff to fit (`_commit_diff`) so the
+  session's work lands explained rather than as a bare patch. Each note is
+  delivered once, on the turn that crosses its threshold; repeating it would
+  spend the very room it warns about. Every check is measured on
+  `Usage.context_tokens`, the one definition of "how full is the context" —
+  render.py's percentage and agent.py's thresholds must never disagree.
+  The guards are inert when the window is unknown, so a provider that reports no
+  context window behaves exactly as it did before. The zoom sub-session loop is
+  *not* covered (it is bounded by `--zoom-max-turns` and its forced `zoom_out`).
+- **A note can only reach the model inside the pending tool-result message.**
+  The providers reject two user messages in a row and require an assistant turn's
+  tool calls to be answered immediately, so `_append_user_text` merges text into
+  that message rather than following it — which is also how the forced commit
+  request gets in. This put a `{"type": "text"}` item into a user list for the
+  first time: the Anthropic converter already passed it through, but the OpenAI
+  one silently *dropped* non-tool_result items and Gemini stringified them into a
+  printed dict. Both were fixed; a converter that loses this item disables the
+  guard silently, so `tests/test_context_pressure.py` asserts each one transmits it.
 - **A guessed number is worse than an honest "unknown."** Both model tables
   (`MODEL_PRICING`, `CONTEXT_WINDOWS`) resolve a `--model` string through
   `model_match.table_match`, which returns None when several keys match and none
@@ -332,6 +355,7 @@ uv run python tests/test_ollama.py       # ollama provider plumbing (no Docker; 
 uv run python tests/test_portkey.py      # portkey provider plumbing (no Docker/key; live smoke if PORTKEY_API_KEY + PORTKEY_TEST_MODEL set)
 uv run python tests/test_stream_timeout.py  # stalled-stream idle timeout reaches every metered client (no network)
 uv run python tests/test_context_windows.py # context-window fallback table + model matching (no network)
+uv run python tests/test_context_pressure.py # context-exhaustion guards: escalation, message shape, forced ending (no network)
 GOOGLE_API_KEY=... uv run python tests/test_gemini.py   # live Gemini backend
 ```
 

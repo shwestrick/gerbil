@@ -717,12 +717,7 @@ def context_suffix(max_context: int | None, usage) -> str:
     isn't (provider doesn't report it), show the raw total."""
     if usage is None:
         return ""
-    # Cached prompt tokens still occupy the window -- input_tokens alone is
-    # just the uncached remainder when explicit caching is active.
-    used = (
-        usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens
-        + usage.output_tokens
-    )
+    used = usage.context_tokens
     if not max_context:
         return style(f"  [context: {used:,} tokens]", "gray")
     pct = used / max_context * 100

@@ -103,6 +103,41 @@ A model none of them covers, or one whose name matches several table entries
 ambiguously, reports no context window rather than a guessed one; the usage
 line then shows raw token totals.
 
+### Running out of context
+
+A long session eventually fills the window. Left alone that ends the run on a
+provider error, losing whatever the agent hadn't written to disk and leaving
+the patch unexplained. When gerbil knows the window size it winds the session
+down instead, in three steps:
+
+| Full | What happens |
+| --- | --- |
+| 75% | The model is told its context is nearly exhausted and to start wrapping up -- finish what's in progress, don't open anything new, leave the tree compiling. |
+| 85% | It is told it MUST wrap up now, and that gerbil will end the session for it at 95%. |
+| 95% | gerbil ends the session itself. The turn in flight finishes, then the model is made to write the commit message, and the run stops. |
+
+Each message is delivered once, on the turn that crosses its threshold --
+repeating it would spend the very room it's warning about. You'll see the
+escalation in the transcript:
+
+```
+[context 86% full: told the model to wrap up now]
+...
+[context 96% full: ending the session]
+[stopped: context window 95% full -- forcing the commit message and ending the session]
+```
+
+The 5% held back at the last threshold is what pays for that final turn; if the
+diff is too big to fit in it, gerbil shortens the diff (head and tail, middle
+elided) rather than skip the commit message. A session cut short this way still
+produces a normal `.patch`, and is resumable like any other -- though a resumed
+one starts near the limit again, so expect it to wind down quickly.
+
+All of this needs a known context window. For a model gerbil can't size (see
+above), sessions run exactly as they did before -- bounded only by `--max-turns`.
+Zoomed-in sub-sessions in big-small mode aren't covered either; they're bounded
+by `--zoom-max-turns`.
+
 ### The observation log
 
 Each line is one *change*: `{"timestamp", "model", "context_window",

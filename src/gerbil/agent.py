@@ -13,7 +13,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .pricing import estimate_cost
-from .prompts import build_system_prompt, commit_request, zoom_task_prompt
+from .prompts import (
+    CONTEXT_TERMINAL,
+    CONTEXT_URGENT,
+    CONTEXT_WIND_DOWN,
+    build_system_prompt,
+    commit_request,
+    context_pressure_note,
+    zoom_task_prompt,
+)
 from .providers import (
     Done,
     TextDelta,
@@ -57,6 +65,72 @@ def _accumulate(dst: Usage, src: Usage) -> None:
     dst.thinking_tokens += src.thinking_tokens
     dst.cache_read_tokens += src.cache_read_tokens
     dst.cache_write_tokens += src.cache_write_tokens
+
+
+def _context_level(usage: Usage | None, max_context: int | None) -> float | None:
+    """The highest context-pressure threshold the conversation has crossed, or
+    None if it is below all of them (or the window size is unknown, which is the
+    case for any provider that won't report one -- gerbil then behaves exactly as
+    it did before these guards existed)."""
+    if usage is None or not max_context:
+        return None
+    fraction = usage.context_tokens / max_context
+    for level in (CONTEXT_TERMINAL, CONTEXT_URGENT, CONTEXT_WIND_DOWN):
+        if fraction >= level:
+            return level
+    return None
+
+
+def _append_user_text(messages: list, text: str) -> None:
+    """Add `text` to the conversation as user-visible input, merging it into the
+    pending user message when there is one.
+
+    The providers require every tool_call in an assistant turn to be answered by
+    tool results in the *immediately* following user message, and reject two user
+    messages in a row. So text that arrives while results are pending -- a
+    context-pressure note, or the commit request when gerbil cuts a session short
+    mid-turn -- has to join that message rather than follow it."""
+    last = messages[-1] if messages else None
+    if last is None or last["role"] != "user":
+        messages.append({"role": "user", "content": text})
+    elif isinstance(last["content"], list):
+        last["content"] = last["content"] + [{"type": "text", "text": text}]
+    else:
+        last["content"] = f"{last['content']}\n\n{text}"
+
+
+# Rough bytes-per-token for English text and diffs. Only ever used to decide how
+# much of a diff can still fit, where the cost of being wrong one way is a
+# slightly shorter diff and the other way is a failed final turn -- so it is
+# deliberately pessimistic (real ratios run nearer 3.5-4).
+CHARS_PER_TOKEN = 3.0
+# Tokens to leave free for the commit message itself plus the request's own
+# boilerplate. A commit message is a few hundred tokens; this is generous.
+COMMIT_TURN_RESERVE = 2000
+
+
+def _commit_diff(diff: str, max_context: int | None, usage: Usage | None) -> str:
+    """The diff to show in the commit-message request, shortened if it would not
+    fit in what's left of the context window.
+
+    The final turn re-sends the whole conversation plus this diff. Normally
+    there is room to spare, but a session that ran to CONTEXT_TERMINAL has only
+    the last few percent left -- and a big diff there would blow the window on
+    the one turn whose entire purpose is to explain the session's work before it
+    is lost. Truncation is head+tail (tools.truncate_tool_output), which suits a
+    diff: the first and last hunks are the most identifiable.
+
+    Returns the diff untouched when the window is unknown or the room is ample,
+    so the normal path is exactly as it was."""
+    if not max_context or usage is None:
+        return diff
+    room = max_context - usage.context_tokens - COMMIT_TURN_RESERVE
+    if room <= 0:
+        # Nothing to spend. Ask for the message with the barest possible diff;
+        # the model still has the whole session in view to describe.
+        return truncate_tool_output(diff, 2000)
+    budget = int(room * CHARS_PER_TOKEN)
+    return truncate_tool_output(diff, budget)
 
 
 def _usage_any(u: Usage) -> bool:
@@ -552,6 +626,13 @@ def run_session(
     turn_offset = sum(1 for m in messages if m.get("role") == "assistant")
     final_text = ""
     stopped_at_max = False
+    # Context-pressure state. `warned_level` is the highest threshold the model
+    # has already been told about: each note is delivered once, on the turn that
+    # crosses its threshold. Repeating it every turn afterwards would spend the
+    # very room it is warning about, and would push the earlier history further
+    # out of the model's attention just as it needs to summarize it.
+    warned_level = 0.0
+    out_of_context = False
     # The most recent turn's usage, shown in the next turn's header so it reflects
     # how full the context is *entering* the turn. None until the first turn lands.
     last_usage: Usage | None = None
@@ -696,6 +777,31 @@ def run_session(
 
         messages.append({"role": "user", "content": tool_results})
 
+        # Context pressure. Measured on the turn that just landed, and acted on
+        # here -- after its tool calls have been answered, because a provider
+        # rejects an assistant turn whose tool_use blocks go unanswered. So even
+        # the terminal threshold lets this turn's tools finish; what it stops is
+        # the *next* one.
+        level = _context_level(last_usage, max_context)
+        if level and level > warned_level:
+            warned_level = level
+            note = context_pressure_note(
+                level, last_usage.context_tokens, max_context
+            )
+            _append_user_text(messages, note)
+            session.record_warning(note)
+            print("\n" + style(
+                f"[context {last_usage.context_tokens / max_context:.0%} full: "
+                + ("ending the session" if level >= CONTEXT_TERMINAL
+                   else "told the model to wrap up now" if level >= CONTEXT_URGENT
+                   else "told the model to start wrapping up"),
+                "bold", "red" if level >= CONTEXT_URGENT else "yellow",
+            ) + "]", flush=True)
+        if level and level >= CONTEXT_TERMINAL:
+            out_of_context = True
+            _update_wip_patch(sandbox, wip_patch_path, session.base_commit)
+            break
+
         # Snapshot the working tree after every turn that ran tools, so an
         # interruption before the next turn leaves a patch that recreates it.
         _update_wip_patch(sandbox, wip_patch_path, session.base_commit)
@@ -706,11 +812,23 @@ def run_session(
             flush=True,
         )
 
+    if out_of_context:
+        print("\n" + style(
+            f"[stopped: context window {CONTEXT_TERMINAL:.0%} full -- "
+            "forcing the commit message and ending the session]", "bold", "red",
+        ), flush=True)
+
     # Final turn: ask for a commit message as a true continuation of the
     # conversation. Skipped if nothing changed, or if we bailed on max_turns
     # (the work is incomplete and the history ends on a tool result). The diff is
     # taken from the session base, so the message describes the whole session even
     # when the agent committed some of it internally.
+    #
+    # A context-exhausted session is the opposite case: it is cut short too, but
+    # the whole point of stopping at CONTEXT_TERMINAL rather than at the API's
+    # hard limit is to keep enough room for this turn -- otherwise the session's
+    # work lands as an unexplained patch. The request merges into the pending
+    # tool-result message (see _append_user_text), since the history ends on one.
     diff = (
         sandbox.diff_since(session.base_commit)
         if session.base_commit else sandbox.get_diff()
@@ -724,8 +842,8 @@ def run_session(
         )
         print("\n" + header + context_suffix(max_context, last_usage), flush=True)
 
-        request = commit_request(diff)
-        messages.append({"role": "user", "content": request})
+        request = commit_request(_commit_diff(diff, max_context, last_usage))
+        _append_user_text(messages, request)
         session.record_turn("user", request)
 
         parts, _calls, text, usage = _run_turn_with_retry(
