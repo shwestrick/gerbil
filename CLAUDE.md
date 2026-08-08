@@ -201,6 +201,12 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
 - The terminal rendering in render.py (`format_tool_call` and friends) is purely
   cosmetic — it must never change what is dispatched or recorded. Keep render.py
   free of gerbil imports (it is a leaf module; agent.py calls in with real data).
+  `turn_header` draws its rule with box-drawing characters only where the output
+  stream can *encode* them (`_supports_unicode` asks the stream, never the
+  locale; `GERBIL_ASCII=1` forces the fallback), and the two layouts are the same
+  width column for column so nothing shifts between them. Anything else drawn
+  with non-ASCII must degrade the same way — a `print` that raises
+  UnicodeEncodeError would take a session down for a decoration.
 
 ## Subcommands
 

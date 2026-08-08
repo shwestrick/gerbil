@@ -36,11 +36,11 @@ from .sandbox import LeanSandbox
 from .session import Session
 from .render import (
     _clip,
-    context_suffix,
     format_tool_call,
     format_tool_result,
     print_usage,
     style,
+    turn_header,
 )
 from .tools import ZOOM_OUT_TOOL, Toolset, truncate_tool_output
 
@@ -401,10 +401,10 @@ def _run_zoom(
     turn = sum(1 for m in messages if m.get("role") == "assistant")
     while turn < inner_max_turns:
         turn += 1
-        header = style(
-            f"--- zoom turn {turn}/{inner_max_turns} ---", "bold", "magenta"
-        )
-        print("\n" + header + context_suffix(max_context, last_usage), flush=True)
+        print("\n" + turn_header(
+            f"zoom turn {turn}/{inner_max_turns}", "bold", "magenta",
+            max_context=max_context, usage=last_usage,
+        ), flush=True)
 
         assistant_parts, tool_calls, text, usage = _run_turn_with_retry(
             small_model, system, messages, tools, provider, sandbox.read_file,
@@ -509,11 +509,10 @@ def _run_zoom(
     messages.append({"role": "user", "content": request})
     session.record_turn("user", request, zoom=True)
 
-    header = style(
-        f"--- zoom turn {inner_max_turns + 1}/{inner_max_turns} "
-        "(forced summary) ---", "bold", "magenta",
-    )
-    print("\n" + header + context_suffix(max_context, last_usage), flush=True)
+    print("\n" + turn_header(
+        f"zoom turn {inner_max_turns + 1}/{inner_max_turns} (forced summary)",
+        "bold", "magenta", max_context=max_context, usage=last_usage,
+    ), flush=True)
     _parts, tool_calls, text, usage = _run_turn_with_retry(
         small_model, system, messages, [ZOOM_OUT_TOOL], provider,
         sandbox.read_file, session,
@@ -698,10 +697,10 @@ def run_session(
             break
         turn += 1
 
-        header = style(
-            f"--- {ralph_tag}turn {turn + turn_offset} ---", "bold", "dark_red"
-        )
-        print("\n" + header + context_suffix(max_context, last_usage), flush=True)
+        print("\n" + turn_header(
+            f"{ralph_tag}turn {turn + turn_offset}", "bold", "dark_red",
+            max_context=max_context, usage=last_usage,
+        ), flush=True)
 
         assistant_parts, tool_calls, final_text, usage = _run_turn_with_retry(
             model, system, messages, tools, provider, sandbox.read_file, session
@@ -836,11 +835,10 @@ def run_session(
     commit_message = ""
     if diff.strip() and not stopped_at_max:
         turn += 1
-        header = style(
-            f"--- {ralph_tag}turn {turn + turn_offset} (commit message) ---",
-            "bold", "dark_red",
-        )
-        print("\n" + header + context_suffix(max_context, last_usage), flush=True)
+        print("\n" + turn_header(
+            f"{ralph_tag}turn {turn + turn_offset} (commit message)",
+            "bold", "dark_red", max_context=max_context, usage=last_usage,
+        ), flush=True)
 
         request = commit_request(_commit_diff(diff, max_context, last_usage))
         _append_user_text(messages, request)

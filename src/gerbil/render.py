@@ -7,6 +7,9 @@ real data and prints whatever comes back.
 
 Contents:
   - style():           tiny ANSI color helper (respects NO_COLOR / non-TTY)
+  - turn_header:       the timestamped rule that opens every turn (box-drawing
+                       characters where the terminal can encode them, dashes
+                       where it can't)
   - format_tool_call:  pretty one-or-many-line rendering of a tool invocation
   - format_tool_result: the "  <- ..." preview of a tool's result
   - context_suffix / print_usage: the turn-header context gauge and the
@@ -18,11 +21,90 @@ import difflib
 import json
 import os
 import re
+import shutil
 import sys
 import textwrap
+from datetime import datetime
 
 # https://no-color.org/ -- any non-empty NO_COLOR disables color.
 ENABLED = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+_BOX_GLYPHS = {"rule": "─", "sep": "·"}
+_ASCII_GLYPHS = {"rule": "-", "sep": "|"}
+
+
+def _supports_unicode(stream=None) -> bool:
+    """Whether `stream` (default stdout) can carry box-drawing characters.
+
+    Asked of the stream's own encoding rather than guessed from the locale: the
+    only thing that matters is whether the write will succeed. A terminal that
+    can't (a C/POSIX locale, a legacy code page, a pipe into something ASCII)
+    gets the dashed fallback instead of mojibake or a UnicodeEncodeError from a
+    print statement. GERBIL_ASCII forces the fallback everywhere."""
+    if os.environ.get("GERBIL_ASCII"):
+        return False
+    encoding = getattr(sys.stdout if stream is None else stream, "encoding", None)
+    if not encoding:
+        return False
+    try:
+        _BOX_GLYPHS["rule"].encode(encoding)
+        _BOX_GLYPHS["sep"].encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
+
+
+UNICODE = _supports_unicode()
+GLYPHS = _BOX_GLYPHS if UNICODE else _ASCII_GLYPHS
+
+# Escape sequences style() may have inserted, for measuring a line's *visible*
+# width. Padding math must not count them -- they occupy no columns.
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+# Below this, a header just puts its pieces next to each other; padding a rule
+# out to a sliver of a terminal looks worse than not trying.
+_MIN_RULE_WIDTH = 40
+
+
+def _visible_len(text: str) -> int:
+    return len(_ANSI_RE.sub("", text))
+
+
+def _terminal_width() -> int:
+    """Columns available for a full-width rule. Falls back to 80 when the output
+    isn't a terminal (a piped log still reads fine at that width)."""
+    try:
+        return shutil.get_terminal_size(fallback=(80, 24)).columns
+    except Exception:
+        return 80
+
+
+def turn_header(label: str, *styles: str, max_context=None, usage=None) -> str:
+    """A turn header: a rule carrying the label and the wall-clock time, run out
+    to the terminal width, with the context gauge right-aligned at the end.
+
+        ---- turn 3 | 14:32:07 --------------  [context: 96,000 / 100,000 (96.0%)]
+
+    The rule is drawn with box-drawing characters where the terminal can encode
+    them (see _supports_unicode) and dashes where it can't -- the two layouts are
+    identical column for column, so nothing shifts between them.
+
+    The timestamp is local wall-clock, deliberately: it is read against the
+    user's own sense of how long a session has been running, and against other
+    things on their screen. The session log keeps the UTC record."""
+    stamp = datetime.now().strftime("%H:%M:%S")
+    rule, sep = GLYPHS["rule"], GLYPHS["sep"]
+
+    left = f"{rule * 4} {label} {sep} {stamp} "
+    right = context_suffix(max_context, usage)
+    width = _terminal_width()
+    # The gauge is styled by its own severity color, so the rule is styled apart
+    # from it and the two are concatenated already-colored.
+    fill = width - _visible_len(left) - _visible_len(right)
+    if width < _MIN_RULE_WIDTH or fill < 1:
+        return style(left.rstrip(), *styles) + right
+    return style(left + rule * fill, *styles) + right
 
 _CODES = {
     "reset": "\033[0m",

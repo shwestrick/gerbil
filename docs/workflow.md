@@ -55,6 +55,20 @@ Transient API failures (rate limits, "service unavailable", dropped
 connections) are retried automatically. A session that dies anyway can be
 picked up again with [`gerbil resume`](resume.md).
 
+Each turn opens with a rule giving the turn number, the wall-clock time, and
+how full the context window is:
+
+```
+──── turn 12 · 14:32:07 ──────────────────  [context: 96,000 / 200,000 (48.0%)]
+```
+
+The rule is drawn with box-drawing characters when the terminal can encode
+them and with dashes when it can't -- the two are the same width, so nothing
+shifts between them. Set `GERBIL_ASCII=1` to force the plain-text form
+everywhere; `NO_COLOR` (see [no-color.org](https://no-color.org/)) drops the
+color separately. Sessions long enough to run low on context also announce
+that here -- see [Running out of context](models.md#running-out-of-context).
+
 ## Finalizing
 
 The session's work -- the agent's own intermediate commits *plus* whatever it

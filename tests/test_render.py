@@ -5,10 +5,14 @@ text here and we can assert on substrings. Run: uv run python tests/test_render.
 """
 
 import json
+import os
+import re
 
+from gerbil import render
 from gerbil.render import (
     format_tool_call,
     format_tool_result,
+    turn_header,
     _render_build_result,
     _render_diagnostics_result,
     _render_goal_result,
@@ -479,6 +483,89 @@ def test_zoom_out() -> None:
           out2.strip() == "-> zoom_out (empty summary)", out2)
 
 
+class FakeUsage:
+    """Duck-typed providers.Usage; render.py only reads context_tokens."""
+
+    def __init__(self, used):
+        self.context_tokens = used
+
+
+TIME_RE = re.compile(r"\d\d:\d\d:\d\d")
+
+
+def _with_glyphs(glyphs, width, fn):
+    """Run fn() with a fixed glyph set and terminal width, then restore."""
+    real_glyphs, real_width = render.GLYPHS, render._terminal_width
+    render.GLYPHS = glyphs
+    render._terminal_width = lambda: width
+    try:
+        return fn()
+    finally:
+        render.GLYPHS, render._terminal_width = real_glyphs, real_width
+
+
+def test_turn_header() -> None:
+    out = _with_glyphs(render._BOX_GLYPHS, 90, lambda: turn_header(
+        "turn 3", max_context=100_000, usage=FakeUsage(96_000)))
+    check("header names the turn", "turn 3" in out, out)
+    check("header is timestamped", bool(TIME_RE.search(out)), out)
+    check("header draws a box rule", "─" in out, out)
+    check("header keeps the context gauge", "96,000 / 100,000" in out, out)
+    check("header fills the terminal width", len(out) == 90, f"{len(out)}: {out}")
+
+    # No usage yet (the first turn): the rule simply runs the whole width.
+    first = _with_glyphs(render._BOX_GLYPHS, 90, lambda: turn_header(
+        "turn 1", max_context=100_000, usage=None))
+    check("first turn still has a header", "turn 1" in first and len(first) == 90, first)
+
+    # A label too long to leave room must not produce negative padding.
+    long_label = "[ralph 10/10] turn 128 (commit message)" + " x" * 20
+    tight = _with_glyphs(render._BOX_GLYPHS, 60, lambda: turn_header(
+        long_label, max_context=100_000, usage=FakeUsage(96_000)))
+    check("an oversized header degrades instead of breaking",
+          long_label in tight and "96,000" in tight, tight)
+
+    # A very narrow terminal: no rule padding at all.
+    narrow = _with_glyphs(render._BOX_GLYPHS, 20, lambda: turn_header(
+        "turn 3", max_context=100_000, usage=None))
+    check("a narrow terminal gets no fill", len(narrow) < 40, narrow)
+
+
+def test_turn_header_ascii_fallback() -> None:
+    box = _with_glyphs(render._BOX_GLYPHS, 90, lambda: turn_header(
+        "turn 3", max_context=100_000, usage=FakeUsage(96_000)))
+    ascii_out = _with_glyphs(render._ASCII_GLYPHS, 90, lambda: turn_header(
+        "turn 3", max_context=100_000, usage=FakeUsage(96_000)))
+
+    check("ascii header uses no box characters", ascii_out.isascii(), ascii_out)
+    check("ascii header still has the rule", "----" in ascii_out, ascii_out)
+    check("ascii header keeps the content",
+          "turn 3" in ascii_out and "96,000 / 100,000" in ascii_out, ascii_out)
+    # The two layouts must line up column for column, so a session that scrolls
+    # between them (or a log read next to a terminal) doesn't jump.
+    check("both layouts are the same width", len(box) == len(ascii_out),
+          f"{len(box)} vs {len(ascii_out)}")
+
+
+def test_unicode_detection() -> None:
+    # The question is only ever "can this stream encode it" -- never the locale.
+    import io
+
+    ascii_stream = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+    utf8_stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+    try:
+        check("an ascii stream falls back", not render._supports_unicode(ascii_stream))
+        check("a utf-8 stream draws boxes", render._supports_unicode(utf8_stream))
+        check("a stream with no encoding falls back",
+              not render._supports_unicode(object()))
+        # GERBIL_ASCII wins over any capable stream.
+        os.environ["GERBIL_ASCII"] = "1"
+        check("GERBIL_ASCII forces the fallback",
+              not render._supports_unicode(utf8_stream))
+    finally:
+        os.environ.pop("GERBIL_ASCII", None)
+
+
 def main() -> None:
     test_write_file_line_numbers()
     test_write_file_summary_when_large()
@@ -501,6 +588,9 @@ def main() -> None:
     test_other_tool_unchanged()
     test_zoom_in()
     test_zoom_out()
+    test_turn_header()
+    test_turn_header_ascii_fallback()
+    test_unicode_detection()
     print("\nAll render tests passed.")
 
 
