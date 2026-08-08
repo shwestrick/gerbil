@@ -2,344 +2,83 @@
 
 :warning: work-in-progress, but fairly stable :warning:
 
-A teensy tiny agent for Lean projects, inspired by
+A teensy tiny agent in a box, for Lean projects. Inspired by
 [lea-prover](https://github.com/chinmayhegde/lea-prover), but with
 container-based sandboxing (Docker or podman), a git-based workflow, and
 built-in support for Ralph loops.
 
-gerbil sessions are self-contained and sandboxed: each session is run
-in a container and produces a git commit. The container only ever sees
-the current branch: the git repo uploaded into the sandbox is stripped
-to the current branch's history -- no other branches, tags, remotes,
-upstreams, or reflogs.
+gerbil sessions are self-contained and sandboxed: each session runs in a
+container and produces a git commit. The container only ever sees the current
+branch -- the git repo uploaded into the sandbox is stripped to that branch's
+history, with no other branches, tags, remotes, upstreams, or reflogs.
 
-## Example Usage
-
-Run at your Lake project root. This needs to be in a git repo, with a clean
-state (no unstaged changes). gerbil produces two files: a `.jsonl` session
-log, and a `.patch` that can be applied and pushed.
-
-```console
-$ cd /path/to/my/lake/project
-
-$ export GOOGLE_API_KEY=...
-
-$ gerbil run --model gemini-3.1-pro-preview --prompt prompt.md
-...
---- 134 turns, 6,541,423 tokens (in: 6,517,329, out: 24,094), ~$8.3876 ---
-session: /Users/shwestrick/.gerbil/sessions/gerbil-260623-235800.jsonl
-patch:   /path/to/my/lake/project/.gerbil/gerbil-260623-235800.patch (git am)
-
-$ ls .gerbil
-gerbil-260623-235800.jsonl
-gerbil-260623-235800.patch
-
-$ gerbil commit
-
-$ git push
-```
-
-
-You can also run a multi-session Ralph loop, applying the same prompt
-repeatedly. The option `--ralph N` runs at most `N` sessions. This produces
-session logs and patches for every session. Running `gerbil commit` a single
-time will commit each of these.
-
-```console
-$ cd my/lake/project
-
-$ export GOOGLE_API_KEY=...
-
-$ gerbil run --model gemini-3.1-pro-preview --prompt ralph-prompt.md --ralph 3
-...
-
-$ ls .gerbil
-gerbil-260623-235900-01.jsonl
-gerbil-260623-235900-01.patch
-gerbil-260623-235900-02.jsonl
-gerbil-260623-235900-02.patch
-gerbil-260623-235900-03.jsonl
-gerbil-260623-235900-03.patch
-
-$ gerbil commit
-
-$ git push
-```
-
-To terminate the Ralph loop early, pass `--ralph_done SCRIPT`. After each
-session completes, gerbil runs that script inside the container on the session's
-committed working tree (from the project directory). If it exits `0`, the loop
-stops; any non-zero exit means keep going.
-
-## Setup and Install
+## Install
 
 `gerbil` is a single self-contained launcher script. Put it on your `PATH`; it
-fetches its own source from GitHub on first use (requires `git`, `docker` (or
-`podman`, see below), and [`uv`](https://astral.sh/uv)):
+fetches its own source from GitHub on first use. Requires `git`,
+[`uv`](https://astral.sh/uv), and `docker` (or `podman`).
+
 ```console
 curl -fsSL https://raw.githubusercontent.com/shwestrick/gerbil/main/bin/gerbil \
      -o ~/.local/bin/gerbil && chmod +x ~/.local/bin/gerbil
 ```
-The sandbox image is built automatically on the first `gerbil run` (and rebuilt
-by `gerbil update`), tagged to match the gerbil version.
 
-Managing the launcher itself:
-```console
-$ gerbil --version    # current version (commit hash)
-$ gerbil update       # update to latest main: refreshes the source, rebuilds the
-                      # image, and overwrites this launcher script in place
-```
+The sandbox image is built automatically on the first `gerbil run`. Later,
+`gerbil update` updates gerbil and rebuilds the image.
 
-### Docker and/or Podman
+More: [Installation](docs/install.md).
 
-Docker must be usable **without sudo** (gerbil talks to the daemon via the
-Docker SDK). On Linux, add yourself to the `docker` group
-(`sudo usermod -aG docker $USER`, then re-login) or use
-[rootless Docker](https://docs.docker.com/engine/security/rootless/).
+## Use
 
-Where Docker isn't available, set `GERBIL_SANDBOX` to run sessions under
-[podman](https://podman.io) instead:
-```console
-$ export GERBIL_SANDBOX=podman     # "docker" (the default) or "podman"
-```
-Everything else is unchanged: the same launcher builds the same image and runs
-the same sessions, just through `podman` (no daemon or socket service needed --
-gerbil drives podman's CLI directly). Since the image is per-runtime, the first
-`gerbil run` after switching rebuilds it.
-
-## API Keys and Backend Models
-
-Use `gerbil run --help` to see the list of backend models. Set the appropriate
-API key for the model you wish to use:
+Run at your Lake project root, in a git repo with a clean working tree. Write
+your task in a file and hand it to gerbil:
 
 ```console
-$ export GOOGLE_API_KEY=...
+$ cd /path/to/my/lake/project
 
 $ export ANTHROPIC_API_KEY=...
 
-$ export OPENAI_API_KEY=...
-```
-
-gerbil also supports [Portkey](https://app.portkey.ai):
-
-```console
-$ export PORTKEY_API_KEY=...
-$ export PORTKEY_BASE_URL=...    # e.g. https://your.gateway.com/v1/
-$ gerbil run --model portkey:<MODEL_CATALOG_STRING> --prompt prompt.md
-```
-
-### Local models with ollama
-
-To run against a local model served by [ollama](https://ollama.com), use the
-`ollama:<NAME>` model syntax — no API key required:
-
-```console
-$ ollama pull qwen2.5-coder
-$ gerbil run --model ollama:qwen2.5-coder --prompt prompt.md
-```
-
-If no ollama server is already running, gerbil runs `ollama serve` as a child
-process. The model must already be pulled locally.
-Set `OLLAMA_HOST` to point at a non-default address (e.g. a remote box).
-
-## The `~/.gerbil` directory
-
-gerbil maintains a `$HOME/.gerbil` directory that contains an archive of
-all recent sessions and patches, and versions of the gerbil driver itself.
-This directory is safe to delete at any time (but note that this will delete
-all archived data).
-
-gerbil also maintains a per-project `.gerbil/` directory inside of the
-project where it is run, to store project-specific session data and patches.
-
-## Lean LSP tools (MCP)
-
-By default, gerbil enables the
-[lean-lsp-mcp](https://github.com/oOo0oOo/lean-lsp-mcp) tools — proof state
-(`lean_goal`), diagnostics, hover info, tactic trials (`lean_multi_attempt`),
-and local declaration search (`lean_local_search`) — alongside the built-in
-`bash`/`read_file`/`write_file`/`edit_file` tools. The MCP server runs inside the
-sandbox container (where the Lean toolchain lives); gerbil connects to it over
-`docker exec` (or `podman exec`).
-
-A few lean-lsp tools are intentionally disabled for better sandboxing:
-`lean_leansearch`, `lean_loogle`, `lean_leanfinder`, `lean_state_search`,
-and `lean_hammer_premise`.
-
-Use `gerbil run --no-mcp` to disable the MCP tools entirely and use only the
-built-in tools. If the MCP server fails to start, gerbil warns and continues with
-the built-in tools.
-
-## Mathlib caching
-
-If the Lake project depends on Mathlib, gerbil starts every sandbox session
-with `lake exe cache get` to pull down precompiled oleans. Projects that don't
-use Mathlib skip it automatically -- `cache` is an executable Mathlib itself
-provides, so running it elsewhere just fails.
-
-Detection reads `lake-manifest.json` (which catches Mathlib arriving indirectly,
-through some other package that requires it) plus the `require`s in
-`lakefile.toml` / `lakefile.lean`. If none of those can be read, gerbil fetches
-anyway; the skip is only taken on positive evidence that Mathlib is absent.
-
-Use `gerbil run --skip-cache` to suppress the fetch for a Mathlib project too --
-faster to start, but Mathlib then rebuilds from source on first use.
-
-## Using your own sandbox image
-
-By default, gerbil builds and runs its own sandbox image. If your project needs
-something that image doesn't carry -- pre-built artifacts, extra system packages,
-a pinned toolchain, private tooling -- you can point gerbil at your own:
-
-```
-$ gerbil run --image my-lean-sandbox:v1 --prompt prompt.md
-```
-
-To make it the default for one project, write it into that project's
-`.gerbil/config.toml`:
-
-```toml
-image = "my-lean-sandbox:v1"
-```
-
-`--image` overrides the config file, and both work with `gerbil run`, `gerbil
-resume`, and `gerbil reconstruct-patch`.
-
-Your image has to fit how gerbil drives the container, so gerbil checks it at
-startup and refuses -- listing everything that's wrong at once -- rather than
-failing halfway through a session. It must:
-
-- provide `bash`, `timeout`, `git`, `tar`, `chown`, `id`, `mktemp`, and `lake`;
-- own a `/workspace/project` directory writable by the container user;
-- run as uid 1000 (or 0), since gerbil uploads files owned by uid 1000;
-- allow `exec` as root, used once after upload to fix ownership;
-- not define an `ENTRYPOINT` -- gerbil runs the container as `sleep infinity`
-  and drives it with `exec`.
-
-`lean-lsp-mcp` is optional: without it you get a warning and the session runs
-with gerbil's built-in tools only. The simplest way to satisfy all of this is to
-build `FROM` gerbil's own image (`src/lean-sandbox/Dockerfile`).
-
-## Turn limits
-
-Use `gerbil run --max-turns N` to forcibly terminate sessions after `N` turns.
-
-## Session data in commits
-
-By default the `.jsonl` session data is included in the generated patch. Use
-`gerbil run --omit-session-log` to keep it out. Either way, the session log is
-always archived in `~/.gerbil/sessions/`.
-
-## Summarizing usage with `gerbil summarize`
-
-`gerbil summarize` scans the project's `.gerbil/*.jsonl` session logs and reports
-total token usage, an estimated cost (from the per-model pricing table), and
-breakdowns by session status, tool call, and model:
-
-```
-$ gerbil summarize
-gerbil summary -- 28 session(s) in /path/to/project/.gerbil
-
-Tokens
-  input:     141,094,502
-  output:        367,974
-  thinking:      201,830  (of output)
-  total:     141,462,476
-
-Estimated cost
-  ~$180.0479
+$ gerbil run --model claude-opus-4-8 --prompt prompt.md
 ...
+--- 139 turns, 17,742,881 tokens (in: 277 + 17,114,370 cache-read + 494,976 cache-write, out: 133,258), ~$14.9836 ---
+session: /Users/shwestrick/.gerbil/sessions/gerbil-260722-171419.jsonl
+patch:   /path/to/my/lake/project/.gerbil/gerbil-260722-171419.patch (git am)
 ```
 
-`thinking` is the reasoning/thinking-token portion of `output` (broken out for
-the models that report it -- e.g. Gemini's "thoughts", OpenAI's reasoning
-tokens). Thinking tokens bill at the output rate and are already included in
-`output` (and in the cost), so they are shown as a sub-total, not added on top.
-For models that don't expose the breakdown, thinking is silently counted within
-`output`.
-
-Session logs reach the project `.gerbil/` by default (via the committed patch);
-runs made with `gerbil run --omit-session-log` keep them only in
-`~/.gerbil/sessions/` (and `summarize` points you there if the project has
-none).
-
-## Committing patches with `gerbil commit`
-
-After running sessions, `gerbil commit` looks in the project `.gerbil/` folder
-and identifies patches that can be applied at the current git `HEAD`. Stale
-and already-committed patches are ignored; these are safe to leave around
-or delete.
-
-## Resuming a crashed session
-
-If a session dies partway through -- a transient API error ("service
-unavailable"), a lost connection, a Ctrl-C -- you can resume
-it from its session log:
+Each session produces a `.jsonl` log of everything that happened and a `.patch`
+holding the work. Nothing touches your repo until you apply it:
 
 ```console
-$ gerbil resume ~/.gerbil/sessions/gerbil-260623-235800.jsonl
+$ gerbil commit
+$ git push
 ```
 
-gerbil boots a fresh sandbox, recreates the git state the session started
-from, replays the conversation up to the crash, and continues from there.
-The model and prompt are taken from the log, so `gerbil resume` takes neither
-`--prompt` nor `--model` (and has no `--ralph` -- a resumed ralph chain
-continues automatically).
+Other subcommands: `gerbil resume` (continue a crashed session), `gerbil
+summarize` (token and cost accounting), `gerbil cleanup` (drop
+already-committed patches), `gerbil reconstruct-patch`. Every command takes
+`--help`.
 
-The working tree is recovered from a `*.wip.patch` file that is kept live
-next to the session log, refreshed after every turn. It is a `git
-format-patch` from the session's base to the current state -- including any
-commits the agent made itself, not just uncommitted changes -- so it never
-loses work. It is a normal git patch: if you'd rather not resume, you can
-just `git apply` it yourself. A clean finish deletes the `.wip.patch`; a
-crash leaves it in place for `gerbil resume`.
+More: [workflow](docs/workflow.md).
 
-The continuation is written as its own session log and patch (named
-`...-resume-<timestamp>`), carrying the full prior history forward, so it is
-itself resumable if it too is interrupted. The original crashed log is left
-untouched.
+## Documentation
 
-Ralph chains are supported. Point `gerbil resume` at the crashed session's log
-(e.g. `gerbil-<ts>-03.jsonl`) and gerbil rebuilds that session's starting
-point by replaying the earlier sessions' patches on top of the chain's base
-commit, reapplies the crashed session's working-tree patch, and then runs the
-remaining iterations. Each ralph session's header records the chain's base
-commit and the ordered list of ancestor patches needed to rebuild it, so the
-sibling `.patch` files (found by the `gerbil-<ts>-NN` naming convention) are all
-that's required -- including across a resume-of-a-resume. If the chain used a
-`--ralph_done` check, its script is recorded in the session log, so the resumed
-chain keeps the same termination check automatically (pass `--ralph_done` again
-to override it).
+- [Installation](docs/install.md) -- installing and updating, Docker vs. podman,
+  `~/.gerbil`
+- [Models and API keys](docs/models.md) -- providers, local models via ollama,
+  Portkey gateways
+- [Workflow](docs/workflow.md) -- prompt, patch, commit, etc.
+- [Ralph loops](docs/ralph.md) -- `--ralph N`, and stopping when the work is
+  actually done
+- [Big-small mode](docs/big-small.md) -- a big model delegating individual
+  `sorry`s to a cheaper one
+- [Resuming and reconstructing](docs/resume.md) -- recovering a crashed session
+  or a lost patch
+- [Usage and cost reporting](docs/summarize.md) -- reading `gerbil summarize`
+- [Sandboxing](docs/sandbox.md) -- containment, mathlib caching, submodules,
+  custom images
+- [Tools](docs/tools.md) -- the built-in tools and the lean-lsp MCP tools
+- [Development](docs/development.md) -- layout, running from source, tests
 
-The session-log setting is likewise inherited: if the resumed session's run
-folded its log into the commit (the default), so does the continuation (pass
-`--omit-session-log` to force the log out).
+## License
 
-Resume needs the same repository that produced the session, with the base
-commit still in its history.
-
-### Reconstructing a patch by replaying tool calls
-
-Where `gerbil resume` restores the working tree from the live `.wip.patch` snapshot,
-`gerbil reconstruct-patch` rebuilds a session's `.patch` by *actually replaying
-the session's tool calls* in a fresh sandbox -- no model involved:
-
-```console
-$ gerbil reconstruct-patch ~/.gerbil/sessions/gerbil-260623-235800.jsonl
-```
-
-gerbil recreates the session's base commit (replaying ancestor patches first for
-a ralph session), re-executes every state-mutating tool call it logged
-(`bash`, `write_file`, `edit_file`; read-only and `lean_*` calls are skipped),
-commits the result under the session's own commit message, and writes the
-corresponding `.patch`. This is useful when the original patch is missing or was
-corrupted -- for example if the agent ran `git` commands that confused gerbil's
-bookkeeping.
-
-If the target `.patch` already exists, gerbil asks before overwriting it (and
-does so up front, before the slow replay). Pass `--force` to overwrite without
-the prompt.
-
-Replay is only as deterministic as the commands themselves: `bash` that depends
-on time, the network, or randomness may not reproduce exactly.
-
+[MIT](LICENSE)
