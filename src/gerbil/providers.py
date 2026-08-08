@@ -89,34 +89,50 @@ class TransientProviderError(RuntimeError):
 
 @lru_cache(maxsize=None)
 def get_context_window(model: str, provider: str | None = None) -> int | None:
-    """The model's maximum context window in total tokens, queried live from the
-    provider's model-info endpoint -- or None if it can't be determined.
+    """The model's maximum context window in total tokens, or None if it can't be
+    determined.
 
-    Gemini (`input_token_limit`) and Anthropic (`max_input_tokens`) report it; the
-    OpenAI models endpoint does not, so it returns None there (and the caller just
-    reports raw token totals). No static table -- we ask the provider so the
-    number can't drift out of date. Cached, so a --ralph chain queries at most
-    once; never raises (any failure -> None)."""
+    The provider is asked first, so the number can't drift out of date: Gemini
+    reports `input_token_limit` and Anthropic `max_input_tokens`. Nobody else
+    does -- the OpenAI models endpoint exposes no context window, a gateway
+    model isn't ours to query, and a local ollama model has no endpoint at all
+    -- and those used to report nothing, leaving the session banner and the
+    context-usage line with no denominator.
+
+    So a live answer falls back to the static snapshot in context_windows.py.
+    Only in that order: the table can go stale, and a stale number is worth
+    having only when the alternative is no number. It matches on the model
+    string itself, which is what lets a Portkey catalog name (whose embedded
+    model gerbil can't ask about) resolve at all.
+
+    Cached, so a --ralph chain queries at most once; never raises (any failure
+    -> the table, then None)."""
+    from .context_windows import context_window
+
     try:
         provider = provider or detect_provider(model)
     except ValueError:
-        return None
+        return context_window(model)
     try:
         if provider == "gemini":
             from google import genai
 
             client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
             limit = getattr(client.models.get(model=model), "input_token_limit", None)
-            return int(limit) if limit else None
-        if provider == "anthropic":
+            if limit:
+                return int(limit)
+        elif provider == "anthropic":
             import anthropic
 
-            client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+            client = anthropic.Anthropic(
+                api_key=os.environ["ANTHROPIC_API_KEY"], **_timeout_kwargs()
+            )
             limit = getattr(client.models.retrieve(model), "max_input_tokens", None)
-            return int(limit) if limit else None
+            if limit:
+                return int(limit)
     except Exception:
-        return None
-    return None  # openai: no endpoint exposes the context window
+        pass
+    return context_window(model)
 
 
 @dataclass

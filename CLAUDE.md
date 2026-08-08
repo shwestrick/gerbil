@@ -51,6 +51,13 @@ src/gerbil/
   agent.py              the agent loop (run_session) and transient-error retry
   prompts.py            system/task prompt text + build_system_prompt
   pricing.py            MODEL_PRICING table and cost estimation (N/A when unknown)
+  context_windows.py    CONTEXT_WINDOWS table — the static fallback for when a
+                        provider won't report its own context window (snapshot
+                        of benchlm.ai/llm-pricing; consulted only after the live
+                        query fails)
+  model_match.py        table_match — the one rule both tables are keyed by
+                        (longest substring match, but only when it subsumes the
+                        others; ambiguity -> None). A leaf module.
   render.py             ALL human-readable terminal rendering: the ANSI style()
                         helper (respects NO_COLOR / non-TTY) and the pretty
                         tool-call/result, context, and usage formatting
@@ -131,6 +138,12 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   *cannot* carry submodule work: format-patch renders a gitlink as one
   `Subproject commit <sha>` line, the objects behind it die with the container,
   and `git am` would silently commit a pointer to a commit that exists nowhere.
+- **A guessed number is worse than an honest "unknown."** Both model tables
+  (`MODEL_PRICING`, `CONTEXT_WINDOWS`) resolve a `--model` string through
+  `model_match.table_match`, which returns None when several keys match and none
+  subsumes the rest; callers then report N/A rather than invent a figure. Keep
+  new entries API-ID-shaped, and never hand-enter a value the upstream snapshot
+  doesn't list — it would silently survive every refresh.
 - **Built-in tool names win** over colliding MCP tool names (today none collide).
 - **Tool output is truncated once** (`tools.truncate_tool_output`, 10k chars,
   head+tail) and the *same* truncated text is what the model sees and what the log
@@ -309,6 +322,7 @@ uv run python tests/test_sandbox_cleanup.py  # container cleanup on interrupt (n
 uv run python tests/test_ollama.py       # ollama provider plumbing (no Docker; live smoke if a server is up)
 uv run python tests/test_portkey.py      # portkey provider plumbing (no Docker/key; live smoke if PORTKEY_API_KEY + PORTKEY_TEST_MODEL set)
 uv run python tests/test_stream_timeout.py  # stalled-stream idle timeout reaches every metered client (no network)
+uv run python tests/test_context_windows.py # context-window fallback table + model matching (no network)
 GOOGLE_API_KEY=... uv run python tests/test_gemini.py   # live Gemini backend
 ```
 

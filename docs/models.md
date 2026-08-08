@@ -79,6 +79,21 @@ failed attempt ran, so a stall is easy to tell apart from an instant `503`:
 This does not apply to `ollama:` models, where a local server legitimately goes
 quiet for minutes while loading a model and there is no metered cache to lose.
 
+## Context window
+
+gerbil shows how much of the model's context window a session is using. It asks
+the provider for the number first, so it can't go stale -- but only Gemini and
+Anthropic publish one. For everything else (OpenAI, gateway models, local
+ollama models) gerbil falls back to a built-in table snapshotted from
+[benchlm.ai/llm-pricing](https://benchlm.ai/llm-pricing), matched against the
+model name -- including a name buried inside a Portkey catalog string like
+`@vertexai-foo/anthropic.claude-opus-4-8`.
+
+A model the table doesn't list, or one whose name matches several entries
+ambiguously, reports no context window at all rather than a guessed one; the
+usage line then shows raw token totals. Refresh the table from that site's
+`/api/data/pricing` endpoint (see `src/gerbil/context_windows.py`).
+
 ## Cost
 
 gerbil prints a running token count and an estimated cost at the end of each

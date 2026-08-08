@@ -8,6 +8,7 @@ made-up number.
 
 import sys
 
+from .model_match import table_match
 from .render import style
 
 
@@ -61,20 +62,10 @@ def pricing_match(model: str) -> str | None:
     `@vertexai-foo/anthropic.claude-opus-4-7` embeds the real model name, so a
     MODEL_PRICING key found inside the string identifies the pricing.
 
-    The table nests keys within a model family (`o3` inside `o3-mini`,
-    `gpt-5.4` inside `gpt-5.4-pro`), so a string like `@x/o3-mini` matches
-    several keys. That isn't real ambiguity: when the longest matching key
-    itself contains every other match, the shorter ones are just its prefixes
-    riding along, and the longest -- most specific -- key is the answer.
-    Anything else (several matches, none subsuming the rest) means we'd be
-    guessing, and a guessed price is worse than an honest N/A -> None."""
-    if model in MODEL_PRICING:
-        return model
-    matches = [key for key in MODEL_PRICING if key in model]
-    if not matches:
-        return None
-    longest = max(matches, key=len)
-    return longest if all(key in longest for key in matches) else None
+    The rule itself (longest match, but only when it subsumes the others; a
+    guessed price is worse than an honest N/A) lives in model_match, which the
+    context-window table matches by too."""
+    return table_match(model, MODEL_PRICING)
 
 
 # Models already warned about by model_pricing, so a summary spanning many
