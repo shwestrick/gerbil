@@ -1,6 +1,6 @@
-<img src="assets/gerbil.png" align="right" width="260" alt="a gerbil sitting in a sandbox">
-
 # gerbil
+
+<img src="assets/gerbil.png" align="right" width="260" alt="a gerbil sitting in a sandbox">
 
 :warning: work-in-progress, but fairly stable :warning:
 
