@@ -1,18 +1,19 @@
 # gerbil
 
-<img src="assets/gerbil.png" align="right" width="260" alt="a gerbil sitting in a sandbox">
-
 :warning: work-in-progress, but fairly stable :warning:
 
-A teensy tiny agent in a box, for Lean projects. Inspired by
-[lea-prover](https://github.com/chinmayhegde/lea-prover), but with
-container-based sandboxing (Docker or podman), a git-based workflow, and
-built-in support for Ralph loops.
+<img src="assets/gerbil.png" align="right" width="220" hspace="20" alt="a gerbil sitting in a sandbox">
 
-gerbil sessions are self-contained and sandboxed: each session runs in a
-container and produces a git commit. The container only ever sees the current
-branch -- the git repo uploaded into the sandbox is stripped to that branch's
-history, with no other branches, tags, remotes, upstreams, or reflogs.
+A teensy tiny sandboxed agent for Lean projects. gerbil sessions run in a
+container (Docker or podman) and produce git patches.
+
+```console
+$ gerbil run --model claude-opus-4-8 \
+             --prompt tell-gerbil-what-to-do.md
+...
+$ gerbil commit
+$ git push
+```
 
 ## Install
 
@@ -28,7 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/shwestrick/gerbil/main/bin/gerbil \
 The sandbox image is built automatically on the first `gerbil run`. Later,
 `gerbil update` updates gerbil and rebuilds the image.
 
-More: [Installation](docs/install.md).
+More: [Installation](docs/install.md)
 
 ## Use
 
@@ -60,7 +61,7 @@ summarize` (token and cost accounting), `gerbil cleanup` (drop
 already-committed patches), `gerbil reconstruct-patch`. Every command takes
 `--help`.
 
-More: [workflow](docs/workflow.md).
+More: [Workflow](docs/workflow.md)
 
 ## Documentation
 
