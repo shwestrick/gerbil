@@ -354,6 +354,7 @@ uv run python tests/test_zoom_resume.py  # big-small resume + summarize accounti
 uv run python tests/test_submodule.py    # submodule upload + containment (phase 2 needs Docker)
 uv run python tests/test_image_config.py # image selection + compatibility check (phase 2 needs Docker)
 uv run python tests/test_mathlib_detect.py  # mathlib dependency detection (no Docker)
+uv run python tests/test_summarize_lean.py  # summarize's lean-line deltas + running-total anchor (no Docker)
 uv run python tests/test_render.py       # terminal rendering
 uv run python tests/test_empty_turn.py   # glitched empty-turn guard + filter (no network)
 uv run python tests/test_sandbox_cleanup.py  # container cleanup on interrupt (no Docker)

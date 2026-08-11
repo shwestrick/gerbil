@@ -864,13 +864,13 @@ def _patch_lean_delta(patch: Path) -> tuple[int, int] | None:
     return added, removed
 
 
-def _committed_lean_delta(project_dir: Path, log_name: str) -> tuple[int, int] | None:
-    """(added, removed) project .lean line counts of the commit that carries a
-    session's folded-in log, or None when no commit contains it. A session log
-    reaches the project's .gerbil/ only by `gerbil commit` (git am) applying the
-    patch the log was folded into, so the commit that added the log IS the
-    session's squashed commit -- and the .patch file itself is typically gone
-    once applied, making history the authoritative record of the diff."""
+def _log_commit(project_dir: Path, log_name: str) -> str | None:
+    """SHA of the commit that added a session's folded-in log to .gerbil/, or
+    None when no commit contains it. A session log reaches the project's
+    .gerbil/ only via the patch it was folded into, so the commit that added
+    the log is normally the session's squashed commit -- and the .patch file
+    itself is typically gone once applied, making history the authoritative
+    record of the diff. (Normally, not always: see _committed_lean_delta.)"""
     result = subprocess.run(
         ["git", "-C", str(project_dir), "log", "--diff-filter=A",
          "--format=%H", "--", f".gerbil/{log_name}"],
@@ -880,23 +880,40 @@ def _committed_lean_delta(project_dir: Path, log_name: str) -> tuple[int, int] |
     commits = result.stdout.split()
     if result.returncode != 0 or not commits:
         return None
+    return commits[0]
+
+
+def _committed_lean_delta(project_dir: Path, commit: str) -> tuple[int, int] | None:
+    """(added, removed) project .lean line counts of a session's squashed
+    commit (found by _log_commit), or None when the commit touches more than
+    one session log. `gerbil commit` folds exactly one log per commit, so a
+    multi-log commit is not any session's own squash -- typically sessions
+    ported wholesale from another checkout -- and crediting its whole diff to
+    each log it carries would count the same lines once per session."""
     # numstat: one "<added>\t<removed>\t<path>" per file, "-" counts for binary.
     show = subprocess.run(
         ["git", "-C", str(project_dir), "show", "--numstat", "--format=",
-         commits[0]],
+         commit],
         capture_output=True,
         text=True,
     )
     if show.returncode != 0:
         return None
     added = removed = 0
+    logs_touched = 0
     for line in show.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) != 3 or parts[0] == "-":
+        if len(parts) != 3:
+            continue
+        if parts[2].startswith(".gerbil/") and parts[2].endswith(".jsonl"):
+            logs_touched += 1
+        if parts[0] == "-":
             continue
         if _is_project_lean(parts[2]):
             added += int(parts[0])
             removed += int(parts[1])
+    if logs_touched != 1:
+        return None
     return added, removed
 
 
@@ -1091,39 +1108,68 @@ def cmd_summarize(args) -> None:
     print()
 
     # Per-session breakdown, in chronological order (the timestamped filenames
-    # sort that way). Each session's code delta comes from the commit its log
-    # was folded into (or a not-yet-committed sibling .patch); the running
-    # total is anchored at the first session's base commit when that commit is
-    # inspectable in the host repo, and is a relative net change otherwise
-    # (e.g. logs copied in from another machine).
+    # sort that way).
     print(bold("Per session") + "  " +
           style("(lean = .lean lines, excluding .lake packages)", "gray"))
-    baseline = _lean_line_count(project_dir, stats[0]["base_commit"])
-    running = baseline if baseline is not None else 0
-    if baseline is not None:
-        print("  " + style(
-            f"lean baseline: {baseline:,} lines at "
-            f"{stats[0]['base_commit'][:12]}", "gray"))
-    else:
-        print("  " + style(
-            "base commit not inspectable here -- lean total shown as net "
-            "change across sessions", "gray"))
 
-    rows = []
-    for path, s in zip(logs, stats):
-        # Git history first: a log lands in .gerbil/ via the commit it was
-        # folded into, so that commit holds the session's diff. A sibling
-        # .patch (not yet committed here, e.g. a hand-copied log) covers the
-        # rest.
-        delta = _committed_lean_delta(project_dir, path.name)
-        if delta is None:
+    # Each session's code delta, and (when it came from git history rather
+    # than a sibling .patch) the commit it was read from. Git history first: a
+    # log lands in .gerbil/ via the commit it was folded into, so that commit
+    # holds the session's diff; a not-yet-committed sibling .patch (e.g. a
+    # hand-copied log) covers the rest. Computed up front because the
+    # running-total anchor below may need the first attributed commit.
+    deltas: list[tuple[tuple[int, int] | None, str | None]] = []
+    for path in logs:
+        commit = _log_commit(project_dir, path.name)
+        delta = _committed_lean_delta(project_dir, commit) if commit else None
+        if delta is not None:
+            deltas.append((delta, commit))
+        else:
             patch = path.with_suffix(".patch")
-            delta = _patch_lean_delta(patch) if patch.is_file() else None
+            deltas.append(
+                (_patch_lean_delta(patch) if patch.is_file() else None, None))
+
+    # Anchor the running total at the first session's recorded base commit
+    # when that commit is still inspectable. A history rewrite (rebase,
+    # squash) leaves the recorded SHA dangling, so fall back to the parent of
+    # the first commit a delta was attributed to: measured from history as it
+    # is *now*, that anchor survives any rewrite. Sessions before a fallback
+    # anchor get no absolute total -- whatever they contributed is already
+    # inside the baseline, and re-adding their deltas would double-count.
+    anchor = 0
+    baseline = _lean_line_count(project_dir, stats[0]["base_commit"])
+    if baseline is not None:
+        note = (f"lean baseline: {baseline:,} lines at "
+                f"{stats[0]['base_commit'][:12]}")
+    else:
+        for i, (_, commit) in enumerate(deltas):
+            if commit is None:
+                continue
+            # Only the first attributed commit can anchor -- a later one would
+            # skip the deltas between. If its parent can't be counted (root
+            # commit), fall through to net-change mode.
+            baseline = _lean_line_count(project_dir, commit + "^")
+            if baseline is not None:
+                anchor = i
+                note = (f"lean baseline: {baseline:,} lines just before "
+                        f"{commit[:12]} (recorded base commit not found here; "
+                        "earlier sessions get no total)")
+            break
+    if baseline is None:
+        note = ("base commit not inspectable here -- lean total shown as net "
+                "change across sessions")
+    print("  " + style(note, "gray"))
+
+    running = baseline if baseline is not None else 0
+    rows = []
+    for i, (path, s) in enumerate(zip(logs, stats)):
+        delta, _ = deltas[i]
         if delta is None:
             change = "-"  # no commit or patch for this log (crashed / no changes)
         else:
             a, r = delta
-            running += a - r
+            if i >= anchor:
+                running += a - r
             change = f"+{a:,}/-{r:,}"
         c = _cost(s)
         # Combined across both models of a big-small session; the per-model
@@ -1140,7 +1186,8 @@ def cmd_summarize(args) -> None:
             f"{s['output_tokens'] + s['zoom_output_tokens']:,}",
             "N/A" if c is None else f"~${c:,.4f}",
             change,
-            f"{running:,}" if baseline is not None else f"{running:+,}",
+            ("-" if i < anchor else f"{running:,}") if baseline is not None
+            else f"{running:+,}",
         ))
 
     headers = ("session", "status", "turns", "in", "out", "cost",
