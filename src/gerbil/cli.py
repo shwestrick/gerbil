@@ -1951,10 +1951,12 @@ def _elapsed_str(seconds: float) -> str:
 
 
 def cmd_running(args) -> None:
-    """List the background runs. Finished (or died) runs are shown one last
-    time with their outcome, then their registry entries are pruned -- the
-    entries are bookkeeping only; the session logs and patches live in
-    ~/.gerbil/sessions/ and each project's .gerbil/ as always."""
+    """List the background runs. Finished (or died) runs stay listed with
+    their outcome until the user grabs them and confirms the exit from the
+    finished screen -- that confirmation, in tui.attach_viewer, is the ONLY
+    thing that removes a registry entry, so no run's ending ever disappears
+    unseen. (The entries are bookkeeping; the session logs and patches live
+    in ~/.gerbil/sessions/ and each project's .gerbil/ as always.)"""
     entries = runs.list_runs()
     if not entries:
         print("no background runs.")
@@ -1992,26 +1994,39 @@ def cmd_running(args) -> None:
         print(style(line, "bold") if i == 0 else line)
 
     live = [e["name"] for e in entries if e["state"] == "running"]
+    hints = []
     if live:
-        print(style(f"\nreattach with: gerbil grab {live[0]}", "gray"))
-    for name in finished:
-        runs.remove_run(name)
+        hints.append(f"reattach with: gerbil grab {live[0]}")
+    if finished:
+        hints.append("review and dismiss finished runs with: "
+                     f"gerbil grab {finished[0]}")
+    if hints:
+        print()
+        for hint in hints:
+            print(style(hint, "gray"))
 
 
 def cmd_grab(args) -> None:
-    """Reattach the full-screen viewer to a background run."""
+    """Reattach the full-screen viewer to a background run. Finished runs are
+    grabbable too -- the viewer opens straight onto the held finished screen,
+    and confirming the exit there is what dismisses the run from the
+    registry (`gerbil running` never cleans one up on its own)."""
     entries = runs.list_runs()
     live = [e["name"] for e in entries if e["state"] == "running"]
     name = args.name
     if name is None:
-        if not live:
+        # Bare grab: a live run is what the user most likely means; with none
+        # live, a finished run awaiting review/dismissal is the next best.
+        candidates = live or [e["name"] for e in entries]
+        if not candidates:
             sys.exit("no background runs. (see `gerbil running`)")
-        if len(live) > 1:
-            sys.exit("several runs are active -- name one:\n  "
-                     + "\n  ".join(f"gerbil grab {n}" for n in live))
-        name = live[0]
+        if len(candidates) > 1:
+            sys.exit("several runs are registered -- name one:\n  "
+                     + "\n  ".join(f"gerbil grab {n}" for n in candidates))
+        name = candidates[0]
     elif runs.load_meta(name) is None:
-        listing = f" active runs: {', '.join(live)}" if live else ""
+        known = [e["name"] for e in entries]
+        listing = f" registered runs: {', '.join(known)}" if known else ""
         sys.exit(f"error: no background run named {name!r}.{listing}")
     if not sys.stdout.isatty():
         sys.exit(f"error: grab needs a terminal. To watch without one:\n"

@@ -12,7 +12,8 @@ few times a second for ~30 seconds (argv[2] overrides), then records status
 Try: scrollback while lines stream, `d` (detach + reattach), Ctrl-C (it
 really does SIGINT this process -- the wrapper records "interrupted"), and
 the held finished screen at the end. The viewer's confirm-exit removes the
-run dir; if it's left behind, `gerbil running` prunes it.
+run dir; until then the finished run stays in `gerbil running` (grab it
+again to dismiss it).
 """
 
 import os

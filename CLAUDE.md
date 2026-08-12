@@ -240,10 +240,13 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   not yet committed are never touched, and the `~/.gerbil/sessions/` archive
   copies are kept.
 - `gerbil running` — list the background runs (name, status, project, model,
-  session, turns, context %, elapsed); finished/died runs are shown one last
-  time, then their registry entries are pruned.
-- `gerbil grab [NAME]` — reattach the full-screen viewer to a background run
-  (bare form works when exactly one run is active).
+  session, turns, context %, elapsed). Listing never cleans up: finished/died
+  runs stay until grabbed and dismissed.
+- `gerbil grab [NAME]` — reattach the full-screen viewer to a background run;
+  for a finished one it opens straight onto the held finished screen, and
+  confirming the exit there is the one and only thing that removes a run's
+  registry entry. Bare `grab` resolves a single live run (or, with none live,
+  a single finished run awaiting dismissal).
 - `gerbil summarize` — token/cost/tool/status stats across `.gerbil/*.jsonl`,
   plus a per-session table (cost, `.lean` lines +/- from the commit each log
   was folded into or its uncommitted `.patch`, running lean-code total

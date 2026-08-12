@@ -281,12 +281,19 @@ def test_cmd_running_and_grab() -> None:
         text = out.getvalue()
         check("live run listed", "live-run" in text and "running" in text
               and "gerbil-260812-01" in text and "50%" in text, text)
-        check("finished run listed once", "done-run" in text
+        check("finished run listed", "done-run" in text
               and "complete" in text, text)
         check("grab hint names a live run", "gerbil grab live-run" in text, text)
-        check("finished run pruned after listing",
-              not runs.run_dir("done-run").exists()
-              and runs.run_dir("live-run").exists(), "")
+        check("dismiss hint names the finished run",
+              "dismiss" in text and "gerbil grab done-run" in text, text)
+        # Listing must never clean up: a finished run stays until the user
+        # grabs it and confirms the exit from the finished screen.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cmd_running(Namespace())
+        check("finished run survives repeated listings",
+              runs.run_dir("done-run").exists()
+              and "done-run" in out.getvalue(), out.getvalue())
 
         # grab: bare with one live run resolves it -- but stdout is not a tty
         # here, so it must exit with the tail -f pointer instead of attaching.
@@ -321,6 +328,18 @@ def test_cmd_running_and_grab() -> None:
         except SystemExit as exc:
             check("grab with no runs says so", "no background runs" in str(exc),
                   str(exc))
+
+    # With nothing live, bare grab falls back to the finished run awaiting
+    # dismissal (here surfacing as the non-tty display-file pointer).
+    with tmp_running_dir():
+        _fab_run("finished-only", status="complete", pid=None)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_grab(Namespace(name=None))
+            check("bare grab resolves a finished run", False, "no SystemExit")
+        except SystemExit as exc:
+            check("bare grab resolves a finished run",
+                  "finished-only" in str(exc), str(exc))
 
 
 def main() -> None:
