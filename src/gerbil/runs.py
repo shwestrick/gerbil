@@ -185,7 +185,7 @@ def pause_run(name: str) -> bool:
     """Freeze a running runner with SIGSTOP. The whole process stops exactly
     where it is -- mid-turn, mid-tool-call -- while its sandbox container (a
     separate process tree under the container daemon) stays alive, so a later
-    resume_run continues the session precisely where it left off. Nothing like
+    continue_run picks the session back up precisely where it left off. Nothing like
     `gerbil resume` happens here: no replay, no new process, no new log.
 
     The status write comes AFTER the stop lands: a stopped process cannot
@@ -212,7 +212,7 @@ def pause_run(name: str) -> bool:
     return True
 
 
-def resume_run(name: str) -> bool:
+def continue_run(name: str) -> bool:
     """Continue a paused runner with SIGCONT. The status write comes BEFORE
     the wake-up -- while the runner is still frozen and cannot write meta
     concurrently (its exit path would otherwise race a terminal status

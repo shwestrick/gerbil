@@ -21,11 +21,12 @@ Key semantics (user-facing):
   "interrupted:" + resume lines into the display stream). A second press
   closes the viewer while the runner unwinds.
 - d: detach -- the viewer exits, the run continues in the background.
-- p / r: pause / resume. Pause SIGSTOPs the runner where it stands -- the
-  sandbox container stays alive -- and r (from this or any later viewer;
+- p / c: pause / continue. Pause SIGSTOPs the runner where it stands -- the
+  sandbox container stays alive -- and c (from this or any later viewer;
   paused runs detach and grab like running ones) SIGCONTs the same process,
-  which continues exactly where it left off. Unrelated to `gerbil resume`,
-  which rebuilds a crashed session in a fresh sandbox.
+  which picks up exactly where it left off. Deliberately NOT called resume:
+  `gerbil resume` is the unrelated feature that rebuilds a crashed session
+  in a fresh sandbox.
 - When the run ends (complete, interrupted, error, or the runner died), the
   viewer holds the finished screen until q/enter/Ctrl-C confirms; only a
   confirmed exit removes the run's registry entry and reprints the
@@ -80,7 +81,7 @@ class ViewerApp(App):
         Binding("q", "interrupt", "interrupt"),
         Binding("d", "detach", "background"),
         Binding("p", "pause", "pause"),
-        Binding("r", "resume", "resume"),
+        Binding("c", "continue_run", "continue"),
         Binding("enter", "confirm_exit", "exit", show=False),
         Binding("end", "follow", "follow tail"),
     ]
@@ -200,7 +201,7 @@ class ViewerApp(App):
         # A SIGINT queued on a stopped process is not delivered until it is
         # continued -- interrupting a paused run means waking it first.
         if self.stats.paused:
-            runs.resume_run(self._name)
+            runs.continue_run(self._name)
             self.stats.paused = False
         try:
             os.kill(self._meta.get("pid") or 0, signal.SIGINT)
@@ -213,17 +214,17 @@ class ViewerApp(App):
     def action_pause(self) -> None:
         """Freeze the runner in place (SIGSTOP; see runs.pause_run). The
         sandbox container stays alive, so this is nothing like `gerbil
-        resume`: pressing r continues the very same process mid-thought."""
+        resume`: pressing c continues the very same process mid-thought."""
         if self.stats.finished is not None or self._interrupt_sent:
             return
         if runs.pause_run(self._name):
             self.stats.paused = True
             self.refresh_stats()
 
-    def action_resume(self) -> None:
+    def action_continue_run(self) -> None:
         if self.stats.finished is not None:
             return
-        if runs.resume_run(self._name):
+        if runs.continue_run(self._name):
             self.stats.paused = False
             self.refresh_stats()
 

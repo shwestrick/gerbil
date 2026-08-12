@@ -320,7 +320,7 @@ def test_render_stats_finished() -> None:
     stats.paused = True
     with contextlib.redirect_stderr(io.StringIO()):
         out = render_stats(stats, 40, now=9_999.0)
-    check("paused banner", "paused: press r to resume" in out, out)
+    check("paused banner", "paused: press c to continue" in out, out)
     stats.interrupt_requested = True
     with contextlib.redirect_stderr(io.StringIO()):
         out = render_stats(stats, 40, now=9_999.0)

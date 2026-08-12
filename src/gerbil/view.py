@@ -462,7 +462,7 @@ def render_stats(stats: SessionStats, width: int, now: float | None = None) -> s
             "press again to detach", "bold", "yellow"))
     elif stats.paused:
         lines.append("")
-        lines.append(render.style("paused: press r to resume", "bold", "blue"))
+        lines.append(render.style("paused: press c to continue", "bold", "blue"))
         lines.append(render.style(
             "(the sandbox stays alive; d detaches)", "gray"))
 

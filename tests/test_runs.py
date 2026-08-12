@@ -141,14 +141,14 @@ def test_pause_resume() -> None:
             check("pausing a paused run is a no-op",
                   not runs.pause_run("nap-run"), "")
 
-            check("resume_run continues it", runs.resume_run("nap-run"), "")
+            check("continue_run picks it back up", runs.continue_run("nap-run"), "")
             check("running again in the registry",
                   runs.classify(runs.load_meta("nap-run")) == "running", "")
             check("process actually SIGCONTed",
                   not _proc_state(sleeper.pid).startswith("T"),
                   _proc_state(sleeper.pid))
             check("resuming a running run is a no-op",
-                  not runs.resume_run("nap-run"), "")
+                  not runs.continue_run("nap-run"), "")
 
             runs.save_meta("nap-run", status="complete")
             check("pausing a finished run refused",
@@ -158,7 +158,7 @@ def test_pause_resume() -> None:
             sleeper.wait()
         runs.save_meta("nap-run", status="running")  # pid now dead
         check("pausing a dead run refused", not runs.pause_run("nap-run"), "")
-        check("resuming a dead run refused", not runs.resume_run("nap-run"), "")
+        check("resuming a dead run refused", not runs.continue_run("nap-run"), "")
 
 
 def test_tail_display() -> None:

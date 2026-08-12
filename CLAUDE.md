@@ -270,11 +270,12 @@ status, the authority on how a run ended — written by `runs.run_runner`, the
 `main()`-level wrapper, whatever the exit path). One run name spans a whole
 ralph chain. Keys: `d` detaches (the run continues; `gerbil ps` lists it,
 `gerbil grab NAME` reattaches, bare `gerbil grab` picks the only live run);
-`p`/`r` pause/resume — pause SIGSTOPs the runner in place (`runs.pause_run`;
+`p`/`c` pause/continue — pause SIGSTOPs the runner in place (`runs.pause_run`;
 the sandbox container stays alive, and the status write ordering around the
-stop/continue signals is deliberate — see the docstrings) so `r`, from this or
-any later viewer, continues the very same process exactly where it stood;
-nothing like `gerbil resume`'s rebuild-and-replay happens. Ctrl-C/q
+stop/continue signals is deliberate — see the docstrings) so `c`
+(`runs.continue_run`), from this or any later viewer, continues the very same
+process exactly where it stood. Deliberately not named "resume": `gerbil
+resume` is the unrelated rebuild-and-replay of a crashed session. Ctrl-C/q
 interrupt — a real SIGINT to the runner, i.e. exactly a `--plain` Ctrl-C over
 there (a paused runner is SIGCONTed first; a stopped process can't receive
 the interrupt) — and a second press closes the viewer while it unwinds.
