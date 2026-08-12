@@ -1,45 +1,39 @@
-"""The full-screen live session view: a textual app with a stats pane on the
-left (files edited with per-file +/- lines, turns, context, tokens, cost,
-wall-clock) and the scrolling turn output on the right.
+"""The full-screen session viewer: a textual app attached to a detached
+background run (see runs.py for the architecture and registry layout).
 
-Division of labor: everything *stateful and pure* (SessionStats, the patch
-parser, render_stats) lives in view.py, testable without a terminal. This
-module is only the glue between three threads of control:
+This process owns nothing but the screen. The session runs in the *runner*
+child cli._spawn_and_attach started; the viewer tails the run's display.ansi
+into the right pane, re-renders the runner's stats.json into the left pane,
+and can be closed (detach: `d`) and reopened (`gerbil grab NAME`) freely --
+which is the whole point. There is no worker thread and no shared memory: two
+processes, three files, and a 4 Hz poll.
 
-- The MAIN thread runs the textual App (it owns the terminal; textual requires
-  it for signal handling).
-- A WORKER thread runs the whole session loop -- the same `body(view)` closure
-  cmd_run/cmd_resume would call inline under a PrintView, with every `with`
-  block (sandbox, MCP) intact. It is a plain daemon Thread, deliberately NOT a
-  textual worker: textual awaits worker cancellation on shutdown, and a thread
-  blocked in a `docker exec` cannot be cancelled -- the app must be able to
-  exit while the worker is still unwinding.
-- TuiView is the bridge: its methods run on the worker thread, do any heavy
-  lifting there (patch parsing, line buffering), and marshal one small
-  _apply() call to the UI thread via app.call_from_thread. Stats are mutated
-  and read only on the UI thread, so no locks are needed.
+Everything the right pane shows is the ANSI-styled classic stream the runner
+prints (GERBIL_FORCE_STYLE keeps render.style live despite its redirected
+stdout), converted with rich's Text.from_ansi. Everything the left pane shows
+is view.SessionStats, reconstructed each poll by view.stats_from_wire -- the
+elapsed clocks re-anchor to this process's monotonic clock, so the 1s tick
+keeps counting between the runner's writes.
 
-Interruption is cooperative. The first Ctrl-C (or q) sets a threading.Event;
-the next view event raised on the worker thread becomes a KeyboardInterrupt
-there, which unwinds the sandbox `with` blocks normally (the container is
-stopped) and is then re-raised on the main thread -- after the terminal is
-restored -- into cmd_run/cmd_resume's existing `except -> _abort` path. A
-second Ctrl-C detaches the UI immediately without waiting for the worker.
-There is no way to interrupt a tool call mid-flight (the same is true of the
-classic view -- a KeyboardInterrupt lands between bytecode instructions, and
-the worker is blocked inside a docker exec); its own `timeout N bash -c`
-bounds the wait.
+Key semantics (user-facing):
+- Ctrl-C / q: interrupt the run -- a real SIGINT to the runner, which is
+  exactly a --plain Ctrl-C over there (the sandbox unwinds, _abort writes the
+  "interrupted:" + resume lines into the display stream). A second press
+  closes the viewer while the runner unwinds.
+- d: detach -- the viewer exits, the run continues in the background.
+- When the run ends (complete, interrupted, error, or the runner died), the
+  viewer holds the finished screen until q/enter/Ctrl-C confirms; only a
+  confirmed exit removes the run's registry entry and reprints the
+  session:/patch:/usage tail onto the normal terminal.
 
-render.py note: everything the right pane shows is the same ANSI-styled text
-the classic view prints, converted with rich's Text.from_ansi. That works
-because the TUI is only ever selected when stdout is a real TTY (cli._use_tui),
-so render.ENABLED was already computed True at import -- unless NO_COLOR is
-set, in which case the strings are plain and the TUI is simply uncolored,
-which is what NO_COLOR asks for.
+The pure pieces (tailing, liveness classification, the wire format) live in
+runs.py and view.py and are tested there; this module is the thinnest possible
+textual shell over them, exercised by hand and by the fake-runner script.
 """
 
+import os
+import signal
 import sys
-import threading
 import time
 
 from rich.text import Text
@@ -49,168 +43,22 @@ from textual.containers import Horizontal
 from textual.events import Print
 from textual.widgets import Footer, RichLog, Static
 
-from . import render
-from .view import SessionStats, patch_file_stats, render_stats
+from . import runs
+from .view import SessionStats, render_stats, stats_from_wire
 
 # Right-pane scrollback bound. Old lines beyond it fall out of the pane (the
-# .jsonl session log remains the complete record); well above any session's
-# useful scrollback while keeping memory flat on very long ralph chains.
+# display.ansi file and the .jsonl session log remain the complete records).
 LOG_MAX_LINES = 20_000
 
 # The stats pane's fixed width (columns), including 1 column of padding each
 # side. Wide enough for a 5-digit +/- file table row and the token figures.
 STATS_PANE_WIDTH = 44
 
-
-class TuiView:
-    """SessionView implementation that feeds the textual app.
-
-    Public methods run on the WORKER thread: they check for a pending
-    interrupt (raising KeyboardInterrupt there -- the one place the
-    cooperative quit lands), prepare display text, and marshal a single
-    _apply() onto the UI thread. _apply and everything it touches (stats, the
-    widgets) run only on the UI thread."""
-
-    wants_wip_patch = True
-
-    def __init__(self):
-        self._app: GerbilApp | None = None
-        self._interrupt = threading.Event()
-        self.stats = SessionStats()
-        self._pending = ""  # partial assistant line; worker thread only
-        # Plain reprint of the session:/patch:/usage lines after the alt
-        # screen closes, so the outcome survives in normal scrollback.
-        # Appended on the worker thread, read by the main thread after join.
-        self.tail_lines: list[str] = []
-
-    def bind(self, app: "GerbilApp") -> None:
-        self._app = app
-
-    # -- interruption (UI thread sets, worker thread trips) ------------------
-
-    @property
-    def interrupt_requested(self) -> bool:
-        return self._interrupt.is_set()
-
-    def request_interrupt(self) -> None:
-        self._interrupt.set()
-        self.stats.interrupt_requested = True
-
-    # -- worker-side plumbing -------------------------------------------------
-
-    def _dispatch(self, mutate=None, log_text: str | None = None) -> None:
-        """Marshal one event to the UI thread; the cooperative-interrupt
-        checkpoint. After the app has exited (detach), call_from_thread fails;
-        that is swallowed -- display is best-effort -- and the set interrupt
-        event ends the worker at this same checkpoint on the next call."""
-        if self._interrupt.is_set():
-            raise KeyboardInterrupt
-        try:
-            self._app.call_from_thread(self._app.apply_event, mutate, log_text)
-        except Exception:
-            pass
-
-    def _flush_pending(self) -> None:
-        """Send any buffered partial assistant line to the log."""
-        if self._pending:
-            text, self._pending = self._pending, ""
-            self._dispatch(None, text)
-
-    # -- SessionView methods (worker thread) ----------------------------------
-
-    def session_begin(self, *, name, model, small_model, ralph, resumed_from):
-        self._flush_pending()
-        now = time.monotonic()
-        self._dispatch(lambda: self.stats.on_session_begin(
-            name=name, model=model, small_model=small_model, ralph=ralph,
-            resumed_from=resumed_from, now=now,
-        ))
-
-    def banner(self, text):
-        self._dispatch(None, text)
-
-    def turn_header(self, label, *styles, max_context=None, usage=None):
-        # A compact divider instead of render.turn_header: no full-width rule
-        # (wrong inside a pane), and no [context: ...] suffix -- the left pane
-        # owns the gauge. The styles the caller chose (dark_red outer, magenta
-        # zoom) still color it, so the two loops stay distinguishable.
-        self._flush_pending()
-        stamp = time.strftime("%H:%M:%S")
-        rule, sep = render.GLYPHS["rule"], render.GLYPHS["sep"]
-        header = render.style(f"{rule * 2} {label} {sep} {stamp}", *styles)
-        self._dispatch(lambda: self.stats.on_turn_header(max_context), header)
-
-    def assistant_delta(self, text):
-        # Buffer to whole lines: one UI marshal per line, not per stream chunk.
-        # The partial tail is held here (worker thread) until a newline, the
-        # next tool call, or the end of the turn flushes it.
-        if self._interrupt.is_set():
-            raise KeyboardInterrupt
-        self._pending += text
-        if "\n" in self._pending:
-            done, self._pending = self._pending.rsplit("\n", 1)
-            self._dispatch(None, done)
-
-    def tool_call(self, name, args, read_file=None):
-        self._flush_pending()
-        self._dispatch(None, render.format_tool_call(name, args, read_file))
-
-    def tool_result(self, name, content, raw_content, is_error):
-        self._dispatch(
-            None, render.format_tool_result(name, content, raw_content, is_error)
-        )
-
-    def notice(self, text, *, newline_before=True, stderr=False):
-        # newline_before is a print-stream spacing convention; the log pane is
-        # already line-oriented, so spacer-only notices are dropped (part of
-        # the "more compact" brief) and stderr-ness is meaningless here.
-        self._flush_pending()
-        if text.strip():
-            self._dispatch(None, text)
-
-    def turn_end(self):
-        self._flush_pending()  # no blank line: the pane stays compact
-
-    def zoom_begin(self, pos, small_model, max_context):
-        self._flush_pending()
-        rule = render.GLYPHS["rule"]
-        header = render.style(
-            f"{rule * 2} zoom in: {pos} ({small_model})", "bold", "magenta",
-        )
-        self._dispatch(
-            lambda: self.stats.on_zoom_begin(pos, small_model, max_context),
-            header,
-        )
-
-    def zoom_end(self, text):
-        self._flush_pending()
-        self._dispatch(self.stats.on_zoom_end, text)
-
-    def turn_complete(self, usage, *, zoom):
-        self._dispatch(lambda: self.stats.on_turn_complete(usage, zoom=zoom))
-
-    def wip_patch(self, patch_text):
-        # Parse on the worker thread (the patch can be large); assign on the UI
-        # thread so stats never see a half-built dict.
-        files = patch_file_stats(patch_text)
-        def assign():
-            self.stats.files = files
-        self._dispatch(assign)
-
-    def usage_summary(self, turns, usage, cost):
-        self._flush_pending()
-        line = render.usage_line(turns, usage, cost)
-        self.tail_lines.append(line)
-        self._dispatch(None, line)
-
-    def result_line(self, text):
-        self._flush_pending()
-        self.tail_lines.append(text)
-        self._dispatch(None, text)
+POLL_INTERVAL = 0.25  # display/stats/liveness poll cadence (seconds)
 
 
-class GerbilApp(App):
-    """Two panes and a footer; all real state lives in view.stats."""
+class ViewerApp(App):
+    """Two panes and a footer over a background run's registry files."""
 
     TITLE = "gerbil"
     CSS = f"""
@@ -225,18 +73,31 @@ class GerbilApp(App):
     BINDINGS = [
         Binding("ctrl+c", "interrupt", "interrupt", priority=True),
         Binding("q", "interrupt", "interrupt"),
+        Binding("d", "detach", "background"),
         Binding("enter", "confirm_exit", "exit", show=False),
         Binding("end", "follow", "follow tail"),
     ]
 
-    def __init__(self, view: TuiView, worker: threading.Thread,
-                 theme: str | None = None):
+    def __init__(self, name: str, meta: dict):
         super().__init__()
-        self._view = view
-        self.worker_thread = worker
-        # "light"/"dark" from the project config (cli._resolve_theme validated
-        # it); None keeps textual's default dark scheme.
-        self._gerbil_theme = theme
+        self._name = name
+        self._meta = meta
+        # Seeded so the pane isn't blank while the runner is still booting its
+        # sandbox (the first stats.json arrives at the first session_begin).
+        self.stats = SessionStats(run_name=name, model=meta.get("model") or "")
+        self.stats.session_started = time.monotonic()
+        self.stats.chain_started = self.stats.session_started
+        self.tail: list[str] = []       # result/usage lines, from stats.json
+        self._offset = 0                # read position in display.ansi
+        self._pending = b""             # partial display line, bytes
+        self._interrupt_sent = False    # this viewer asked the runner to stop
+        # How the viewer session ended, read by attach_viewer after run():
+        # "detach" | "detach-unwinding" | "complete" | "interrupted" | "error".
+        self.outcome = "detach"
+
+    @property
+    def _display_path(self):
+        return runs.run_dir(self._name) / "display.ansi"
 
     def compose(self):
         with Horizontal():
@@ -246,128 +107,139 @@ class GerbilApp(App):
         yield Footer()
 
     def on_mount(self):
-        if self._gerbil_theme:
-            self.theme = f"textual-{self._gerbil_theme}"
-        self.set_interval(1.0, self.refresh_stats)  # the elapsed clock tick
-        # Stray print()s from inside the bracket (pricing.py's unknown-pricing
-        # warning, providers.py's Portkey fallback note) land in the log
-        # instead of corrupting the alt screen.
+        theme = self._meta.get("theme")
+        if theme:
+            self.theme = f"textual-{theme}"
+        lines, self._offset, truncated = runs.initial_display(self._display_path)
+        log = self.query_one("#log", RichLog)
+        if truncated:
+            log.write(Text.from_ansi(
+                f"[earlier output omitted; full log: {self._display_path}]"))
+        for line in lines:
+            log.write(Text.from_ansi(line))
+        log.scroll_end(animate=False)
+        # Stray prints from THIS process (e.g. pricing.py's unknown-model
+        # warning, triggered by the cost lookup in render_stats) land in the
+        # log instead of corrupting the alt screen.
         self.begin_capture_print(self)
         self.refresh_stats()
-        self.worker_thread.start()
+        self.set_interval(POLL_INTERVAL, self._poll)
+        self.set_interval(1.0, self.refresh_stats)  # the elapsed clock tick
 
     def on_print(self, event: Print) -> None:
         text = event.text.rstrip("\n")
         if text:
             self._write_log(text)
 
-    # -- events marshaled from the worker (UI thread) -------------------------
+    # -- the poll: display bytes, stats doc, liveness -------------------------
 
-    def apply_event(self, mutate, log_text) -> None:
-        if mutate is not None:
-            mutate()
-        if log_text is not None:
-            self._write_log(log_text)
+    def _poll(self) -> None:
+        self._drain_display()
+
+        doc = runs.load_stats_doc(self._name)
+        if doc is not None and isinstance(doc.get("stats"), dict):
+            # A torn or foreign doc keeps the last-good stats instead.
+            finished, finished_at = self.stats.finished, self.stats.finished_at
+            self.stats = stats_from_wire(doc["stats"])
+            # Viewer-owned state is deliberately not on the wire; reapply it.
+            self.stats.finished, self.stats.finished_at = finished, finished_at
+            self.stats.interrupt_requested = self._interrupt_sent
+            if isinstance(doc.get("tail"), list):
+                self.tail = [str(t) for t in doc["tail"]]
+
+        if self.stats.finished is None:
+            meta = runs.load_meta(self._name) or self._meta
+            self._meta = meta
+            state = runs.classify(meta)
+            if state != "running":
+                self._drain_display()  # the runner's last words, incl. _abort's
+                if state == "died":
+                    self._write_log(
+                        "[runner died without recording an exit status]")
+                self.stats.finished = "error" if state == "died" else state
+                self.stats.finished_at = time.monotonic()
+
         self.refresh_stats()
+
+    def _drain_display(self) -> None:
+        lines, self._pending, self._offset = runs.tail_display(
+            self._display_path, self._offset, self._pending)
+        for line in lines:
+            self._write_log(line)
 
     def _write_log(self, text: str) -> None:
         log = self.query_one("#log", RichLog)
         # Follow the tail only while the user is already at it: a reader who
-        # scrolled back keeps their place, and returning to the bottom (or the
-        # `end` binding) re-engages the auto-follow.
+        # scrolled back keeps their place; the bottom (or `end`) re-engages.
         log.write(Text.from_ansi(text), scroll_end=log.is_vertical_scroll_end)
 
     def refresh_stats(self) -> None:
         pane = self.query_one("#stats", Static)
         width = pane.content_size.width or (STATS_PANE_WIDTH - 2)
-        pane.update(Text.from_ansi(render_stats(self._view.stats, width)))
-
-    # -- end of the run --------------------------------------------------------
-
-    def worker_finished(self, outcome: str) -> None:
-        """Called (via call_from_thread) when the whole run has ended. The app
-        stays up -- the user confirms the exit (q/enter/Ctrl-C) after reading
-        the final state -- rather than yanking the screen away the moment the
-        last session lands."""
-        self._view.stats.finished = outcome
-        self._view.stats.finished_at = time.monotonic()
-        self.refresh_stats()
+        pane.update(Text.from_ansi(render_stats(self.stats, width)))
 
     # -- user actions ----------------------------------------------------------
 
     def action_interrupt(self) -> None:
-        if self._view.stats.finished is not None:
+        if self.stats.finished is not None:
+            self.outcome = self.stats.finished
             self.exit()  # the run already ended; this is the exit confirmation
             return
-        if self._view.interrupt_requested:
-            self.exit()  # second press: detach now, let the worker unwind alone
+        if self._interrupt_sent:
+            self.outcome = "detach-unwinding"
+            self.exit()  # second press: stop watching the unwind
             return
-        self._view.request_interrupt()
+        try:
+            os.kill(self._meta.get("pid") or 0, signal.SIGINT)
+        except (ProcessLookupError, PermissionError):
+            pass  # already gone (or not ours); the next poll classifies it
+        self._interrupt_sent = True
+        self.stats.interrupt_requested = True
         self.refresh_stats()
+
+    def action_detach(self) -> None:
+        if self.stats.finished is not None:
+            self.outcome = self.stats.finished  # nothing left to background
+        self.exit()
 
     def action_confirm_exit(self) -> None:
         # Enter exits only the finished screen; mid-run it does nothing (too
-        # easy to lean on for it to mean "interrupt").
-        if self._view.stats.finished is not None:
+        # easy to lean on for it to mean "interrupt" or "detach").
+        if self.stats.finished is not None:
+            self.outcome = self.stats.finished
             self.exit()
 
     def action_follow(self) -> None:
         self.query_one("#log", RichLog).scroll_end(animate=False)
 
 
-def launch_tui(body, theme: str | None = None) -> None:
-    """Run `body(view)` -- the whole session loop -- under the full-screen app.
+def attach_viewer(name: str) -> int:
+    """Run a viewer over the named background run; returns the process exit
+    code. Detaching leaves the run (and its registry entry) alone; a confirmed
+    exit from the finished screen reprints the run's tail lines onto the
+    normal terminal -- so the outcome survives in scrollback -- and removes
+    the registry entry (the session log and patch live in their usual homes)."""
+    meta = runs.load_meta(name)
+    if meta is None:
+        sys.exit(f"error: no background run named {name!r} "
+                 "(see `gerbil running`)")
 
-    When the run ends (cleanly or not), the app does NOT exit: it shows the
-    outcome in the stats pane and waits for the user to confirm (q, enter, or
-    Ctrl-C), so the final screen can actually be read. The worker's exception
-    (a crash, or the KeyboardInterrupt our cooperative interrupt raises) is
-    captured and re-raised HERE, on the main thread, only after the terminal
-    is restored -- it then flows into cmd_run/cmd_resume's existing `except ->
-    _abort` path, whose stderr message prints legibly onto the normal screen.
-    The finally block also covers main()'s SIGTERM/SIGHUP -> SystemExit
-    handlers firing inside app.run(): the worker is asked to stop and joined
-    (giving the sandbox `with` blocks their normal teardown) before the exit
-    proceeds."""
-    view = TuiView()
-    outcome: dict[str, BaseException] = {}
+    app = ViewerApp(name, meta)
+    app.run()
 
-    def worker():
-        try:
-            body(view)
-            kind = "complete"
-        except BaseException as exc:
-            outcome["exc"] = exc
-            kind = ("interrupted" if isinstance(exc, KeyboardInterrupt)
-                    else "error")
-        try:
-            app.call_from_thread(app.worker_finished, kind)
-        except Exception:
-            pass  # app already gone (detached before the worker finished)
+    if app.outcome in ("detach", "detach-unwinding"):
+        print(f"detached: run continues in the background "
+              f"(reattach: gerbil grab {name})")
+        return 0
 
-    app = GerbilApp(view, threading.Thread(
-        target=worker, daemon=True, name="gerbil-session",
-    ), theme=theme)
-    view.bind(app)
-    try:
-        app.run()
-    finally:
-        view.request_interrupt()
-        if app.worker_thread.is_alive():
-            # Detached (or torn down by a signal) while the session was still
-            # unwinding. Wait for it: the sandbox context managers are on that
-            # thread. A real Ctrl-C works again now that the terminal is
-            # restored -- it abandons the daemon thread, at worst leaving the
-            # container running (the same exposure as kill -9 has always had).
-            print(
-                "waiting for the current operation to finish "
-                "(Ctrl-C to force-quit; that may leave the sandbox container "
-                "running)", file=sys.stderr,
-            )
-            app.worker_thread.join()
-        # The session:/patch:/usage lines, replayed onto the normal screen so
-        # the run's outcome survives in scrollback after the alt screen closed.
-        for line in view.tail_lines:
-            print(line)
-    if "exc" in outcome:
-        raise outcome["exc"]
+    for line in app.tail:
+        print(line)
+    if app.outcome != "complete" and app.stats.session_name:
+        # The run ended early; point at the resume command the same way
+        # _abort does on a foreground crash (its own line is in the display
+        # stream, which is gone with the alt screen).
+        session_log = (runs.RUNNING_DIR.parent / "sessions"
+                       / f"{app.stats.session_name}.jsonl")
+        print(f"resume: gerbil resume {session_log}")
+    runs.remove_run(name)
+    return {"complete": 0, "interrupted": 130}.get(app.outcome, 1)

@@ -10,9 +10,15 @@ implementations exist:
   gerbil has always produced. It is the default everywhere (run_session
   constructs one when no view is passed), so existing tests, piped runs, and
   --plain behave exactly as before.
-- TuiView (tui.py): the full-screen live view. It lives in its own module so
-  this one never imports textual -- the classic path must keep working even if
-  the textual dependency were missing or broken.
+- RunnerView (here): PrintView plus live statistics, for the detached runner
+  process behind a TUI run. Its stdout/stderr are already redirected to the
+  run's display.ansi file, so the inherited prints ARE the stream the viewer
+  (tui.ViewerApp) tails; on top it keeps a SessionStats and persists it to the
+  run's stats.json after every stats-relevant event (see runs.py for the
+  registry layout).
+
+The full-screen app itself lives in tui.py -- the only module that imports
+textual; this one never does.
 
 This module also owns the pure state behind the TUI's left pane:
 
@@ -30,10 +36,11 @@ terminal (tests/test_tui.py), and deliberately free of any textual import.
 
 import sys
 import time
-from dataclasses import dataclass, field
-from typing import Callable, Protocol
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Protocol
 
-from . import render
+from . import render, runs
 from .pricing import estimate_cost
 from .providers import Usage
 
@@ -145,25 +152,6 @@ class PrintView:
         print(text, flush=True)
 
 
-def run_under_view(use_tui: bool, body: Callable[[SessionView], None],
-                   theme: str | None = None) -> None:
-    """Run `body` (the whole session loop) under the chosen view.
-
-    The plain path is deliberately nothing at all: construct a PrintView and
-    call straight through on the caller's thread, so --plain and non-TTY runs
-    have exactly the control flow they had before the TUI existed. The TUI
-    import is deferred to here so the classic path never touches textual.
-
-    `theme` is the TUI's color scheme ("light" or "dark", from the project
-    config; None = the default dark). The plain view has no theme -- its
-    colors are whatever the user's terminal shows for ANSI."""
-    if not use_tui:
-        body(PrintView())
-        return
-    from .tui import launch_tui
-    launch_tui(body, theme=theme)
-
-
 # ---------------------------------------------------------------------------
 # Left-pane state: pure data + pure functions, shared with tests.
 # ---------------------------------------------------------------------------
@@ -225,7 +213,9 @@ class SessionStats:
     (a ralph chain runs several sessions under one TUI), while the chain_*
     fields and chain_started accumulate across the whole run."""
 
-    # Identity (per session)
+    # Identity (per session; run_name spans the whole run and is what
+    # `gerbil grab` takes -- shown in the pane so the user always sees it)
+    run_name: str = ""
     model: str = ""
     small_model: str | None = None
     session_name: str = ""
@@ -398,8 +388,10 @@ def render_stats(stats: SessionStats, width: int, now: float | None = None) -> s
     rule = render.GLYPHS["rule"]
     lines: list[str] = []
 
-    title = f"gerbil {sep} {stats.model}"
+    title = f"gerbil {sep} {stats.run_name or stats.model}"
     lines.append(render.style(title, "bold"))
+    if stats.run_name:
+        lines.append(_stat_row("model", stats.model))
     if stats.small_model:
         lines.append(_stat_row("small:", stats.small_model))
 
@@ -497,3 +489,179 @@ def render_stats(stats: SessionStats, width: int, now: float | None = None) -> s
             lines.append(render.style(f"{label}{' ' * pad}", "gray") + total)
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# The wire format: SessionStats across a process boundary.
+#
+# The runner process owns the stats; the viewer re-renders them. Everything
+# JSON-native crosses as-is; the two things that don't are converted here:
+# time.monotonic() anchors (meaningless in another process -- shipped as
+# elapsed seconds, re-anchored against the reader's own clock so its 1s tick
+# keeps counting between writes) and the files dict's tuple/None values.
+# `finished`/`finished_at`/`interrupt_requested` are deliberately NOT carried:
+# meta.json's status is the authority for how a run ended, and the interrupt
+# banner belongs to the viewer that pressed the key.
+# ---------------------------------------------------------------------------
+
+
+def stats_to_wire(stats: SessionStats, now: float | None = None) -> dict:
+    now = time.monotonic() if now is None else now
+    return {
+        "run_name": stats.run_name,
+        "model": stats.model,
+        "small_model": stats.small_model,
+        "session_name": stats.session_name,
+        "ralph_iteration": stats.ralph_iteration,
+        "ralph_total": stats.ralph_total,
+        "resumed_from": stats.resumed_from,
+        "session_elapsed": max(0.0, now - stats.session_started),
+        "chain_elapsed": max(0.0, now - stats.chain_started),
+        "turns": stats.turns,
+        "zoom_turns": stats.zoom_turns,
+        "max_context": stats.max_context,
+        "zoom_max_context": stats.zoom_max_context,
+        "last_context_tokens": stats.last_context_tokens,
+        "last_zoom_context_tokens": stats.last_zoom_context_tokens,
+        "zoom_active": stats.zoom_active,
+        "outer": asdict(stats.outer),
+        "inner": asdict(stats.inner),
+        "chain_outer": asdict(stats.chain_outer),
+        "chain_inner": asdict(stats.chain_inner),
+        "files": {
+            path: None if counts is None else list(counts)
+            for path, counts in stats.files.items()
+        },
+    }
+
+
+def stats_from_wire(doc: dict, now: float | None = None) -> SessionStats:
+    """Tolerant inverse of stats_to_wire: every field falls back to its
+    default, so a document written by a different gerbil version (or torn in
+    some way the atomic replace didn't catch) degrades the display rather
+    than crashing the viewer."""
+    now = time.monotonic() if now is None else now
+    s = SessionStats()
+
+    def _usage(key: str) -> Usage:
+        val = doc.get(key)
+        if isinstance(val, dict):
+            try:
+                return Usage(**val)
+            except TypeError:
+                pass
+        return Usage()
+
+    def _opt_int(key: str) -> int | None:
+        val = doc.get(key)
+        return int(val) if isinstance(val, (int, float)) and val else None
+
+    s.run_name = str(doc.get("run_name") or "")
+    s.model = str(doc.get("model") or "")
+    s.small_model = doc.get("small_model") or None
+    s.session_name = str(doc.get("session_name") or "")
+    s.ralph_iteration = _opt_int("ralph_iteration")
+    s.ralph_total = _opt_int("ralph_total")
+    s.resumed_from = doc.get("resumed_from") or None
+    s.session_started = now - float(doc.get("session_elapsed") or 0.0)
+    s.chain_started = now - float(doc.get("chain_elapsed") or 0.0)
+    s.turns = int(doc.get("turns") or 0)
+    s.zoom_turns = int(doc.get("zoom_turns") or 0)
+    s.max_context = _opt_int("max_context")
+    s.zoom_max_context = _opt_int("zoom_max_context")
+    s.last_context_tokens = int(doc.get("last_context_tokens") or 0)
+    s.last_zoom_context_tokens = int(doc.get("last_zoom_context_tokens") or 0)
+    s.zoom_active = doc.get("zoom_active") or None
+    s.outer = _usage("outer")
+    s.inner = _usage("inner")
+    s.chain_outer = _usage("chain_outer")
+    s.chain_inner = _usage("chain_inner")
+    files_doc = doc.get("files")
+    if isinstance(files_doc, dict):
+        for path, counts in files_doc.items():
+            try:
+                s.files[str(path)] = (
+                    None if counts is None
+                    else (int(counts[0]), int(counts[1]))
+                )
+            except (TypeError, IndexError, ValueError):
+                continue  # one malformed entry costs one row, not the pane
+    return s
+
+
+class RunnerView(PrintView):
+    """The detached runner's view: the classic stream plus live statistics.
+
+    Runs with stdout/stderr redirected to the run's display.ansi (and
+    GERBIL_FORCE_STYLE keeping render.style live), so the inherited PrintView
+    prints are exactly what the viewer tails. On top, it maintains a
+    SessionStats and rewrites the run's stats.json after every stats-relevant
+    event -- a handful of writes per turn, never per streaming delta. All
+    persistence is best-effort: registry I/O must never take a session down.
+
+    The one display divergence from PrintView is turn_header: the full-width
+    rule render.turn_header draws (at the 80-column non-tty fallback) is wrong
+    inside a viewer pane, so the runner writes the compact divider the
+    in-process TUI used to draw, and leaves the context gauge to the stats
+    pane."""
+
+    wants_wip_patch = True  # the file table is parsed from the wip patch
+
+    def __init__(self, run_dir: Path):
+        self._dir = run_dir
+        self.stats = SessionStats(run_name=run_dir.name)
+        self._tail: list[str] = []
+
+    def _save(self) -> None:
+        try:
+            runs.write_stats_doc(self._dir, {
+                "v": 1,
+                "written_at": time.time(),
+                "stats": stats_to_wire(self.stats),
+                "tail": list(self._tail),
+            })
+        except Exception:
+            pass  # write_stats_doc already swallows OSError; belt and braces
+
+    def session_begin(self, *, name, model, small_model, ralph, resumed_from):
+        self.stats.on_session_begin(
+            name=name, model=model, small_model=small_model, ralph=ralph,
+            resumed_from=resumed_from, now=time.monotonic(),
+        )
+        self._save()
+
+    def turn_header(self, label, *styles, max_context=None, usage=None):
+        stamp = time.strftime("%H:%M:%S")
+        rule, sep = render.GLYPHS["rule"], render.GLYPHS["sep"]
+        print("\n" + render.style(f"{rule * 2} {label} {sep} {stamp}", *styles),
+              flush=True)
+        self.stats.on_turn_header(max_context)
+        self._save()
+
+    def turn_complete(self, usage, *, zoom):
+        self.stats.on_turn_complete(usage, zoom=zoom)
+        self._save()
+
+    def zoom_begin(self, pos, small_model, max_context):
+        super().zoom_begin(pos, small_model, max_context)
+        self.stats.on_zoom_begin(pos, small_model, max_context)
+        self._save()
+
+    def zoom_end(self, text):
+        super().zoom_end(text)
+        self.stats.on_zoom_end()
+        self._save()
+
+    def wip_patch(self, patch_text):
+        self.stats.on_wip_patch(patch_text)
+        self._save()
+
+    def usage_summary(self, turns, usage, cost):
+        super().usage_summary(turns, usage, cost)
+        self._tail.append(render.usage_line(turns, usage, cost))
+        self._save()
+
+    def result_line(self, text):
+        super().result_line(text)
+        self._tail.append(text)
+        self._save()

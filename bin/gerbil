@@ -13,6 +13,8 @@
 #   gerbil cleanup [--at DIR]                               delete committed patches
 #   gerbil summarize [--at DIR]                             token/cost/tool stats
 #   gerbil reconstruct-patch SESSION_FILE [--at DIR]        rebuild a .patch
+#   gerbil running                                          list background runs
+#   gerbil grab [NAME]                                      reattach a background run
 #   gerbil update                                           update to latest main (+ self)
 #   gerbil --version                                        show current version
 #
@@ -252,7 +254,7 @@ remove_old_images() {
 }
 
 usage() {
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 cmd="${1:-}"
@@ -319,10 +321,19 @@ case "$cmd" in
             GERBIL_VERSION="$(cat "$CURRENT_FILE")" \
             uv run --project "$(current_dir)" python -m gerbil reconstruct-patch "$@"
         ;;
+    running|grab)
+        bootstrap_if_needed
+        shift
+        # Host-side registry commands: running lists ~/.gerbil/running/, grab
+        # attaches a viewer to an already-running sandboxed session -- neither
+        # boots a container, so no image is needed.
+        exec env GERBIL_CWD="$PWD" uv run --project "$(current_dir)" \
+            python -m gerbil "$cmd" "$@"
+        ;;
     ""|-h|--help|help)
         usage
         ;;
     *)
-        die "unknown command '$cmd' (try: run, resume, commit, cleanup, summarize, reconstruct-patch, update, --version)"
+        die "unknown command '$cmd' (try: run, resume, commit, cleanup, summarize, reconstruct-patch, running, grab, update, --version)"
         ;;
 esac

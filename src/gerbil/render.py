@@ -27,7 +27,13 @@ import textwrap
 from datetime import datetime
 
 # https://no-color.org/ -- any non-empty NO_COLOR disables color.
-ENABLED = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+# GERBIL_FORCE_STYLE keeps styling on when stdout is not a tty: a detached
+# runner's stdout is the display file a live viewer tails and re-renders, so
+# the escapes are wanted there. Only gerbil's own spawner sets it (cli.
+# _spawn_and_attach); NO_COLOR still wins.
+ENABLED = (
+    sys.stdout.isatty() or bool(os.environ.get("GERBIL_FORCE_STYLE"))
+) and not os.environ.get("NO_COLOR")
 
 
 _BOX_GLYPHS = {"rule": "─", "sep": "·"}

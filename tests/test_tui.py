@@ -1,11 +1,12 @@
 """Tests for the live-view plumbing: view.py's stats model, patch parser, and
 left-pane renderer; PrintView's byte-compatibility with the historical inline
-prints; and TuiView's worker-side plumbing against a stub app.
+prints; and RunnerView (the detached runner's PrintView-plus-stats).
 
-No Docker, no network, no real terminal (the textual App itself is exercised
-by hand -- see CLAUDE.md; everything below it is covered here headlessly).
-render.style() is a no-op off a TTY, so output is plain text and substring
-asserts work. Run: uv run python tests/test_tui.py
+No Docker, no network, no real terminal (the textual viewer app itself is
+exercised by hand and by tests/fake_runner.py -- see CLAUDE.md; everything
+below it is covered here headlessly). The registry itself is covered by
+tests/test_runs.py. render.style() is a no-op off a TTY, so output is plain
+text and substring asserts work. Run: uv run python tests/test_tui.py
 """
 
 import contextlib
@@ -440,88 +441,87 @@ def test_printview_byte_compat() -> None:
 
 
 # ---------------------------------------------------------------------------
-# TuiView worker-side plumbing (stub app; no textual event loop)
+# RunnerView: the detached runner's PrintView-plus-stats (stub registry dir)
 # ---------------------------------------------------------------------------
 
 
-class StubApp:
-    """Duck-types the two things TuiView touches: call_from_thread (run
-    inline) and apply_event (collect log writes, run mutations)."""
+def test_runner_view() -> None:
+    import json
+    import tempfile
+    from pathlib import Path
 
-    def __init__(self):
-        self.logged: list[str] = []
+    from gerbil import view as view_mod
+    from gerbil.view import RunnerView, stats_from_wire
 
-    def call_from_thread(self, fn, *args):
-        fn(*args)
+    d = Path(tempfile.mkdtemp()) / "brave-otter"
+    d.mkdir()
+    rv = RunnerView(d)
+    pv = PrintView()
+    check("RunnerView wants the wip patch", rv.wants_wip_patch is True, "")
+    check("run name seeded from the dir", rv.stats.run_name == "brave-otter",
+          rv.stats.run_name)
 
-    def apply_event(self, mutate, log_text):
-        if mutate is not None:
-            mutate()
-        if log_text is not None:
-            self.logged.append(log_text)
+    # Every non-overridden method is byte-identical to PrintView -- the
+    # display stream the viewer tails IS the classic stream.
+    cases = [
+        ("banner", lambda v: v.banner("[context window: 1 tokens]")),
+        ("assistant_delta", lambda v: v.assistant_delta("stream chunk")),
+        ("tool_call", lambda v: v.tool_call("bash", {"command": "ls"})),
+        ("tool_result", lambda v: v.tool_result("bash", "ok", "ok", False)),
+        ("notice", lambda v: v.notice("[note]")),
+        ("turn_end", lambda v: v.turn_end()),
+        ("zoom_begin", lambda v: v.zoom_begin("Foo.lean:3", "small-x", None)),
+        ("zoom_end", lambda v: v.zoom_end("===== zoom out (2 turns) =====")),
+        ("result_line", lambda v: v.result_line("session: /tmp/x")),
+        ("usage_summary", lambda v: v.usage_summary(
+            1, Usage(input_tokens=10, output_tokens=1), None)),
+    ]
+    for label, call in cases:
+        got, _ = _capture(lambda: call(rv))
+        want, _ = _capture(lambda: call(pv))
+        check(f"runner {label} == PrintView", got == want,
+              f"{got!r} != {want!r}")
 
+    # turn_header is the one display divergence: a compact divider, not the
+    # full-width rule (wrong inside a viewer pane).
+    got, _ = _capture(lambda: rv.turn_header(
+        "turn 1", "bold", max_context=100_000, usage=None))
+    rule, sep = render.GLYPHS["rule"], render.GLYPHS["sep"]
+    check("compact turn_header",
+          got.startswith(f"\n{rule * 2} turn 1 {sep} ") and got.endswith("\n")
+          and rule * 10 not in got, repr(got))
+    check("turn_header feeds the window", rv.stats.max_context == 100_000,
+          str(rv.stats.max_context))
 
-def test_tuiview_plumbing() -> None:
-    from gerbil.tui import TuiView
+    # Stats persistence: the sidecar parses back through the wire format.
+    with contextlib.redirect_stdout(io.StringIO()):
+        rv.session_begin(name="gerbil-x-01", model=PRICED_MODEL,
+                         small_model=None, ralph=None, resumed_from=None)
+        rv.turn_complete(Usage(input_tokens=10, output_tokens=2), zoom=False)
+        rv.wip_patch("diff --git a/A.lean b/A.lean\n+x\n")
+        rv.result_line("session: /tmp/s.jsonl")
+        rv.usage_summary(1, Usage(input_tokens=10, output_tokens=2), None)
+    doc = json.loads((d / "stats.json").read_text())
+    s = stats_from_wire(doc["stats"])
+    check("stats.json round-trips",
+          s.turns == 1 and s.files == {"A.lean": (1, 0)}
+          and s.session_name == "gerbil-x-01" and s.run_name == "brave-otter",
+          str(doc["stats"]))
+    # (the byte-compat sweep above also exercised result_line/usage_summary,
+    # so the tail holds those entries too -- assert on the latest pair)
+    check("tail carried in the doc", len(doc["tail"]) >= 2
+          and doc["tail"][-2] == "session: /tmp/s.jsonl", str(doc["tail"]))
 
-    view = TuiView()
-    app = StubApp()
-    view.bind(app)
-    check("TuiView wants the wip patch", view.wants_wip_patch is True, "")
-
-    # Deltas buffer to whole lines; the partial tail is held until flushed.
-    view.assistant_delta("hello ")
-    check("partial line held", app.logged == [], str(app.logged))
-    view.assistant_delta("world\nand a partial")
-    check("completed line emitted", app.logged == ["hello world"],
-          str(app.logged))
-    view.tool_call("bash", {"command": "ls"})
-    check("tool_call flushes the partial first",
-          app.logged[1] == "and a partial" and "bash" in app.logged[2],
-          str(app.logged))
-
-    # Spacer-only notices are dropped (compactness); real ones logged.
-    n = len(app.logged)
-    view.notice("", newline_before=False)
-    view.turn_end()
-    check("spacers dropped", len(app.logged) == n, str(app.logged[n:]))
-    view.notice("[stopped: reached max_turns=5]")
-    check("real notice logged", app.logged[-1] == "[stopped: reached max_turns=5]",
-          str(app.logged[-1]))
-
-    # Stats flow: session_begin -> turn_complete -> wip_patch.
-    view.session_begin(name="s1", model=PRICED_MODEL, small_model=None,
-                       ralph=None, resumed_from=None)
-    view.turn_complete(Usage(input_tokens=10, output_tokens=1), zoom=False)
-    view.wip_patch("diff --git a/A.lean b/A.lean\n+x\n")
-    check("stats updated through the stub",
-          view.stats.turns == 1 and view.stats.files == {"A.lean": (1, 0)},
-          f"{view.stats.turns}/{view.stats.files}")
-
-    # result_line / usage_summary retain the tail for the post-exit reprint.
-    view.result_line("session: /tmp/s.jsonl")
-    view.usage_summary(1, Usage(input_tokens=10, output_tokens=1), None)
-    check("tail retained", len(view.tail_lines) == 2
-          and view.tail_lines[0] == "session: /tmp/s.jsonl",
-          str(view.tail_lines))
-    check("tail also logged", app.logged[-1] == view.tail_lines[-1],
-          str(app.logged[-1]))
-
-    # The cooperative interrupt lands on the next view event, in this thread.
-    view.request_interrupt()
-    check("interrupt flag visible", view.interrupt_requested
-          and view.stats.interrupt_requested, "")
-    for call in (lambda: view.banner("x"),
-                 lambda: view.assistant_delta("y"),
-                 lambda: view.turn_complete(Usage(), zoom=False)):
-        try:
-            call()
-            check("view event raises KeyboardInterrupt after interrupt", False,
-                  "no exception")
-        except KeyboardInterrupt:
-            pass
-    check("view events raise KeyboardInterrupt after interrupt", True, "")
-
+    # Registry I/O failure must never escape a view method.
+    real_write = view_mod.runs.write_stats_doc
+    view_mod.runs.write_stats_doc = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("disk gone"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rv.turn_complete(Usage(input_tokens=1), zoom=False)
+        check("failing stats write never raises", True, "")
+    finally:
+        view_mod.runs.write_stats_doc = real_write
 
 def main() -> None:
     test_patch_parser_multi_commit()
@@ -531,7 +531,7 @@ def main() -> None:
     test_render_stats_finished()
     test_resolve_theme()
     test_printview_byte_compat()
-    test_tuiview_plumbing()
+    test_runner_view()
     print("\nAll tui tests passed.")
 
 

@@ -66,13 +66,20 @@ src/gerbil/
                         tool-call/result, context, and usage formatting
   view.py               where session output goes: the SessionView protocol,
                         PrintView (the classic scrolling stream, byte-for-byte
-                        the old inline prints, and the default everywhere), and
-                        the TUI's pure state -- SessionStats, the wip-patch
-                        per-file +/- parser, render_stats. Never imports textual
-  tui.py                the full-screen live view (textual): stats pane left,
-                        scrolling turn output right; agent loop on a worker
-                        thread, cooperative Ctrl-C. The only module that
-                        imports textual
+                        the old inline prints, and the default everywhere),
+                        RunnerView (PrintView + live stats persisted for a
+                        viewer), and the live view's pure state -- SessionStats
+                        (+ its wire format), the wip-patch per-file +/- parser,
+                        render_stats. Never imports textual
+  runs.py               the background-run registry (~/.gerbil/running/<name>/):
+                        adjective-animal naming, meta/stats files (atomic
+                        replace, tolerant reads), pid liveness + the one
+                        classify() rule, display-file tailing, and the runner
+                        exit-status wrapper. Stdlib only
+  tui.py                the full-screen viewer (textual): stats pane left,
+                        scrolling display-stream tail right, attached to a
+                        detached runner process via the registry files. The
+                        only module that imports textual
   providers.py          unified LLM streaming over gemini/anthropic/openai/
                         ollama/portkey
   ollama.py             host-side ollama server detect/start/stop + model check
@@ -232,6 +239,11 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   are already committed (same stable patch-id test as `gerbil commit`); patches
   not yet committed are never touched, and the `~/.gerbil/sessions/` archive
   copies are kept.
+- `gerbil running` — list the background runs (name, status, project, model,
+  session, turns, context %, elapsed); finished/died runs are shown one last
+  time, then their registry entries are pruned.
+- `gerbil grab [NAME]` — reattach the full-screen viewer to a background run
+  (bare form works when exactly one run is active).
 - `gerbil summarize` — token/cost/tool/status stats across `.gerbil/*.jsonl`,
   plus a per-session table (cost, `.lean` lines +/- from the commit each log
   was folded into or its uncommitted `.patch`, running lean-code total
@@ -240,23 +252,33 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   tool calls* (`bash`/`write_file`/`edit_file`; read-only/`lean_*` skipped) in a
   fresh sandbox, no LLM involved.
 
-**Live view vs `--plain`**: on a terminal, `gerbil run`/`resume` render the
-session as a full-screen textual app — left pane with live stats (per-file
+**Live view, background runs, `--plain`**: on a terminal, `gerbil run`/`resume`
+never run the session in the terminal-attached process. After preflight,
+`cli._spawn_and_attach` starts a detached *runner* child (`--_runner NAME`, a
+hidden flag; `start_new_session` so it survives the terminal) and the process
+becomes a full-screen *viewer* over it — left pane with live stats (per-file
 +/- lines parsed from the wip patch, turns, ralph i/N, context %, tokens, a
-running cost estimate, wall clock), right pane scrolling a compact version of
-the classic output. One app spans a whole ralph chain (like the sandbox).
-`--plain`, or any non-TTY stdout, selects the classic scrolling print stream
-instead — which is byte-for-byte the pre-TUI output (PrintView pins it; see
-view.py). The view is display-only: what reaches the session log, the patch,
-and the model never depends on it. Ctrl-C in the TUI is cooperative (lands at
-the next output event; a second press detaches the UI) and ends in the same
-`_abort` path as before, after the terminal is restored. When the run ends —
-complete, interrupted, or crashed — the app holds the finished screen (clocks
-frozen, outcome banner in the stats pane) until the user confirms with
-q/enter/Ctrl-C; the `session:`/`patch:`/usage lines are then reprinted onto
-the normal terminal. `theme = "light" | "dark"` in
-`<project>/.gerbil/config.toml` picks the TUI's color scheme
-(`cli._resolve_theme`, validated at preflight; default dark).
+running cost estimate, wall clocks), right pane tailing the runner's output
+stream. The two share only the registry files in `~/.gerbil/running/<name>/`
+(see runs.py): `display.ansi` (the child's stdout+stderr — the classic stream,
+ANSI kept alive by `GERBIL_FORCE_STYLE`), `stats.json` (SessionStats over the
+wire; monotonic anchors ship as elapsed seconds), and `meta.json` (pid +
+status, the authority on how a run ended — written by `runs.run_runner`, the
+`main()`-level wrapper, whatever the exit path). One run name spans a whole
+ralph chain. Keys: `d` detaches (the run continues; `gerbil running` lists it,
+`gerbil grab NAME` reattaches, bare `gerbil grab` picks the only live run);
+Ctrl-C/q interrupt — a real SIGINT to the runner, i.e. exactly a `--plain`
+Ctrl-C over there — and a second press closes the viewer while it unwinds.
+When the run ends (complete/interrupted/error, or the runner died), the viewer
+holds the finished screen until q/enter/Ctrl-C confirms; only a confirmed exit
+removes the registry entry and reprints the `session:`/`patch:`/usage tail
+(plus a resume hint on early endings) onto the normal terminal. `--plain`, or
+any non-TTY stdout, skips all of this and runs in-process — byte-for-byte the
+pre-TUI output (PrintView pins it; see view.py). The view is display-only:
+what reaches the session log, the patch, and the model never depends on it.
+`theme = "light" | "dark"` in `<project>/.gerbil/config.toml` picks the
+viewer's color scheme (`cli._resolve_theme`, validated at preflight; default
+dark).
 
 **Big-small mode** (`--small-model M`): the big model (`--model`) drives the
 session and gets a `zoom_in(prompt, file, line[, column])` tool; calling it sets
@@ -389,7 +411,10 @@ uv run python tests/test_summarize_lean.py  # summarize's lean-line deltas + run
 uv run python tests/test_render.py       # terminal rendering
 uv run python tests/test_tui.py          # live view: stats model, wip-patch file
                                          # parser, left pane, PrintView byte-compat,
-                                         # TuiView plumbing (no Docker, no terminal)
+                                         # RunnerView (no Docker, no terminal)
+uv run python tests/test_runs.py         # background-run registry: naming, liveness,
+                                         # display tailing, stats wire format,
+                                         # running/grab commands (no Docker)
 uv run python tests/test_empty_turn.py   # glitched empty-turn guard + filter (no network)
 uv run python tests/test_sandbox_cleanup.py  # container cleanup on interrupt (no Docker)
 uv run python tests/test_ollama.py       # ollama provider plumbing (no Docker; live smoke if a server is up)
@@ -401,7 +426,10 @@ GOOGLE_API_KEY=... uv run python tests/test_gemini.py   # live Gemini backend
 ```
 
 Most require Docker and the `gerbil-lean-sandbox` image; `test_gemini.py` needs a real
-API key. `test_ollama.py` and `test_portkey.py` need neither Docker nor a key
+API key. `tests/fake_runner.py` is not a test but a prop: it registers and
+plays a fake background run so the viewer can be exercised by hand
+(`uv run python tests/fake_runner.py &` then `gerbil grab fake-run`) without
+Docker or a model. `test_ollama.py` and `test_portkey.py` need neither Docker nor a key
 (each runs a live smoke only if its backend is already reachable/configured).
 
 The container-backed tests run against whichever runtime `GERBIL_SANDBOX`

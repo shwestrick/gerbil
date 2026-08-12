@@ -30,6 +30,12 @@ append-only record of every context window a provider has reported (see
 context_windows.py). A run compares it against the built-in table and warns
 about disagreements.
 
+On a terminal, run/resume execute in a detached runner process registered
+under ~/.gerbil/running/<name>/ (see runs.py) with the full-screen app as a
+detachable viewer over it; `gerbil running` lists these and `gerbil grab NAME`
+reattaches. The registry is bookkeeping only -- the outputs above are
+unaffected.
+
 With --ralph N, N sessions run back-to-back on the same prompt (reusing the
 sandbox); outputs are numbered gerbil-TIMESTAMP-NN and each session builds on
 the previous one's commit.
@@ -45,11 +51,12 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import tomllib
 from datetime import datetime
 from pathlib import Path
 
-from . import runtime
+from . import runs, runtime
 from .agent import DEFAULT_INNER_MAX_TURNS, run_session
 from .context_windows import OBSERVATIONS_PATH, table_drift
 from .pricing import (
@@ -62,7 +69,7 @@ from .sandbox import LeanSandbox, submodule_entries
 from .session import Session
 from .render import style
 from .tools import Toolset
-from .view import SessionView, run_under_view
+from .view import PrintView, RunnerView, SessionView
 
 
 DEFAULT_MODEL = "gemini-3.1-pro-preview"
@@ -417,6 +424,10 @@ def main() -> None:
         help="Use the classic scrolling print output instead of the full-screen "
         "live view (chosen automatically when stdout is not a terminal).",
     )
+    # Internal: marks this process as the detached runner behind a TUI run
+    # (see _spawn_and_attach). Hidden from --help; never passed by hand.
+    run_p.add_argument("--_runner", metavar="NAME", default=None,
+                       help=argparse.SUPPRESS)
     run_p.set_defaults(func=cmd_run)
 
     resume_p = sub.add_parser(
@@ -488,7 +499,26 @@ def main() -> None:
         help="Use the classic scrolling print output instead of the full-screen "
         "live view (chosen automatically when stdout is not a terminal).",
     )
+    resume_p.add_argument("--_runner", metavar="NAME", default=None,
+                          help=argparse.SUPPRESS)
     resume_p.set_defaults(func=cmd_resume)
+
+    running_p = sub.add_parser(
+        "running", help="list gerbil runs currently active in the background"
+    )
+    running_p.set_defaults(func=cmd_running)
+
+    grab_p = sub.add_parser(
+        "grab", help="reattach the full-screen view to a background run"
+    )
+    grab_p.add_argument(
+        "name",
+        metavar="NAME",
+        nargs="?",
+        help="The run to attach to (see `gerbil running`). May be omitted "
+        "when exactly one run is active.",
+    )
+    grab_p.set_defaults(func=cmd_grab)
 
     commit_p = sub.add_parser(
         "commit", help="git am the patches gerbil produced into the repo, in order"
@@ -559,7 +589,14 @@ def main() -> None:
     recon_p.set_defaults(func=cmd_reconstruct_patch)
 
     args = parser.parse_args()
-    args.func(args)
+    if getattr(args, "_runner", None):
+        # This process is the detached runner behind a TUI run: record its
+        # pid up front and, however the command ends (clean return, _abort's
+        # sys.exit, a signal-handler SystemExit), record how -- the viewer and
+        # `gerbil running` read that status as the truth about the run.
+        runs.run_runner(args._runner, lambda: args.func(args))
+    else:
+        args.func(args)
 
 
 def _patch_id(repo_dir: Path, text: str) -> str | None:
@@ -1339,6 +1376,46 @@ def _use_tui(args) -> bool:
     return not args.plain and sys.stdout.isatty()
 
 
+def _spawn_and_attach(*, project_dir: Path, model: str,
+                      theme: str | None) -> None:
+    """TUI mode always runs detached: re-invoke this same command as a runner
+    child in its own session (so it survives the terminal and never sees the
+    tty's signals), then become a viewer over it. Never returns -- exits with
+    the viewer's verdict. `d` in the viewer (or its death) leaves the run
+    going; `gerbil grab` attaches a fresh viewer later.
+
+    The child's stdout and stderr share ONE file handle onto display.ansi --
+    a single append offset, so the two streams can't corrupt each other's
+    lines -- and the env keeps the stream viewer-ready: GERBIL_FORCE_STYLE
+    (ANSI despite the non-tty stdout), PYTHONUNBUFFERED (stray prints that
+    don't flush still arrive promptly), PYTHONIOENCODING (the viewer decodes
+    UTF-8 regardless of locale)."""
+    name = runs.new_run_name()
+    rd = runs.create_run(name, project_dir=project_dir, model=model,
+                         theme=theme, command=sys.argv[1:])
+    env = os.environ | {
+        "GERBIL_FORCE_STYLE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
+    with (rd / "display.ansi").open("ab") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "gerbil", *sys.argv[1:], "--_runner", name],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            start_new_session=True, env=env, cwd=os.getcwd(),
+        )
+    runs.save_meta(name, pid=proc.pid, status="running")
+    from .tui import attach_viewer  # deferred: textual loads only for a tty
+    sys.exit(attach_viewer(name))
+
+
+def _session_view(args) -> SessionView:
+    """The view for an in-process session loop: the runner child persists live
+    stats for its viewer; everything else is the classic print stream."""
+    return (RunnerView(runs.run_dir(args._runner)) if args._runner
+            else PrintView())
+
+
 def cmd_run(args) -> None:
     if not args.prompt:
         sys.exit("error: --prompt is required "
@@ -1367,6 +1444,16 @@ def cmd_run(args) -> None:
     _warn_context_window_drift()
     if not prompt_file.is_file():
         sys.exit(f"error: {prompt_file} is not a file")
+    theme = _resolve_theme(project_dir)  # validated pre-spawn, like the rest
+
+    # TUI mode never runs the session here: with the preflight passed on the
+    # real terminal, hand the whole command to a detached runner child and
+    # become its viewer (never returns). The child re-enters cmd_run with
+    # --_runner set, re-runs the read-only preflight harmlessly, and proceeds
+    # below with a RunnerView.
+    if args._runner is None and _use_tui(args):
+        _spawn_and_attach(project_dir=project_dir, model=args.model,
+                          theme=theme)
 
     prompt = prompt_file.read_text()
     timestamp = datetime.now().strftime("%y%m%d-%H%M%S")
@@ -1503,8 +1590,7 @@ def cmd_run(args) -> None:
                             if _ralph_done(sandbox, ralph_done_script, view):
                                 break
 
-                run_under_view(_use_tui(args), _sessions,
-                               theme=_resolve_theme(project_dir))
+                _sessions(_session_view(args))
     except (Exception, KeyboardInterrupt) as exc:
         # Catch both crashes and Ctrl-C (KeyboardInterrupt is a BaseException, not
         # an Exception, so it must be named explicitly). The sandbox/MCP context
@@ -1618,6 +1704,15 @@ def cmd_resume(args) -> None:
     _require_clean_submodules(repo_root)
     _require_container_runtime()
     _warn_context_window_drift()
+    theme = _resolve_theme(project_dir)
+
+    # As in cmd_run: on a terminal, the resume happens in a detached runner
+    # child and this process becomes its viewer. Placed after parse_session
+    # (the run's meta wants the model) and before the gray informational
+    # prints below, so nothing is printed twice by parent and child.
+    if args._runner is None and _use_tui(args):
+        _spawn_and_attach(project_dir=project_dir, model=parsed.model,
+                          theme=theme)
 
     archive_dir = Path.home() / ".gerbil" / "sessions"
     archive_dir.mkdir(parents=True, exist_ok=True)
@@ -1843,12 +1938,86 @@ def cmd_resume(args) -> None:
                             if _ralph_done(sandbox, ralph_done_script, view):
                                 break
 
-                run_under_view(_use_tui(args), _sessions,
-                               theme=_resolve_theme(project_dir))
+                _sessions(_session_view(args))
     except (Exception, KeyboardInterrupt) as exc:
         # A resumed run is itself resumable: _abort points at this continuation's
         # own log (and Ctrl-C is caught the same as a crash -- see cmd_run).
         _abort(exc, session)
+
+
+def _elapsed_str(seconds: float) -> str:
+    s = max(0, int(seconds))
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def cmd_running(args) -> None:
+    """List the background runs. Finished (or died) runs are shown one last
+    time with their outcome, then their registry entries are pruned -- the
+    entries are bookkeeping only; the session logs and patches live in
+    ~/.gerbil/sessions/ and each project's .gerbil/ as always."""
+    entries = runs.list_runs()
+    if not entries:
+        print("no background runs.")
+        return
+
+    rows = [("NAME", "STATUS", "PROJECT", "MODEL", "SESSION", "TURNS",
+             "CTX", "ELAPSED")]
+    finished = []
+    for e in entries:
+        stats_doc = (e.get("stats") or {}).get("stats") or {}
+        if e["state"] in (*runs.TERMINAL_STATUSES, "died"):
+            finished.append(e["name"])
+            end = e.get("finished_at") or time.time()
+        else:
+            end = time.time()
+        ctx = ""
+        used, window = (stats_doc.get("last_context_tokens"),
+                        stats_doc.get("max_context"))
+        if used and window:
+            ctx = f"{used / window:.0%}"
+        rows.append((
+            e["name"],
+            e["state"],
+            Path(e.get("project_dir") or "?").name,
+            e.get("model") or "?",
+            stats_doc.get("session_name") or "-",
+            str(stats_doc.get("turns") or 0),
+            ctx,
+            _elapsed_str(end - (e.get("started_at") or end)),
+        ))
+
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for i, row in enumerate(rows):
+        line = "  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip()
+        print(style(line, "bold") if i == 0 else line)
+
+    live = [e["name"] for e in entries if e["state"] == "running"]
+    if live:
+        print(style(f"\nreattach with: gerbil grab {live[0]}", "gray"))
+    for name in finished:
+        runs.remove_run(name)
+
+
+def cmd_grab(args) -> None:
+    """Reattach the full-screen viewer to a background run."""
+    entries = runs.list_runs()
+    live = [e["name"] for e in entries if e["state"] == "running"]
+    name = args.name
+    if name is None:
+        if not live:
+            sys.exit("no background runs. (see `gerbil running`)")
+        if len(live) > 1:
+            sys.exit("several runs are active -- name one:\n  "
+                     + "\n  ".join(f"gerbil grab {n}" for n in live))
+        name = live[0]
+    elif runs.load_meta(name) is None:
+        listing = f" active runs: {', '.join(live)}" if live else ""
+        sys.exit(f"error: no background run named {name!r}.{listing}")
+    if not sys.stdout.isatty():
+        sys.exit(f"error: grab needs a terminal. To watch without one:\n"
+                 f"  tail -f {runs.run_dir(name) / 'display.ansi'}")
+    from .tui import attach_viewer
+    sys.exit(attach_viewer(name))
 
 
 # The tool calls that mutate sandbox state and so must be replayed to reproduce a
