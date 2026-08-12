@@ -269,7 +269,8 @@ def test_session_escalates_and_stops():
     real_turn = agent._run_turn_with_retry
     real_window = agent.get_context_window
 
-    def stub(model, system, messages, tools, provider, read_file=None, session=None):
+    def stub(model, system, messages, tools, provider, read_file=None, session=None,
+             view=None):
         i = min(state["n"], len(percentages) - 1)
         state["n"] += 1
         usage = usage_at(percentages[i])

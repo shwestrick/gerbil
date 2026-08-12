@@ -13,6 +13,9 @@ dependencies = [
     "openai>=1.50",
     "google-genai>=0.3",
     "portkey-ai>=2.0",
+    # The full-screen live session view (tui.py). The classic print view
+    # (--plain, or any non-TTY stdout) never imports it at runtime.
+    "textual>=1.0",
 ]
 
 [project.scripts]

@@ -197,7 +197,8 @@ def test_mid_zoom_continuation() -> None:
 
     calls = []
 
-    def stub(model, system, messages, tools, provider, read_file=None, session=None):
+    def stub(model, system, messages, tools, provider, read_file=None, session=None,
+             view=None):
         calls.append({"model": model, "last_role": messages[-1]["role"],
                       "n_messages": len(messages)})
         if model == "claude-haiku-4-5-20251001":

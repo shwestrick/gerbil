@@ -58,7 +58,8 @@ def scripted(turns):
     """
     state = {"n": 0, "calls": []}
 
-    def stub(model, system, messages, tools, provider, read_file=None, session=None):
+    def stub(model, system, messages, tools, provider, read_file=None, session=None,
+             view=None):
         state["calls"].append({
             "model": model, "n_messages": len(messages),
             "tools": [t["name"] for t in tools],

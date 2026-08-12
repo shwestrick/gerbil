@@ -64,6 +64,15 @@ src/gerbil/
   render.py             ALL human-readable terminal rendering: the ANSI style()
                         helper (respects NO_COLOR / non-TTY) and the pretty
                         tool-call/result, context, and usage formatting
+  view.py               where session output goes: the SessionView protocol,
+                        PrintView (the classic scrolling stream, byte-for-byte
+                        the old inline prints, and the default everywhere), and
+                        the TUI's pure state -- SessionStats, the wip-patch
+                        per-file +/- parser, render_stats. Never imports textual
+  tui.py                the full-screen live view (textual): stats pane left,
+                        scrolling turn output right; agent loop on a worker
+                        thread, cooperative Ctrl-C. The only module that
+                        imports textual
   providers.py          unified LLM streaming over gemini/anthropic/openai/
                         ollama/portkey
   ollama.py             host-side ollama server detect/start/stop + model check
@@ -212,9 +221,10 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
 
 - `gerbil run --prompt FILE [--model M] [--small-model M] [--zoom-max-turns N]
   [--ralph N] [--ralph_done SCRIPT] [--max-turns N] [--image IMAGE]
-  [--skip-cache] [--no-mcp] [--omit-session-log]`
+  [--skip-cache] [--no-mcp] [--omit-session-log] [--plain]`
 - `gerbil resume LOG [--at DIR] [--max-turns N] [--zoom-max-turns N] [--image
-  IMAGE] [--skip-cache] [--no-mcp] [--ralph_done SCRIPT] [--omit-session-log]` —
+  IMAGE] [--skip-cache] [--no-mcp] [--ralph_done SCRIPT] [--omit-session-log]
+  [--plain]` —
   continue a crashed/interrupted session (model and prompt come from the log).
 - `gerbil commit` — `git am` the project's `.gerbil/*.patch` in order, skipping
   already-applied (by stable patch-id) and stale (non-applying) patches.
@@ -229,6 +239,18 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
 - `gerbil reconstruct-patch LOG [--image IMAGE]` — rebuild a `.patch` by *replaying the logged
   tool calls* (`bash`/`write_file`/`edit_file`; read-only/`lean_*` skipped) in a
   fresh sandbox, no LLM involved.
+
+**Live view vs `--plain`**: on a terminal, `gerbil run`/`resume` render the
+session as a full-screen textual app — left pane with live stats (per-file
++/- lines parsed from the wip patch, turns, ralph i/N, context %, tokens, a
+running cost estimate, wall clock), right pane scrolling a compact version of
+the classic output. One app spans a whole ralph chain (like the sandbox).
+`--plain`, or any non-TTY stdout, selects the classic scrolling print stream
+instead — which is byte-for-byte the pre-TUI output (PrintView pins it; see
+view.py). The view is display-only: what reaches the session log, the patch,
+and the model never depends on it. Ctrl-C in the TUI is cooperative (lands at
+the next output event; a second press detaches the UI) and ends in the same
+`_abort` path as before, after the terminal is restored.
 
 **Big-small mode** (`--small-model M`): the big model (`--model`) drives the
 session and gets a `zoom_in(prompt, file, line[, column])` tool; calling it sets
@@ -335,7 +357,9 @@ podman build --build-arg SANDBOX_UID=0 -t gerbil-lean-sandbox:latest src/lean-sa
 Dependencies (managed by `uv`, see pyproject.toml): `docker`, `mcp`, and all
 four provider SDKs (`anthropic`, `openai`, `google-genai`, `portkey-ai`) are
 core deps so any `--model` works out of the box. `providers.py` imports only
-the selected SDK at runtime. Requires Python ≥ 3.12.
+the selected SDK at runtime. `textual` powers the live view; only tui.py
+imports it, and the `--plain`/non-TTY path never loads it. Requires
+Python ≥ 3.12.
 
 ## Testing
 
@@ -356,6 +380,9 @@ uv run python tests/test_image_config.py # image selection + compatibility check
 uv run python tests/test_mathlib_detect.py  # mathlib dependency detection (no Docker)
 uv run python tests/test_summarize_lean.py  # summarize's lean-line deltas + running-total anchor (no Docker)
 uv run python tests/test_render.py       # terminal rendering
+uv run python tests/test_tui.py          # live view: stats model, wip-patch file
+                                         # parser, left pane, PrintView byte-compat,
+                                         # TuiView plumbing (no Docker, no terminal)
 uv run python tests/test_empty_turn.py   # glitched empty-turn guard + filter (no network)
 uv run python tests/test_sandbox_cleanup.py  # container cleanup on interrupt (no Docker)
 uv run python tests/test_ollama.py       # ollama provider plumbing (no Docker; live smoke if a server is up)

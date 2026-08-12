@@ -7,7 +7,6 @@ and the sandbox tools (tools.dispatch), recording every turn, tool call, and
 tool result to the Session as it goes.
 """
 
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,15 +33,9 @@ from .providers import (
 )
 from .sandbox import LeanSandbox
 from .session import Session
-from .render import (
-    _clip,
-    format_tool_call,
-    format_tool_result,
-    print_usage,
-    style,
-    turn_header,
-)
+from .render import _clip, style
 from .tools import ZOOM_OUT_TOOL, Toolset, truncate_tool_output
+from .view import PrintView, SessionView
 
 
 @dataclass
@@ -140,11 +133,13 @@ def _usage_any(u: Usage) -> bool:
     )
 
 
-def _run_turn(model, system, messages, tools, provider, read_file=None):
-    """Stream a single turn, printing text and tool calls live.
+def _run_turn(model, system, messages, tools, provider, read_file=None,
+              view: SessionView | None = None):
+    """Stream a single turn, showing text and tool calls live via `view`.
 
     Returns (assistant_parts, tool_calls, text, usage).
     """
+    view = view if view is not None else PrintView()
     assistant_parts = []
     current_text = ""
     tool_calls = []  # {name, args, id, raw_part}
@@ -152,17 +147,13 @@ def _run_turn(model, system, messages, tools, provider, read_file=None):
 
     for event in stream(model, system, messages, tools, provider):
         if isinstance(event, TextDelta):
-            sys.stdout.write(event.text)
-            sys.stdout.flush()
+            view.assistant_delta(event.text)
             current_text += event.text
         elif isinstance(event, ToolCall):
             if current_text:
                 assistant_parts.append({"type": "text", "text": current_text})
                 current_text = ""
-            print(
-                "\n" + format_tool_call(event.name, event.args, read_file),
-                flush=True,
-            )
+            view.tool_call(event.name, event.args, read_file)
             tool_calls.append({
                 "name": event.name,
                 "args": event.args,
@@ -272,7 +263,8 @@ def _is_transient_error(exc: BaseException) -> bool:
 
 
 def _run_turn_with_retry(
-    model, system, messages, tools, provider, read_file=None, session=None
+    model, system, messages, tools, provider, read_file=None, session=None,
+    view: SessionView | None = None,
 ):
     """Run one streamed turn, retrying transient provider failures every
     RETRY_DELAY_SECONDS until the call succeeds. Everything stays warm across the
@@ -281,11 +273,13 @@ def _run_turn_with_retry(
     Non-transient errors propagate immediately, so the run still aborts (and stays
     resumable) on a real failure. A Ctrl-C during the wait aborts cleanly (it is a
     BaseException, not caught here)."""
+    view = view if view is not None else PrintView()
     attempt = 0
     while True:
         started = time.monotonic()
         try:
-            return _run_turn(model, system, messages, tools, provider, read_file)
+            return _run_turn(model, system, messages, tools, provider, read_file,
+                             view)
         except Exception as exc:
             if not _is_transient_error(exc):
                 raise
@@ -299,7 +293,7 @@ def _run_turn_with_retry(
                 f"[provider unavailable after {time.monotonic() - started:.0f}s: "
                 f"{detail}; retrying in {RETRY_DELAY_SECONDS}s (attempt {attempt})]"
             )
-            print("\n" + style(msg, "bold", "yellow"), flush=True)
+            view.notice(style(msg, "bold", "yellow"))
             if session is not None:
                 session.record_warning(msg)
             time.sleep(RETRY_DELAY_SECONDS)
@@ -319,17 +313,33 @@ def _thought_sig(raw_part) -> str | None:
     return base64.b64encode(sig).decode()
 
 
-def _update_wip_patch(sandbox: LeanSandbox, path: Path | None, base: str) -> None:
+def _update_wip_patch(
+    sandbox: LeanSandbox, path: Path | None, base: str,
+    view: SessionView | None = None,
+) -> None:
     """Refresh the live resume snapshot -- a format-patch from `base` to the
     current state (committed + uncommitted), so a crash can be resumed or the
     patch applied directly. Best-effort: a checkpoint must never be the thing that
-    crashes the session."""
-    if path is None:
+    crashes the session.
+
+    The same patch text feeds the view (the TUI's per-file +/- table is parsed
+    from it), so a live file list costs no container round-trips beyond the
+    snapshot the loop was already taking. When no snapshot file is wanted, the
+    patch is computed only if the view asks for it -- `wip_patch_path=None`
+    keeps its long-standing meaning of "do nothing" under a PrintView."""
+    view = view if view is not None else PrintView()
+    if path is None and not view.wants_wip_patch:
         return
     try:
-        path.write_text(sandbox.wip_patch(base))
+        text = sandbox.wip_patch(base)
     except Exception:
-        pass
+        return
+    view.wip_patch(text)
+    if path is not None:
+        try:
+            path.write_text(text)
+        except Exception:
+            pass
 
 
 def _run_zoom(
@@ -342,6 +352,7 @@ def _run_zoom(
     inner_max_turns: int,
     wip_patch_path: Path | None,
     seed_messages: list | None = None,
+    view: SessionView | None = None,
 ) -> tuple[str, Usage]:
     """Run a zoomed-in sub-session: the small model works on the single sorry
     named by `zoom_args` (a zoom_in call's arguments) until it calls zoom_out.
@@ -357,6 +368,7 @@ def _run_zoom(
     `seed_messages` is a mid-zoom resume's rebuilt inner conversation; when
     given, it is continued as-is (its events were already replayed into the log,
     so nothing is re-recorded here)."""
+    view = view if view is not None else PrintView()
     total = Usage()
     if seed_messages is None:
         prompt = zoom_task_prompt(zoom_args, inner_max_turns)
@@ -377,10 +389,7 @@ def _run_zoom(
     max_context = get_context_window(small_model, provider)
 
     pos = f"{zoom_args.get('file', '?')}:{zoom_args.get('line', '?')}"
-    print(
-        "\n" + style(f"===== zoom in: {pos} ({small_model}) =====", "bold", "magenta"),
-        flush=True,
-    )
+    view.zoom_begin(pos, small_model, max_context)
 
     # A resumed inner conversation ending on an assistant message means the
     # small model's last turn called no tools (the crash hit the nudge window);
@@ -401,16 +410,17 @@ def _run_zoom(
     turn = sum(1 for m in messages if m.get("role") == "assistant")
     while turn < inner_max_turns:
         turn += 1
-        print("\n" + turn_header(
+        view.turn_header(
             f"zoom turn {turn}/{inner_max_turns}", "bold", "magenta",
             max_context=max_context, usage=last_usage,
-        ), flush=True)
+        )
 
         assistant_parts, tool_calls, text, usage = _run_turn_with_retry(
             small_model, system, messages, tools, provider, sandbox.read_file,
-            session,
+            session, view,
         )
         _accumulate(total, usage)
+        view.turn_complete(usage, zoom=True)
         last_usage = usage
         if text:
             last_text = text
@@ -426,11 +436,8 @@ def _run_zoom(
         # only zoom_out hands control back. Nudge (counted against the cap, so
         # a model that never complies still terminates).
         if not tool_calls:
-            print(
-                "\n" + style("[zoom: no tool calls; nudging toward zoom_out]",
-                             "yellow"),
-                flush=True,
-            )
+            view.notice(style("[zoom: no tool calls; nudging toward zoom_out]",
+                              "yellow"))
             messages.append({"role": "user", "content": nudge})
             session.record_turn("user", nudge, zoom=True)
             continue
@@ -453,23 +460,15 @@ def _run_zoom(
                     "zoom_out", "[zoom_out received; sub-session ended]",
                     zoom=True,
                 )
-                print(
-                    "\n" + style(f"===== zoom out ({turn} turns) =====",
-                                 "bold", "magenta"),
-                    flush=True,
-                )
+                view.zoom_end(style(f"===== zoom out ({turn} turns) =====",
+                                    "bold", "magenta"))
                 return summary, total
 
             result = toolset.dispatch(tc["name"], tc["args"])
             content = truncate_tool_output(result.content)
             session.record_tool_result(tc["name"], content, zoom=True)
 
-            print(
-                format_tool_result(
-                    tc["name"], content, result.content, result.is_error
-                ),
-                flush=True,
-            )
+            view.tool_result(tc["name"], content, result.content, result.is_error)
 
             tr = {
                 "type": "tool_result",
@@ -485,7 +484,7 @@ def _run_zoom(
 
         # The sub-session mutates the same working tree; keep the crash
         # snapshot as fresh as the outer loop does.
-        _update_wip_patch(sandbox, wip_patch_path, session.base_commit)
+        _update_wip_patch(sandbox, wip_patch_path, session.base_commit, view)
 
     # Cap hit without a zoom_out: don't just abandon the sub-session -- demand
     # the summary. One final turn where zoom_out is the only tool on offer and
@@ -493,13 +492,10 @@ def _run_zoom(
     # constrains its final exchange. If the model still won't call zoom_out,
     # its final text stands in; either way the big model gets a real report,
     # prefixed with a note that the cap was hit.
-    print(
-        "\n" + style(
-            f"[zoom: reached the {inner_max_turns}-turn cap without zoom_out; "
-            "forcing a summary]", "bold", "yellow",
-        ),
-        flush=True,
-    )
+    view.notice(style(
+        f"[zoom: reached the {inner_max_turns}-turn cap without zoom_out; "
+        "forcing a summary]", "bold", "yellow",
+    ))
     request = (
         f"You have run out of turns ({inner_max_turns}). Stop working now. "
         "You MUST call zoom_out immediately with a summary of what you did, "
@@ -509,15 +505,16 @@ def _run_zoom(
     messages.append({"role": "user", "content": request})
     session.record_turn("user", request, zoom=True)
 
-    print("\n" + turn_header(
+    view.turn_header(
         f"zoom turn {inner_max_turns + 1}/{inner_max_turns} (forced summary)",
         "bold", "magenta", max_context=max_context, usage=last_usage,
-    ), flush=True)
+    )
     _parts, tool_calls, text, usage = _run_turn_with_retry(
         small_model, system, messages, [ZOOM_OUT_TOOL], provider,
-        sandbox.read_file, session,
+        sandbox.read_file, session, view,
     )
     _accumulate(total, usage)
+    view.turn_complete(usage, zoom=True)
     session.record_turn(
         "assistant", text, usage.input_tokens, usage.output_tokens,
         usage.thinking_tokens, usage.cache_read_tokens,
@@ -542,13 +539,10 @@ def _run_zoom(
             f"{_clip(last_text, 500)})"
         )
 
-    print(
-        "\n" + style(
-            f"===== zoom out (forced after {inner_max_turns} turns) =====",
-            "bold", "magenta",
-        ),
-        flush=True,
-    )
+    view.zoom_end(style(
+        f"===== zoom out (forced after {inner_max_turns} turns) =====",
+        "bold", "magenta",
+    ))
     note = (
         f"[zoom_in: the smaller model used all {inner_max_turns} turns without "
         "calling zoom_out; this summary was demanded at cutoff. Its edits (if "
@@ -570,6 +564,7 @@ def run_session(
     small_model: str | None = None,
     inner_max_turns: int = DEFAULT_INNER_MAX_TURNS,
     pending_zoom: dict | None = None,
+    view: SessionView | None = None,
 ) -> SessionResult:
     """Run the agent loop until the model stops calling tools (or max_turns).
 
@@ -590,7 +585,13 @@ def run_session(
     resume.ParsedSession.pending_zoom): the crashed session died inside a
     sub-session, so finish that sub-session first, then continue the outer
     conversation with its summary.
+
+    `view` is where the session's output goes (see view.SessionView); it
+    defaults to the classic scrolling PrintView, so every existing caller and
+    test behaves exactly as before the view abstraction existed. The view is
+    display-only -- what is recorded to `session` never depends on it.
     """
+    view = view if view is not None else PrintView()
     if messages is None:
         messages = [{"role": "user", "content": prompt}]
         session.record_turn("user", prompt)
@@ -611,7 +612,7 @@ def run_session(
         banner = f"[context window: {max_context:,} tokens ({model})]"
     else:
         banner = f"[context window: unknown for {model}; reporting token totals only]"
-    print(style(banner, "gray"), flush=True)
+    view.banner(style(banner, "gray"))
 
     total = Usage()
     # The small model's share of `total` (big-small mode), priced separately at
@@ -659,7 +660,7 @@ def run_session(
             summary, zoom_usage = _run_zoom(
                 sandbox, session, toolset, provider, small_model,
                 pending_zoom.get("args") or {}, inner_max_turns, wip_patch_path,
-                seed_messages=pending_zoom.get("messages") or None,
+                seed_messages=pending_zoom.get("messages") or None, view=view,
             )
             _accumulate(total, zoom_usage)
             _accumulate(inner_total, zoom_usage)
@@ -677,7 +678,7 @@ def run_session(
             "tool_call_id": pending_zoom["call_id"],
         })
         messages.append({"role": "user", "content": results})
-        _update_wip_patch(sandbox, wip_patch_path, session.base_commit)
+        _update_wip_patch(sandbox, wip_patch_path, session.base_commit, view)
 
     # A resumed conversation that already ends on an assistant message had no
     # pending tool calls -- the model was done. Skip the loop (calling the model
@@ -697,15 +698,17 @@ def run_session(
             break
         turn += 1
 
-        print("\n" + turn_header(
+        view.turn_header(
             f"{ralph_tag}turn {turn + turn_offset}", "bold", "dark_red",
             max_context=max_context, usage=last_usage,
-        ), flush=True)
+        )
 
         assistant_parts, tool_calls, final_text, usage = _run_turn_with_retry(
-            model, system, messages, tools, provider, sandbox.read_file, session
+            model, system, messages, tools, provider, sandbox.read_file, session,
+            view,
         )
         _accumulate(total, usage)
+        view.turn_complete(usage, zoom=False)
         last_usage = usage
 
         messages.append({"role": "assistant", "content": assistant_parts})
@@ -717,7 +720,7 @@ def run_session(
 
         # No tool calls => the model is done with the task.
         if not tool_calls:
-            print(flush=True)
+            view.turn_end()
             break
 
         # Execute tool calls and feed results back.
@@ -734,7 +737,7 @@ def run_session(
                 # -- resume relies on that ordering.
                 summary, zoom_usage = _run_zoom(
                     sandbox, session, toolset, provider, small_model,
-                    tc["args"], inner_max_turns, wip_patch_path,
+                    tc["args"], inner_max_turns, wip_patch_path, view=view,
                 )
                 _accumulate(total, zoom_usage)
                 _accumulate(inner_total, zoom_usage)
@@ -756,12 +759,7 @@ def run_session(
             content = truncate_tool_output(result.content)
             session.record_tool_result(tc["name"], content)
 
-            print(
-                format_tool_result(
-                    tc["name"], content, result.content, result.is_error
-                ),
-                flush=True,
-            )
+            view.tool_result(tc["name"], content, result.content, result.is_error)
 
             tr = {
                 "type": "tool_result",
@@ -789,33 +787,31 @@ def run_session(
             )
             _append_user_text(messages, note)
             session.record_warning(note)
-            print("\n" + style(
+            view.notice(style(
                 f"[context {last_usage.context_tokens / max_context:.0%} full: "
                 + ("ending the session" if level >= CONTEXT_TERMINAL
                    else "told the model to wrap up now" if level >= CONTEXT_URGENT
                    else "told the model to start wrapping up"),
                 "bold", "red" if level >= CONTEXT_URGENT else "yellow",
-            ) + "]", flush=True)
+            ) + "]")
         if level and level >= CONTEXT_TERMINAL:
             out_of_context = True
-            _update_wip_patch(sandbox, wip_patch_path, session.base_commit)
+            _update_wip_patch(sandbox, wip_patch_path, session.base_commit, view)
             break
 
         # Snapshot the working tree after every turn that ran tools, so an
         # interruption before the next turn leaves a patch that recreates it.
-        _update_wip_patch(sandbox, wip_patch_path, session.base_commit)
+        _update_wip_patch(sandbox, wip_patch_path, session.base_commit, view)
 
     if stopped_at_max:
-        print(
-            "\n" + style(f"[stopped: reached max_turns={max_turns}]", "bold", "yellow"),
-            flush=True,
-        )
+        view.notice(style(f"[stopped: reached max_turns={max_turns}]",
+                          "bold", "yellow"))
 
     if out_of_context:
-        print("\n" + style(
+        view.notice(style(
             f"[stopped: context window {CONTEXT_TERMINAL:.0%} full -- "
             "forcing the commit message and ending the session]", "bold", "red",
-        ), flush=True)
+        ))
 
     # Final turn: ask for a commit message as a true continuation of the
     # conversation. Skipped if nothing changed, or if we bailed on max_turns
@@ -835,19 +831,20 @@ def run_session(
     commit_message = ""
     if diff.strip() and not stopped_at_max:
         turn += 1
-        print("\n" + turn_header(
+        view.turn_header(
             f"{ralph_tag}turn {turn + turn_offset} (commit message)",
             "bold", "dark_red", max_context=max_context, usage=last_usage,
-        ), flush=True)
+        )
 
         request = commit_request(_commit_diff(diff, max_context, last_usage))
         _append_user_text(messages, request)
         session.record_turn("user", request)
 
         parts, _calls, text, usage = _run_turn_with_retry(
-            model, system, messages, [], provider, session=session
+            model, system, messages, [], provider, session=session, view=view
         )
         _accumulate(total, usage)
+        view.turn_complete(usage, zoom=False)
         last_usage = usage
 
         messages.append({"role": "assistant", "content": parts})
@@ -857,7 +854,7 @@ def run_session(
             usage.cache_write_tokens,
         )
         commit_message = text.strip()
-        print(flush=True)
+        view.turn_end()
 
     if _usage_any(inner_total):
         # Price the two models separately: the outer bucket is everything the
@@ -883,16 +880,16 @@ def run_session(
             inner_total.input_tokens + inner_total.cache_read_tokens
             + inner_total.cache_write_tokens + inner_total.output_tokens
         )
-        print(style(
+        view.notice(style(
             f"[zoom sub-sessions on {small_model}: {inner_tokens:,} of the "
             "session's tokens]", "gray",
-        ), flush=True)
+        ), newline_before=False)
     else:
         cost = estimate_cost(
             model, total.input_tokens, total.output_tokens,
             total.cache_read_tokens, total.cache_write_tokens,
         )
-    print_usage(turn + turn_offset, total, cost)
+    view.usage_summary(turn + turn_offset, total, cost)
     return SessionResult(
         final_text=final_text, diff=diff, commit_message=commit_message
     )

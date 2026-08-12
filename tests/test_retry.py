@@ -97,7 +97,8 @@ def main() -> None:
     agent.RETRY_DELAY_SECONDS = 0  # don't actually sleep in the test
     state = {"n": 0}
 
-    def flaky(model, system, messages, tools, provider, read_file=None):
+    def flaky(model, system, messages, tools, provider, read_file=None,
+              view=None):
         state["n"] += 1
         if state["n"] < 3:
             raise ServerError("503 UNAVAILABLE", code=503, status="UNAVAILABLE")

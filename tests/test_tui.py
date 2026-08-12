@@ -1,0 +1,486 @@
+"""Tests for the live-view plumbing: view.py's stats model, patch parser, and
+left-pane renderer; PrintView's byte-compatibility with the historical inline
+prints; and TuiView's worker-side plumbing against a stub app.
+
+No Docker, no network, no real terminal (the textual App itself is exercised
+by hand -- see CLAUDE.md; everything below it is covered here headlessly).
+render.style() is a no-op off a TTY, so output is plain text and substring
+asserts work. Run: uv run python tests/test_tui.py
+"""
+
+import contextlib
+import io
+
+from gerbil import render
+from gerbil.pricing import MODEL_PRICING
+from gerbil.providers import Usage
+from gerbil.view import (
+    PrintView,
+    SessionStats,
+    chain_cost,
+    live_cost,
+    patch_file_stats,
+    render_stats,
+)
+
+
+def check(label: str, ok: bool, detail: str = "") -> None:
+    mark = "PASS" if ok else "FAIL"
+    print(f"[{mark}] {label}" + (f" -- {detail}" if detail and not ok else ""))
+    if not ok:
+        raise SystemExit(f"test failed: {label}\n{detail}")
+
+
+# A model with a known price, whatever the table currently holds.
+PRICED_MODEL = next(iter(MODEL_PRICING))
+
+
+# ---------------------------------------------------------------------------
+# patch_file_stats
+# ---------------------------------------------------------------------------
+
+# A two-commit `format-patch --stdout` with the traps the parser must survive:
+# commit-message bullets starting with "-", the `-- ` signature separator
+# pausing (not stopping) the count, +++/--- headers, a rename, a binary file,
+# a path with spaces, and the same file touched in both commits (summed).
+MULTI_COMMIT_PATCH = """\
+From 1111111 Mon Sep 17 00:00:00 2001
+From: gerbil <gerbil@sandbox>
+Date: Tue, 12 Aug 2026 10:00:00 +0000
+Subject: [PATCH 1/2] first
+
+message body
+- a bullet that must not count as a removal
+
+---
+ Foo.lean | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/Foo.lean b/Foo.lean
+index 1111111..2222222 100644
+--- a/Foo.lean
++++ b/Foo.lean
+@@ -1,2 +1,3 @@
++added one
++added two
+-removed one
+ context line
+diff --git a/Old.lean b/New.lean
+similarity index 95%
+rename from Old.lean
+rename to New.lean
+index 3333333..4444444 100644
+--- a/Old.lean
++++ b/New.lean
+@@ -1 +1 @@
++renamed add
+diff --git a/img/pic.png b/img/pic.png
+new file mode 100644
+index 0000000..5555555
+Binary files /dev/null and b/img/pic.png differ
+diff --git a/My Dir/My File.lean b/My Dir/My File.lean
+index 6666666..7777777 100644
+--- a/My Dir/My File.lean
++++ b/My Dir/My File.lean
+@@ -1 +1,2 @@
++spaced add
+-- 
+2.39.0
+
+From 2222222 Mon Sep 17 00:00:00 2001
+From: gerbil <gerbil@sandbox>
+Date: Tue, 12 Aug 2026 10:05:00 +0000
+Subject: [PATCH 2/2] second
+
+- another bullet between commits, still uncounted
+
+---
+diff --git a/Foo.lean b/Foo.lean
+index 2222222..8888888 100644
+--- a/Foo.lean
++++ b/Foo.lean
+@@ -1,3 +1,3 @@
++third add
+-second removal
+-- 
+2.39.0
+
+"""
+
+
+def test_patch_parser_multi_commit() -> None:
+    files = patch_file_stats(MULTI_COMMIT_PATCH)
+    check("same file summed across commits", files.get("Foo.lean") == (3, 2),
+          str(files))
+    check("rename counts on the b/ path", files.get("New.lean") == (1, 0),
+          str(files))
+    check("rename leaves no a/ entry", "Old.lean" not in files, str(files))
+    check("binary marked None", "img/pic.png" in files
+          and files["img/pic.png"] is None, str(files))
+    check("path with spaces", files.get("My Dir/My File.lean") == (1, 0),
+          str(files))
+    check("no phantom files from message bullets", len(files) == 4, str(files))
+
+
+def test_patch_parser_edges() -> None:
+    check("empty patch", patch_file_stats("") == {}, "")
+    # A GIT binary patch's base85 payload lines may start with +/-; the None
+    # marker must shield them.
+    git_binary = (
+        "diff --git a/blob.bin b/blob.bin\n"
+        "GIT binary patch\n"
+        "literal 10\n"
+        "-c$aBC0ssIL10VntA\n"
+        "+zzz\n"
+    )
+    check("GIT binary payload not counted",
+          patch_file_stats(git_binary) == {"blob.bin": None},
+          str(patch_file_stats(git_binary)))
+    # +++/--- are headers, not content.
+    plain = (
+        "diff --git a/A.lean b/A.lean\n"
+        "--- a/A.lean\n"
+        "+++ b/A.lean\n"
+        "+x\n"
+    )
+    check("file headers excluded", patch_file_stats(plain) == {"A.lean": (1, 0)},
+          str(patch_file_stats(plain)))
+
+
+# ---------------------------------------------------------------------------
+# SessionStats event replay + costs
+# ---------------------------------------------------------------------------
+
+
+def test_stats_replay() -> None:
+    stats = SessionStats()
+    stats.on_session_begin(
+        name="gerbil-1", model=PRICED_MODEL, small_model=None,
+        ralph={"iteration": 1, "total": 2, "chain_base": "abc", "ancestors": []},
+        resumed_from=None, now=100.0,
+    )
+    stats.on_turn_header(200_000)
+    stats.on_turn_complete(Usage(input_tokens=1000, output_tokens=100), zoom=False)
+    stats.on_turn_complete(Usage(input_tokens=2000, output_tokens=200), zoom=False)
+
+    check("turns counted", stats.turns == 2, str(stats.turns))
+    check("window adopted", stats.max_context == 200_000, str(stats.max_context))
+    check("last context is the latest turn's",
+          stats.last_context_tokens == 2200, str(stats.last_context_tokens))
+    check("outer bucket accumulates",
+          stats.outer.input_tokens == 3000 and stats.outer.output_tokens == 300,
+          str(stats.outer))
+
+    cost_before_zoom = live_cost(stats)
+    check("live cost priced for a known model",
+          cost_before_zoom is not None and cost_before_zoom > 0,
+          str(cost_before_zoom))
+
+    # A zoom sub-session: its turns and tokens land in the inner bucket, its
+    # window must not clobber the outer gauge.
+    stats.on_zoom_begin("Foo.lean:3", "small-model-x", 32_000)
+    stats.on_turn_header(32_000)  # the zoom's own header
+    stats.on_turn_complete(Usage(input_tokens=500, output_tokens=50), zoom=True)
+    check("zoom turn counted separately",
+          stats.zoom_turns == 1 and stats.turns == 2,
+          f"{stats.zoom_turns}/{stats.turns}")
+    check("outer window survives the zoom", stats.max_context == 200_000,
+          str(stats.max_context))
+    check("inner bucket separate", stats.inner.input_tokens == 500,
+          str(stats.inner))
+    stats.on_zoom_end()
+    check("zoom cleared", stats.zoom_active is None, str(stats.zoom_active))
+
+    # The zoom's small model is unknown to pricing, so the whole estimate goes
+    # N/A rather than a made-up partial number (mirrors agent.py).
+    with contextlib.redirect_stderr(io.StringIO()):
+        check("unpriced small model makes cost N/A", live_cost(stats) is None, "")
+
+    # Second ralph session: per-session state resets, chain buckets keep going.
+    stats.on_session_begin(
+        name="gerbil-2", model=PRICED_MODEL, small_model=None,
+        ralph={"iteration": 2, "total": 2, "chain_base": "abc", "ancestors": []},
+        resumed_from=None, now=400.0,
+    )
+    check("session counters reset",
+          stats.turns == 0 and stats.zoom_turns == 0
+          and stats.outer.input_tokens == 0 and stats.files == {},
+          str(stats))
+    check("chain buckets survive",
+          stats.chain_outer.input_tokens == 3000
+          and stats.chain_inner.input_tokens == 500,
+          f"{stats.chain_outer}/{stats.chain_inner}")
+    check("chain clock keeps its anchor", stats.chain_started == 100.0
+          and stats.session_started == 400.0,
+          f"{stats.chain_started}/{stats.session_started}")
+
+    stats.on_turn_complete(Usage(input_tokens=100, output_tokens=10), zoom=False)
+    check("chain accumulation continues",
+          stats.chain_outer.input_tokens == 3100,
+          str(stats.chain_outer.input_tokens))
+    check("chain cost covers both sessions", chain_cost(stats) is None
+          or chain_cost(stats) >= (live_cost(stats) or 0), "")
+
+
+# ---------------------------------------------------------------------------
+# render_stats
+# ---------------------------------------------------------------------------
+
+
+def test_render_stats() -> None:
+    stats = SessionStats()
+    stats.on_session_begin(
+        name="gerbil-260812", model="some-model", small_model=None,
+        ralph={"iteration": 2, "total": 5, "chain_base": "", "ancestors": []},
+        resumed_from=None, now=0.0,
+    )
+    stats.chain_started = 0.0
+    stats.session_started = 100.0
+    stats.on_turn_header(100_000)
+    stats.on_turn_complete(Usage(input_tokens=60_000, output_tokens=2_000),
+                           zoom=False)
+    stats.files = {
+        "Small.lean": (1, 0),
+        "Big/Change.lean": (120, 8),
+        "img.png": None,
+    }
+    with contextlib.redirect_stderr(io.StringIO()):  # unknown-pricing warning
+        out = render_stats(stats, 40, now=3823.0)  # 3723s session, 3823s chain
+
+    check("model shown", "some-model" in out, out)
+    check("session name shown", "gerbil-260812" in out, out)
+    check("ralph i/N", "2/5" in out, out)
+    check("elapsed hh:mm:ss", "01:02:03" in out, out)
+    check("chain elapsed", "01:03:43" in out, out)
+    check("turns", "turns 1" in out, out)
+    check("context percent", "62.0%" in out and "62,000 / 100,000" in out, out)
+    check("token totals", "in 60,000" in out and "out 2,000" in out, out)
+    check("unknown model cost is N/A", "N/A" in out, out)
+    lines = out.splitlines()
+    big = next(i for i, l in enumerate(lines) if "Big/Change.lean" in l)
+    small = next(i for i, l in enumerate(lines) if "Small.lean" in l)
+    binary = next(i for i, l in enumerate(lines) if "img.png" in l)
+    check("files sorted by churn, binary last", big < small < binary,
+          out)
+    check("binary marked bin", "bin" in lines[binary], lines[binary])
+    check("per-file figures", "+120" in lines[big] and "-8" in lines[big],
+          lines[big])
+    check("totals row", any("total (3 files)" in l and "+121" in l and "-8" in l
+                            for l in lines), out)
+
+    # Zoom indicator and interrupt banner.
+    stats.on_zoom_begin("Foo.lean:42", "small-x", 10_000)
+    stats.last_zoom_context_tokens = 1_800
+    stats.interrupt_requested = True
+    with contextlib.redirect_stderr(io.StringIO()):
+        out2 = render_stats(stats, 40, now=3823.0)
+    check("zoom line", "zoom: Foo.lean:42" in out2 and "18.0%" in out2, out2)
+    check("interrupt banner", "interrupting" in out2, out2)
+
+    # Unknown window: raw token count, no percentage.
+    stats2 = SessionStats()
+    stats2.on_session_begin(name="s", model="m", small_model=None, ralph=None,
+                            resumed_from=None, now=0.0)
+    stats2.on_turn_complete(Usage(input_tokens=123_456), zoom=False)
+    with contextlib.redirect_stderr(io.StringIO()):
+        out3 = render_stats(stats2, 40, now=1.0)
+    check("unknown window shows raw tokens",
+          "123,456 tokens (window unknown)" in out3, out3)
+    check("no ralph rows for a single session", "ralph" not in out3, out3)
+    check("empty file table placeholder", "(none yet)" in out3, out3)
+
+
+# ---------------------------------------------------------------------------
+# PrintView byte-compatibility with the historical inline prints
+# ---------------------------------------------------------------------------
+
+
+class FakeUsage:
+    context_tokens = 96_000
+
+
+class FrozenDatetime:
+    """Pin render.turn_header's wall-clock stamp for an exact comparison."""
+
+    @staticmethod
+    def now():
+        class _Stamp:
+            @staticmethod
+            def strftime(fmt):
+                return "12:34:56"
+        return _Stamp()
+
+
+def _capture(fn) -> tuple[str, str]:
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        fn()
+    return out.getvalue(), err.getvalue()
+
+
+def test_printview_byte_compat() -> None:
+    pv = PrintView()
+    check("PrintView never asks for the wip patch",
+          pv.wants_wip_patch is False, "")
+
+    real_dt = render.datetime
+    render.datetime = FrozenDatetime
+    try:
+        got, _ = _capture(lambda: pv.turn_header(
+            "turn 3", "bold", "dark_red", max_context=100_000, usage=FakeUsage()))
+        want = "\n" + render.turn_header(
+            "turn 3", "bold", "dark_red", max_context=100_000, usage=FakeUsage()
+        ) + "\n"
+        check("turn_header == historical print", got == want,
+              f"{got!r} != {want!r}")
+    finally:
+        render.datetime = real_dt
+
+    got, _ = _capture(lambda: pv.tool_call("bash", {"command": "ls"}))
+    want = "\n" + render.format_tool_call("bash", {"command": "ls"}, None) + "\n"
+    check("tool_call == historical print", got == want, f"{got!r} != {want!r}")
+
+    got, _ = _capture(lambda: pv.tool_result("bash", "ok", "ok", False))
+    want = render.format_tool_result("bash", "ok", "ok", False) + "\n"
+    check("tool_result == historical print", got == want, f"{got!r} != {want!r}")
+
+    got, _ = _capture(lambda: pv.banner("[context window: 1 tokens]"))
+    check("banner: no leading newline", got == "[context window: 1 tokens]\n",
+          repr(got))
+
+    got, _ = _capture(lambda: pv.notice("[note]"))
+    check("notice: leading newline by default", got == "\n[note]\n", repr(got))
+    got, _ = _capture(lambda: pv.notice("[note]", newline_before=False))
+    check("notice: newline_before=False", got == "[note]\n", repr(got))
+    got, _ = _capture(lambda: pv.notice("", newline_before=False))
+    check("empty notice is the bare print()", got == "\n", repr(got))
+    got, err = _capture(lambda: pv.notice("warn", newline_before=False,
+                                          stderr=True))
+    check("stderr notice routes to stderr", got == "" and err == "warn\n",
+          f"{got!r}/{err!r}")
+
+    got, _ = _capture(pv.turn_end)
+    check("turn_end is a blank line", got == "\n", repr(got))
+
+    got, _ = _capture(lambda: pv.zoom_begin("Foo.lean:3", "small-x", None))
+    check("zoom_begin banner",
+          got == "\n===== zoom in: Foo.lean:3 (small-x) =====\n", repr(got))
+    got, _ = _capture(lambda: pv.zoom_end("===== zoom out (2 turns) ====="))
+    check("zoom_end", got == "\n===== zoom out (2 turns) =====\n", repr(got))
+
+    usage = Usage(input_tokens=1000, output_tokens=50, thinking_tokens=10,
+                  cache_read_tokens=200, cache_write_tokens=30)
+    got, _ = _capture(lambda: pv.usage_summary(4, usage, 1.25))
+    want, _ = _capture(lambda: render.print_usage(4, usage, 1.25))
+    check("usage_summary == print_usage", got == want, f"{got!r} != {want!r}")
+
+    got, _ = _capture(lambda: pv.result_line("session: /tmp/x"))
+    check("result_line", got == "session: /tmp/x\n", repr(got))
+
+    # The data feeds are silent no-ops.
+    got, err = _capture(lambda: (
+        pv.session_begin(name="n", model="m", small_model=None, ralph=None,
+                         resumed_from=None),
+        pv.turn_complete(usage, zoom=False),
+        pv.wip_patch("diff --git a/X b/X"),
+    ))
+    check("data feeds print nothing", got == "" and err == "",
+          f"{got!r}/{err!r}")
+
+
+# ---------------------------------------------------------------------------
+# TuiView worker-side plumbing (stub app; no textual event loop)
+# ---------------------------------------------------------------------------
+
+
+class StubApp:
+    """Duck-types the two things TuiView touches: call_from_thread (run
+    inline) and apply_event (collect log writes, run mutations)."""
+
+    def __init__(self):
+        self.logged: list[str] = []
+
+    def call_from_thread(self, fn, *args):
+        fn(*args)
+
+    def apply_event(self, mutate, log_text):
+        if mutate is not None:
+            mutate()
+        if log_text is not None:
+            self.logged.append(log_text)
+
+
+def test_tuiview_plumbing() -> None:
+    from gerbil.tui import TuiView
+
+    view = TuiView()
+    app = StubApp()
+    view.bind(app)
+    check("TuiView wants the wip patch", view.wants_wip_patch is True, "")
+
+    # Deltas buffer to whole lines; the partial tail is held until flushed.
+    view.assistant_delta("hello ")
+    check("partial line held", app.logged == [], str(app.logged))
+    view.assistant_delta("world\nand a partial")
+    check("completed line emitted", app.logged == ["hello world"],
+          str(app.logged))
+    view.tool_call("bash", {"command": "ls"})
+    check("tool_call flushes the partial first",
+          app.logged[1] == "and a partial" and "bash" in app.logged[2],
+          str(app.logged))
+
+    # Spacer-only notices are dropped (compactness); real ones logged.
+    n = len(app.logged)
+    view.notice("", newline_before=False)
+    view.turn_end()
+    check("spacers dropped", len(app.logged) == n, str(app.logged[n:]))
+    view.notice("[stopped: reached max_turns=5]")
+    check("real notice logged", app.logged[-1] == "[stopped: reached max_turns=5]",
+          str(app.logged[-1]))
+
+    # Stats flow: session_begin -> turn_complete -> wip_patch.
+    view.session_begin(name="s1", model=PRICED_MODEL, small_model=None,
+                       ralph=None, resumed_from=None)
+    view.turn_complete(Usage(input_tokens=10, output_tokens=1), zoom=False)
+    view.wip_patch("diff --git a/A.lean b/A.lean\n+x\n")
+    check("stats updated through the stub",
+          view.stats.turns == 1 and view.stats.files == {"A.lean": (1, 0)},
+          f"{view.stats.turns}/{view.stats.files}")
+
+    # result_line / usage_summary retain the tail for the post-exit reprint.
+    view.result_line("session: /tmp/s.jsonl")
+    view.usage_summary(1, Usage(input_tokens=10, output_tokens=1), None)
+    check("tail retained", len(view.tail_lines) == 2
+          and view.tail_lines[0] == "session: /tmp/s.jsonl",
+          str(view.tail_lines))
+    check("tail also logged", app.logged[-1] == view.tail_lines[-1],
+          str(app.logged[-1]))
+
+    # The cooperative interrupt lands on the next view event, in this thread.
+    view.request_interrupt()
+    check("interrupt flag visible", view.interrupt_requested
+          and view.stats.interrupt_requested, "")
+    for call in (lambda: view.banner("x"),
+                 lambda: view.assistant_delta("y"),
+                 lambda: view.turn_complete(Usage(), zoom=False)):
+        try:
+            call()
+            check("view event raises KeyboardInterrupt after interrupt", False,
+                  "no exception")
+        except KeyboardInterrupt:
+            pass
+    check("view events raise KeyboardInterrupt after interrupt", True, "")
+
+
+def main() -> None:
+    test_patch_parser_multi_commit()
+    test_patch_parser_edges()
+    test_stats_replay()
+    test_render_stats()
+    test_printview_byte_compat()
+    test_tuiview_plumbing()
+    print("\nAll tui tests passed.")
+
+
+if __name__ == "__main__":
+    main()

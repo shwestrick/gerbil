@@ -807,10 +807,10 @@ def context_suffix(max_context: int | None, usage) -> str:
     return style(f"  [context: {used:,} / {max_context:,} ({pct:.1f}%)]", color)
 
 
-def print_usage(turns: int, usage, cost: float | None) -> None:
-    """Print the end-of-session summary line with token counts and estimated
-    cost. `usage` is a providers.Usage (duck-typed to keep this module free of
-    gerbil imports); `cost` comes from pricing.estimate_cost, None = unknown."""
+def usage_line(turns: int, usage, cost: float | None) -> str:
+    """The end-of-session summary line with token counts and estimated cost.
+    `usage` is a providers.Usage (duck-typed to keep this module free of gerbil
+    imports); `cost` comes from pricing.estimate_cost, None = unknown."""
     cost_str = "cost: N/A" if cost is None else f"~${cost:.4f}"
     total = (
         usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens
@@ -834,4 +834,9 @@ def print_usage(turns: int, usage, cost: float | None) -> None:
         f"({inp}, {out}), "
         f"{cost_str} ---"
     )
-    print("\n" + style(line, "bold"), flush=True)
+    return style(line, "bold")
+
+
+def print_usage(turns: int, usage, cost: float | None) -> None:
+    """Print the end-of-session summary line (see usage_line)."""
+    print("\n" + usage_line(turns, usage, cost), flush=True)

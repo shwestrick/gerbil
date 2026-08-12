@@ -62,6 +62,7 @@ from .sandbox import LeanSandbox, submodule_entries
 from .session import Session
 from .render import style
 from .tools import Toolset
+from .view import SessionView, run_under_view
 
 
 DEFAULT_MODEL = "gemini-3.1-pro-preview"
@@ -383,6 +384,12 @@ def main() -> None:
         "it is folded in via commit --amend before the patch is produced). "
         "The log is always archived in ~/.gerbil/sessions/ regardless.",
     )
+    run_p.add_argument(
+        "--plain",
+        action="store_true",
+        help="Use the classic scrolling print output instead of the full-screen "
+        "live view (chosen automatically when stdout is not a terminal).",
+    )
     run_p.set_defaults(func=cmd_run)
 
     resume_p = sub.add_parser(
@@ -447,6 +454,12 @@ def main() -> None:
         help="Do not include the session .jsonl log in the commit. The resumed "
         "session's recorded setting is inherited by default; this flag forces "
         "the log out. It is always archived in ~/.gerbil/sessions/ regardless.",
+    )
+    resume_p.add_argument(
+        "--plain",
+        action="store_true",
+        help="Use the classic scrolling print output instead of the full-screen "
+        "live view (chosen automatically when stdout is not a terminal).",
     )
     resume_p.set_defaults(func=cmd_resume)
 
@@ -1215,7 +1228,7 @@ def cmd_summarize(args) -> None:
 def _finalize_session(
     sandbox, base: str, result, *,
     session_path: Path, patch_path: Path, out_dir: Path, archive_dir: Path,
-    include_session: bool, footer: str,
+    include_session: bool, footer: str, view: SessionView,
 ) -> str | None:
     """Squash the session's work -- the agent's intermediate commits plus its
     uncommitted changes -- into a single commit on top of base, then emit its
@@ -1230,9 +1243,9 @@ def _finalize_session(
 
     squashed = sandbox.squash_commit(base, message)
 
-    print(f"{style('session:', 'bold')} {session_path}")
+    view.result_line(f"{style('session:', 'bold')} {session_path}")
     if not squashed:
-        print(f"{style('patch:', 'bold')}   (no changes; skipped)")
+        view.result_line(f"{style('patch:', 'bold')}   (no changes; skipped)")
         return None
 
     # Optionally fold the session log into the (single) commit, and thus the patch.
@@ -1244,9 +1257,8 @@ def _finalize_session(
     out_dir.mkdir(parents=True, exist_ok=True)
     patch_path.write_text(patch_text)
     shutil.copy2(patch_path, archive_dir / patch_path.name)
-    print(f"{style('patch:', 'bold')}   {patch_path} (git am)")
+    view.result_line(f"{style('patch:', 'bold')}   {patch_path} (git am)")
     return patch_path.name
-    return None
 
 
 def _abort(exc: BaseException, session) -> None:
@@ -1290,6 +1302,14 @@ def _abort(exc: BaseException, session) -> None:
         )
     # 130 is the conventional shell exit code for SIGINT; 1 for any other failure.
     sys.exit(130 if interrupted else 1)
+
+
+def _use_tui(args) -> bool:
+    """Whether to run the session under the full-screen live view: the default
+    on a terminal, opted out with --plain, and skipped automatically when
+    stdout is piped (the classic stream is the only sensible thing to write to
+    a file, and render.ENABLED was already fixed at import for that case)."""
+    return not args.plain and sys.stdout.isatty()
 
 
 def cmd_run(args) -> None:
@@ -1371,79 +1391,92 @@ def cmd_run(args) -> None:
                 chain_base = sandbox.head() if args.ralph else ""
                 ancestors: list[str] = []
 
-                for i in range(1, iterations + 1):
-                    if args.ralph:
-                        print(
-                            "\n" + style(
+                # The whole (ralph) loop runs under one view -- the TUI spans
+                # the chain exactly like the sandbox and MCP client above it,
+                # while the preflight/boot output above stayed on the plain
+                # terminal. `session` is nonlocal so the except handler below
+                # still sees the in-flight one when the loop dies mid-session.
+                def _sessions(view: SessionView) -> None:
+                    nonlocal session
+                    for i in range(1, iterations + 1):
+                        if args.ralph:
+                            view.notice(style(
                                 f"===== ralph session {i}/{iterations} =====",
                                 "bold", "magenta",
+                            ))
+                        name = session_name(i)
+                        session_path = archive_dir / f"{name}.jsonl"  # live session log
+                        patch_path = out_dir / f"{name}.patch"        # project-level patch
+                        wip_path = archive_dir / f"{name}.wip.patch"  # live resume patch
+
+                        # Baseline before the session: recorded in the log so --resume
+                        # can recreate it, and used to format-patch the session's commits.
+                        session_base = sandbox.head()
+                        ralph_meta = {
+                            "iteration": i, "total": iterations,
+                            "chain_base": chain_base, "ancestors": list(ancestors),
+                        } if args.ralph else None
+
+                        session = Session(
+                            path=session_path,
+                            model=args.model,
+                            project_dir=project_dir,
+                            prompt_file=prompt_file,
+                            version=version,
+                            base_commit=session_base,
+                            ralph=ralph_meta,
+                            ralph_done_script=ralph_done_script,
+                            include_session=not args.omit_session_log,
+                            small_model=args.small_model,
+                            inner_max_turns=(
+                                inner_max_turns if args.small_model else None
                             ),
-                            flush=True,
+                            image=image,
                         )
-                    name = session_name(i)
-                    session_path = archive_dir / f"{name}.jsonl"  # live session log
-                    patch_path = out_dir / f"{name}.patch"        # project-level patch
-                    wip_path = archive_dir / f"{name}.wip.patch"  # live resume patch
+                        if mcp_warning:
+                            session.record_warning(mcp_warning)
+                        view.session_begin(
+                            name=name, model=args.model,
+                            small_model=args.small_model, ralph=ralph_meta,
+                            resumed_from=None,
+                        )
 
-                    # Baseline before the session: recorded in the log so --resume
-                    # can recreate it, and used to format-patch the session's commits.
-                    session_base = sandbox.head()
-                    ralph_meta = {
-                        "iteration": i, "total": iterations,
-                        "chain_base": chain_base, "ancestors": list(ancestors),
-                    } if args.ralph else None
+                        result = run_session(
+                            sandbox, session, prompt, args.model, toolset,
+                            max_turns=args.max_turns, wip_patch_path=wip_path,
+                            small_model=args.small_model,
+                            inner_max_turns=inner_max_turns,
+                            view=view,
+                        )
+                        session.close()
+                        session = None
+                        # The session finished cleanly; the live resume patch is only
+                        # useful if it had crashed, so drop it. (On a crash, the except
+                        # handler leaves it in place for `gerbil resume`.)
+                        wip_path.unlink(missing_ok=True)
 
-                    session = Session(
-                        path=session_path,
-                        model=args.model,
-                        project_dir=project_dir,
-                        prompt_file=prompt_file,
-                        version=version,
-                        base_commit=session_base,
-                        ralph=ralph_meta,
-                        ralph_done_script=ralph_done_script,
-                        include_session=not args.omit_session_log,
-                        small_model=args.small_model,
-                        inner_max_turns=(
-                            inner_max_turns if args.small_model else None
-                        ),
-                        image=image,
-                    )
-                    if mcp_warning:
-                        session.record_warning(mcp_warning)
+                        footer = _run_footer(args, i if args.ralph else None, iterations)
+                        patch_name = _finalize_session(
+                            sandbox, session_base, result,
+                            session_path=session_path, patch_path=patch_path,
+                            out_dir=out_dir, archive_dir=archive_dir,
+                            include_session=not args.omit_session_log, footer=footer,
+                            view=view,
+                        )
+                        # Once a session produces a commit, later sessions in the chain
+                        # build on it -- record its patch as an ancestor for resume.
+                        if patch_name and args.ralph:
+                            ancestors.append(patch_name)
 
-                    result = run_session(
-                        sandbox, session, prompt, args.model, toolset,
-                        max_turns=args.max_turns, wip_patch_path=wip_path,
-                        small_model=args.small_model,
-                        inner_max_turns=inner_max_turns,
-                    )
-                    session.close()
-                    session = None
-                    # The session finished cleanly; the live resume patch is only
-                    # useful if it had crashed, so drop it. (On a crash, the except
-                    # handler leaves it in place for `gerbil resume`.)
-                    wip_path.unlink(missing_ok=True)
+                        # Optionally run the user's termination check on this session's
+                        # committed tree. Skip it on the final iteration (nothing left
+                        # to skip) -- the loop ends anyway.
+                        if ralph_done_script and i < iterations:
+                            view.notice("", newline_before=False)
+                            if _ralph_done(sandbox, ralph_done_script, view):
+                                break
 
-                    footer = _run_footer(args, i if args.ralph else None, iterations)
-                    patch_name = _finalize_session(
-                        sandbox, session_base, result,
-                        session_path=session_path, patch_path=patch_path,
-                        out_dir=out_dir, archive_dir=archive_dir,
-                        include_session=not args.omit_session_log, footer=footer,
-                    )
-                    # Once a session produces a commit, later sessions in the chain
-                    # build on it -- record its patch as an ancestor for resume.
-                    if patch_name and args.ralph:
-                        ancestors.append(patch_name)
-
-                    # Optionally run the user's termination check on this session's
-                    # committed tree. Skip it on the final iteration (nothing left
-                    # to skip) -- the loop ends anyway.
-                    if ralph_done_script and i < iterations:
-                        print(flush=True)
-                        if _ralph_done(sandbox, ralph_done_script):
-                            break
+                run_under_view(_use_tui(args), _sessions)
     except (Exception, KeyboardInterrupt) as exc:
         # Catch both crashes and Ctrl-C (KeyboardInterrupt is a BaseException, not
         # an Exception, so it must be named explicitly). The sandbox/MCP context
@@ -1659,120 +1692,130 @@ def cmd_resume(args) -> None:
                 # resumable across the resume boundary.
                 running_ancestors = list(ancestor_names)
 
-                for i in range(start_iter, total_iters + 1):
-                    if ralph:
-                        print(
-                            "\n" + style(
+                # The remaining iterations run under one view, exactly as in
+                # cmd_run (`session` is nonlocal for the except handler below).
+                def _sessions(view: SessionView) -> None:
+                    nonlocal session
+                    for i in range(start_iter, total_iters + 1):
+                        if ralph:
+                            view.notice(style(
                                 f"===== ralph session {i}/{total_iters} "
                                 "(resumed) =====", "bold", "magenta",
+                            ))
+                        name = out_name(i)
+                        session_path = archive_dir / f"{name}.jsonl"
+                        patch_path = out_dir / f"{name}.patch"
+                        wip_path = archive_dir / f"{name}.wip.patch"
+
+                        iter_base = sandbox.head()
+                        seeded = i == start_iter  # only the crashed session is replayed
+
+                        # Lay the crashed session's uncommitted edits back on top.
+                        if seeded and working_patch.strip():
+                            try:
+                                sandbox.apply_diff(working_patch)
+                            except Exception as exc:
+                                view.notice(
+                                    f"{style('warning:', 'bold', 'yellow')} could not "
+                                    f"apply the saved working-tree patch ({exc}); "
+                                    "continuing from the base commit only.",
+                                    newline_before=False, stderr=True,
+                                )
+
+                        ralph_meta = {
+                            "iteration": i, "total": total_iters,
+                            "chain_base": anchor, "ancestors": list(running_ancestors),
+                        } if ralph else None
+                        session = Session(
+                            path=session_path,
+                            model=parsed.model,
+                            project_dir=project_dir,
+                            prompt_file=Path(parsed.prompt_file),
+                            version=version,
+                            base_commit=iter_base,
+                            resumed_from=resume_file.name,
+                            ralph=ralph_meta,
+                            ralph_done_script=ralph_done_script,
+                            include_session=include_session,
+                            small_model=parsed.small_model,
+                            inner_max_turns=(
+                                inner_max_turns if parsed.small_model else None
                             ),
-                            flush=True,
+                            image=image,
                         )
-                    name = out_name(i)
-                    session_path = archive_dir / f"{name}.jsonl"
-                    patch_path = out_dir / f"{name}.patch"
-                    wip_path = archive_dir / f"{name}.wip.patch"
-
-                    iter_base = sandbox.head()
-                    seeded = i == start_iter  # only the crashed session is replayed
-
-                    # Lay the crashed session's uncommitted edits back on top.
-                    if seeded and working_patch.strip():
-                        try:
-                            sandbox.apply_diff(working_patch)
-                        except Exception as exc:
-                            print(
-                                f"{style('warning:', 'bold', 'yellow')} could not "
-                                f"apply the saved working-tree patch ({exc}); "
-                                "continuing from the base commit only.",
-                                file=sys.stderr,
+                        view.session_begin(
+                            name=name, model=parsed.model,
+                            small_model=parsed.small_model, ralph=ralph_meta,
+                            resumed_from=resume_file.name if seeded else None,
+                        )
+                        if seeded:
+                            # Carry the parent log forward IN FULL -- session_start,
+                            # warnings, the error that killed it, and the whole
+                            # conversation -- so the new log is a complete record of
+                            # the session from the beginning (and itself resumable).
+                            # The crashed original never commits, so this replay is
+                            # the only copy of its history that can reach the
+                            # project's .gerbil/. A `resumed` marker then separates
+                            # the carried-over history from the live continuation.
+                            for ev in parsed.events:
+                                session.record_replayed(ev)
+                            session.record_resumed(
+                                resume_file.name, len(parsed.events)
                             )
+                            view.banner(style(
+                                f"resuming {resume_file.name}: base {iter_base[:12]}, "
+                                f"{len(parsed.events)} events replayed, "
+                                f"model {parsed.model}", "gray",
+                            ))
+                            seed_messages = parsed.messages
+                        else:
+                            seed_messages = None
+                        # After the replay, so a continuation's own MCP warning
+                        # lands in its live region, not amid the parent's history.
+                        if mcp_warning:
+                            session.record_warning(mcp_warning)
 
-                    ralph_meta = {
-                        "iteration": i, "total": total_iters,
-                        "chain_base": anchor, "ancestors": list(running_ancestors),
-                    } if ralph else None
-                    session = Session(
-                        path=session_path,
-                        model=parsed.model,
-                        project_dir=project_dir,
-                        prompt_file=Path(parsed.prompt_file),
-                        version=version,
-                        base_commit=iter_base,
-                        resumed_from=resume_file.name,
-                        ralph=ralph_meta,
-                        ralph_done_script=ralph_done_script,
-                        include_session=include_session,
-                        small_model=parsed.small_model,
-                        inner_max_turns=(
-                            inner_max_turns if parsed.small_model else None
-                        ),
-                        image=image,
-                    )
-                    if seeded:
-                        # Carry the parent log forward IN FULL -- session_start,
-                        # warnings, the error that killed it, and the whole
-                        # conversation -- so the new log is a complete record of
-                        # the session from the beginning (and itself resumable).
-                        # The crashed original never commits, so this replay is
-                        # the only copy of its history that can reach the
-                        # project's .gerbil/. A `resumed` marker then separates
-                        # the carried-over history from the live continuation.
-                        for ev in parsed.events:
-                            session.record_replayed(ev)
-                        session.record_resumed(
-                            resume_file.name, len(parsed.events)
+                        result = run_session(
+                            sandbox, session, parsed.prompt, parsed.model, toolset,
+                            max_turns=args.max_turns, messages=seed_messages,
+                            wip_patch_path=wip_path,
+                            small_model=parsed.small_model,
+                            inner_max_turns=inner_max_turns,
+                            # Only the crashed (seeded) session can be mid-zoom;
+                            # later ralph iterations start fresh.
+                            pending_zoom=parsed.pending_zoom if seeded else None,
+                            view=view,
                         )
-                        print(style(
-                            f"resuming {resume_file.name}: base {iter_base[:12]}, "
-                            f"{len(parsed.events)} events replayed, "
-                            f"model {parsed.model}", "gray",
-                        ))
-                        seed_messages = parsed.messages
-                    else:
-                        seed_messages = None
-                    # After the replay, so a continuation's own MCP warning
-                    # lands in its live region, not amid the parent's history.
-                    if mcp_warning:
-                        session.record_warning(mcp_warning)
+                        session.close()
+                        session = None
+                        wip_path.unlink(missing_ok=True)
 
-                    result = run_session(
-                        sandbox, session, parsed.prompt, parsed.model, toolset,
-                        max_turns=args.max_turns, messages=seed_messages,
-                        wip_patch_path=wip_path,
-                        small_model=parsed.small_model,
-                        inner_max_turns=inner_max_turns,
-                        # Only the crashed (seeded) session can be mid-zoom;
-                        # later ralph iterations start fresh.
-                        pending_zoom=parsed.pending_zoom if seeded else None,
-                    )
-                    session.close()
-                    session = None
-                    wip_path.unlink(missing_ok=True)
+                        footer = (
+                            "authored by Gerbil:\n"
+                            f"--model {parsed.model}\n"
+                            f"resume {resume_file.name}"
+                        )
+                        if parsed.small_model:
+                            footer += f"\n--small-model {parsed.small_model}"
+                        if ralph:
+                            footer += f"\n--ralph (session {i}/{total_iters})"
+                        patch_name = _finalize_session(
+                            sandbox, iter_base, result,
+                            session_path=session_path, patch_path=patch_path,
+                            out_dir=out_dir, archive_dir=archive_dir,
+                            include_session=include_session, footer=footer,
+                            view=view,
+                        )
+                        if patch_name and ralph:
+                            running_ancestors.append(patch_name)
 
-                    footer = (
-                        "authored by Gerbil:\n"
-                        f"--model {parsed.model}\n"
-                        f"resume {resume_file.name}"
-                    )
-                    if parsed.small_model:
-                        footer += f"\n--small-model {parsed.small_model}"
-                    if ralph:
-                        footer += f"\n--ralph (session {i}/{total_iters})"
-                    patch_name = _finalize_session(
-                        sandbox, iter_base, result,
-                        session_path=session_path, patch_path=patch_path,
-                        out_dir=out_dir, archive_dir=archive_dir,
-                        include_session=include_session, footer=footer,
-                    )
-                    if patch_name and ralph:
-                        running_ancestors.append(patch_name)
+                        # Same termination check as a fresh run; skip on the last iter.
+                        if ralph_done_script and i < total_iters:
+                            view.notice("", newline_before=False)
+                            if _ralph_done(sandbox, ralph_done_script, view):
+                                break
 
-                    # Same termination check as a fresh run; skip on the last iter.
-                    if ralph_done_script and i < total_iters:
-                        print(flush=True)
-                        if _ralph_done(sandbox, ralph_done_script):
-                            break
+                run_under_view(_use_tui(args), _sessions)
     except (Exception, KeyboardInterrupt) as exc:
         # A resumed run is itself resumable: _abort points at this continuation's
         # own log (and Ctrl-C is caught the same as a crash -- see cmd_run).
@@ -2005,23 +2048,25 @@ def _load_ralph_done_script(path_str: str | None, *, have_ralph: bool) -> str | 
     return p.read_text()
 
 
-def _ralph_done(sandbox, script: str) -> bool:
+def _ralph_done(sandbox, script: str, view: SessionView) -> bool:
     """Run the --ralph_done check inside the container on the session's committed
     tree. Exit code 0 means the loop is finished (return True to stop); any other
     code means keep going. The script's output is shown either way."""
-    print(style("running --ralph_done check...", "bold", "magenta"), flush=True)
+    view.notice(style("running --ralph_done check...", "bold", "magenta"),
+                newline_before=False)
     result = sandbox.run_script(script)
     out = (result.stdout + result.stderr).strip()
     if out:
-        print(style(out.replace("\n", "\n  "), "gray"), flush=True)
+        view.notice(style(out.replace("\n", "\n  "), "gray"),
+                    newline_before=False)
     if result.exit_code == 0:
-        print(style("[ralph_done: check passed (exit 0) -- stopping loop]",
-                    "bold", "magenta"), flush=True)
+        view.notice(style("[ralph_done: check passed (exit 0) -- stopping loop]",
+                          "bold", "magenta"), newline_before=False)
         return True
-    print(style(
+    view.notice(style(
         f"[ralph_done: check did not pass (exit {result.exit_code}) -- continuing]",
         "gray",
-    ), flush=True)
+    ), newline_before=False)
     return False
 
 
