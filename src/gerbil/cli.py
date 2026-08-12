@@ -213,22 +213,49 @@ def _resolve_image(args, project_dir: Path) -> str:
     if getattr(args, "image", None):
         return args.image
 
-    config = project_dir / ".gerbil" / "config.toml"
-    if config.exists():
-        try:
-            settings = tomllib.loads(config.read_text())
-        except (tomllib.TOMLDecodeError, OSError) as exc:
-            sys.exit(f"error: could not read {config}:\n  {exc}")
-        image = settings.get("image")
-        if image is not None:
-            if not isinstance(image, str) or not image.strip():
-                sys.exit(
-                    f"error: `image` in {config} must be a non-empty string "
-                    f"(got {image!r})."
-                )
-            return image
+    settings = _project_config(project_dir)
+    image = settings.get("image")
+    if image is not None:
+        if not isinstance(image, str) or not image.strip():
+            config = project_dir / ".gerbil" / "config.toml"
+            sys.exit(
+                f"error: `image` in {config} must be a non-empty string "
+                f"(got {image!r})."
+            )
+        return image
 
     return os.environ.get("GERBIL_SANDBOX_IMAGE", DEFAULT_SANDBOX_IMAGE)
+
+
+def _project_config(project_dir: Path) -> dict:
+    """The parsed <project>/.gerbil/config.toml, {} when there isn't one.
+    Unknown keys are deliberately ignored so the file can grow; a file that
+    exists but cannot be parsed is a hard error (silently dropping the user's
+    stated configuration would be worse)."""
+    config = project_dir / ".gerbil" / "config.toml"
+    if not config.exists():
+        return {}
+    try:
+        return tomllib.loads(config.read_text())
+    except (tomllib.TOMLDecodeError, OSError) as exc:
+        sys.exit(f"error: could not read {config}:\n  {exc}")
+
+
+def _resolve_theme(project_dir: Path) -> str | None:
+    """The live view's color scheme: `theme = "light" | "dark"` in the project
+    config, None (textual's default dark) when unset. Validated here, at
+    preflight, so a typo fails before the sandbox boots rather than being
+    silently ignored on the finished screen. The plain view has no theme."""
+    theme = _project_config(project_dir).get("theme")
+    if theme is None:
+        return None
+    if theme not in ("light", "dark"):
+        config = project_dir / ".gerbil" / "config.toml"
+        sys.exit(
+            f'error: `theme` in {config} must be "light" or "dark" '
+            f"(got {theme!r})."
+        )
+    return theme
 
 
 def _require_container_runtime() -> None:
@@ -1476,7 +1503,8 @@ def cmd_run(args) -> None:
                             if _ralph_done(sandbox, ralph_done_script, view):
                                 break
 
-                run_under_view(_use_tui(args), _sessions)
+                run_under_view(_use_tui(args), _sessions,
+                               theme=_resolve_theme(project_dir))
     except (Exception, KeyboardInterrupt) as exc:
         # Catch both crashes and Ctrl-C (KeyboardInterrupt is a BaseException, not
         # an Exception, so it must be named explicitly). The sandbox/MCP context
@@ -1815,7 +1843,8 @@ def cmd_resume(args) -> None:
                             if _ralph_done(sandbox, ralph_done_script, view):
                                 break
 
-                run_under_view(_use_tui(args), _sessions)
+                run_under_view(_use_tui(args), _sessions,
+                               theme=_resolve_theme(project_dir))
     except (Exception, KeyboardInterrupt) as exc:
         # A resumed run is itself resumable: _abort points at this continuation's
         # own log (and Ctrl-C is caught the same as a crash -- see cmd_run).

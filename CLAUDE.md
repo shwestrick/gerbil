@@ -250,7 +250,13 @@ instead — which is byte-for-byte the pre-TUI output (PrintView pins it; see
 view.py). The view is display-only: what reaches the session log, the patch,
 and the model never depends on it. Ctrl-C in the TUI is cooperative (lands at
 the next output event; a second press detaches the UI) and ends in the same
-`_abort` path as before, after the terminal is restored.
+`_abort` path as before, after the terminal is restored. When the run ends —
+complete, interrupted, or crashed — the app holds the finished screen (clocks
+frozen, outcome banner in the stats pane) until the user confirms with
+q/enter/Ctrl-C; the `session:`/`patch:`/usage lines are then reprinted onto
+the normal terminal. `theme = "light" | "dark"` in
+`<project>/.gerbil/config.toml` picks the TUI's color scheme
+(`cli._resolve_theme`, validated at preflight; default dark).
 
 **Big-small mode** (`--small-model M`): the big model (`--model`) drives the
 session and gets a `zoom_in(prompt, file, line[, column])` tool; calling it sets
@@ -290,7 +296,8 @@ handles it.
 packages, or a pinned toolchain that gerbil's stock image does not carry, so the
 image is selectable. `cli._resolve_image` picks it, highest precedence first:
 `--image`, then `image = "..."` in `<project>/.gerbil/config.toml` (stdlib
-`tomllib`; unknown keys ignored so the file can grow), then
+`tomllib`, read by `cli._project_config`; unknown keys ignored so the file can
+grow — `theme` for the live view also lives here), then
 `GERBIL_SANDBOX_IMAGE` (what the launcher sets to its version-matched build),
 then `gerbil-lean-sandbox:latest` for direct dev use. The project config
 deliberately outranks the environment — the launcher *always* exports

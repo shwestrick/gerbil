@@ -290,6 +290,57 @@ def test_render_stats() -> None:
     check("empty file table placeholder", "(none yet)" in out3, out3)
 
 
+def test_render_stats_finished() -> None:
+    """The end-of-run hold: a finished banner replaces the interrupt one and
+    the clocks freeze at finished_at, not at render time."""
+    stats = SessionStats()
+    stats.on_session_begin(name="s", model="m", small_model=None, ralph=None,
+                           resumed_from=None, now=0.0)
+    stats.interrupt_requested = True  # superseded once finished
+    stats.finished = "complete"
+    stats.finished_at = 60.0
+    with contextlib.redirect_stderr(io.StringIO()):
+        out = render_stats(stats, 40, now=9_999.0)
+    check("finished banner shown", "session complete" in out, out)
+    check("exit hint shown", "press q or enter to exit" in out, out)
+    check("interrupt banner superseded", "interrupting" not in out, out)
+    check("clock frozen at finished_at", "00:01:00" in out, out)
+
+    for kind in ("interrupted", "error"):
+        stats.finished = kind
+        with contextlib.redirect_stderr(io.StringIO()):
+            out = render_stats(stats, 40, now=9_999.0)
+        check(f"finished banner: {kind}", f"session {kind}" in out, out)
+
+
+def test_resolve_theme() -> None:
+    """`theme` in .gerbil/config.toml: light/dark accepted, absence is None,
+    anything else is a preflight error."""
+    import tempfile
+    from pathlib import Path
+
+    from gerbil.cli import _resolve_theme
+
+    root = Path(tempfile.mkdtemp())
+    check("no config file -> default", _resolve_theme(root) is None, "")
+
+    cfg = root / ".gerbil"
+    cfg.mkdir()
+    (cfg / "config.toml").write_text('image = "custom:latest"\n')
+    check("config without theme -> default", _resolve_theme(root) is None, "")
+
+    for value in ("light", "dark"):
+        (cfg / "config.toml").write_text(f'theme = "{value}"\n')
+        check(f"theme {value} accepted", _resolve_theme(root) == value, "")
+
+    (cfg / "config.toml").write_text('theme = "solarized"\n')
+    try:
+        _resolve_theme(root)
+        check("invalid theme rejected", False, "no SystemExit")
+    except SystemExit as exc:
+        check("invalid theme rejected", "light" in str(exc), str(exc))
+
+
 # ---------------------------------------------------------------------------
 # PrintView byte-compatibility with the historical inline prints
 # ---------------------------------------------------------------------------
@@ -477,6 +528,8 @@ def main() -> None:
     test_patch_parser_edges()
     test_stats_replay()
     test_render_stats()
+    test_render_stats_finished()
+    test_resolve_theme()
     test_printview_byte_compat()
     test_tuiview_plumbing()
     print("\nAll tui tests passed.")

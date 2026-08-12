@@ -145,18 +145,23 @@ class PrintView:
         print(text, flush=True)
 
 
-def run_under_view(use_tui: bool, body: Callable[[SessionView], None]) -> None:
+def run_under_view(use_tui: bool, body: Callable[[SessionView], None],
+                   theme: str | None = None) -> None:
     """Run `body` (the whole session loop) under the chosen view.
 
     The plain path is deliberately nothing at all: construct a PrintView and
     call straight through on the caller's thread, so --plain and non-TTY runs
     have exactly the control flow they had before the TUI existed. The TUI
-    import is deferred to here so the classic path never touches textual."""
+    import is deferred to here so the classic path never touches textual.
+
+    `theme` is the TUI's color scheme ("light" or "dark", from the project
+    config; None = the default dark). The plain view has no theme -- its
+    colors are whatever the user's terminal shows for ANSI."""
     if not use_tui:
         body(PrintView())
         return
     from .tui import launch_tui
-    launch_tui(body)
+    launch_tui(body, theme=theme)
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +259,13 @@ class SessionStats:
 
     # Set when the user asked to interrupt; render_stats shows a banner.
     interrupt_requested: bool = False
+
+    # Set once the whole run (every ralph session) has ended and the TUI is
+    # holding the screen for the user to read: "complete", "interrupted", or
+    # "error". finished_at pins the clocks so elapsed stops counting the time
+    # spent looking at the finished screen.
+    finished: str | None = None
+    finished_at: float | None = None
 
     def on_session_begin(self, *, name: str, model: str,
                          small_model: str | None, ralph: dict | None,
@@ -380,6 +392,8 @@ def render_stats(stats: SessionStats, width: int, now: float | None = None) -> s
     pin it. Colors come from render.style, so the output is plain text
     wherever style() is disabled (piped tests, NO_COLOR)."""
     now = time.monotonic() if now is None else now
+    if stats.finished_at is not None:
+        now = stats.finished_at  # freeze the clocks on the finished screen
     sep = render.GLYPHS["sep"]
     rule = render.GLYPHS["rule"]
     lines: list[str] = []
@@ -438,7 +452,13 @@ def render_stats(stats: SessionStats, width: int, now: float | None = None) -> s
             zoom += f" {sep} ctx {zpct:.1f}%"
         lines.append(render.style(f"zoom: {zoom}", "magenta"))
 
-    if stats.interrupt_requested:
+    if stats.finished is not None:
+        color = {"complete": "green", "interrupted": "yellow"}.get(
+            stats.finished, "red")
+        lines.append("")
+        lines.append(render.style(f"session {stats.finished}", "bold", color))
+        lines.append(render.style("press q or enter to exit", "gray"))
+    elif stats.interrupt_requested:
         lines.append("")
         lines.append(render.style(
             "interrupting: finishing the current operation;\n"

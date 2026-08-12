@@ -225,13 +225,18 @@ class GerbilApp(App):
     BINDINGS = [
         Binding("ctrl+c", "interrupt", "interrupt", priority=True),
         Binding("q", "interrupt", "interrupt"),
+        Binding("enter", "confirm_exit", "exit", show=False),
         Binding("end", "follow", "follow tail"),
     ]
 
-    def __init__(self, view: TuiView, worker: threading.Thread):
+    def __init__(self, view: TuiView, worker: threading.Thread,
+                 theme: str | None = None):
         super().__init__()
         self._view = view
         self.worker_thread = worker
+        # "light"/"dark" from the project config (cli._resolve_theme validated
+        # it); None keeps textual's default dark scheme.
+        self._gerbil_theme = theme
 
     def compose(self):
         with Horizontal():
@@ -241,6 +246,8 @@ class GerbilApp(App):
         yield Footer()
 
     def on_mount(self):
+        if self._gerbil_theme:
+            self.theme = f"textual-{self._gerbil_theme}"
         self.set_interval(1.0, self.refresh_stats)  # the elapsed clock tick
         # Stray print()s from inside the bracket (pricing.py's unknown-pricing
         # warning, providers.py's Portkey fallback note) land in the log
@@ -275,47 +282,72 @@ class GerbilApp(App):
         width = pane.content_size.width or (STATS_PANE_WIDTH - 2)
         pane.update(Text.from_ansi(render_stats(self._view.stats, width)))
 
+    # -- end of the run --------------------------------------------------------
+
+    def worker_finished(self, outcome: str) -> None:
+        """Called (via call_from_thread) when the whole run has ended. The app
+        stays up -- the user confirms the exit (q/enter/Ctrl-C) after reading
+        the final state -- rather than yanking the screen away the moment the
+        last session lands."""
+        self._view.stats.finished = outcome
+        self._view.stats.finished_at = time.monotonic()
+        self.refresh_stats()
+
     # -- user actions ----------------------------------------------------------
 
     def action_interrupt(self) -> None:
+        if self._view.stats.finished is not None:
+            self.exit()  # the run already ended; this is the exit confirmation
+            return
         if self._view.interrupt_requested:
             self.exit()  # second press: detach now, let the worker unwind alone
             return
         self._view.request_interrupt()
         self.refresh_stats()
 
+    def action_confirm_exit(self) -> None:
+        # Enter exits only the finished screen; mid-run it does nothing (too
+        # easy to lean on for it to mean "interrupt").
+        if self._view.stats.finished is not None:
+            self.exit()
+
     def action_follow(self) -> None:
         self.query_one("#log", RichLog).scroll_end(animate=False)
 
 
-def launch_tui(body) -> None:
+def launch_tui(body, theme: str | None = None) -> None:
     """Run `body(view)` -- the whole session loop -- under the full-screen app.
 
-    The worker's exception (a crash, or the KeyboardInterrupt our cooperative
-    interrupt raises) is captured and re-raised HERE, on the main thread, only
-    after the terminal is restored -- it then flows into cmd_run/cmd_resume's
-    existing `except -> _abort` path, whose stderr message prints legibly onto
-    the normal screen. The finally block also covers main()'s SIGTERM/SIGHUP
-    -> SystemExit handlers firing inside app.run(): the worker is asked to
-    stop and joined (giving the sandbox `with` blocks their normal teardown)
-    before the exit proceeds."""
+    When the run ends (cleanly or not), the app does NOT exit: it shows the
+    outcome in the stats pane and waits for the user to confirm (q, enter, or
+    Ctrl-C), so the final screen can actually be read. The worker's exception
+    (a crash, or the KeyboardInterrupt our cooperative interrupt raises) is
+    captured and re-raised HERE, on the main thread, only after the terminal
+    is restored -- it then flows into cmd_run/cmd_resume's existing `except ->
+    _abort` path, whose stderr message prints legibly onto the normal screen.
+    The finally block also covers main()'s SIGTERM/SIGHUP -> SystemExit
+    handlers firing inside app.run(): the worker is asked to stop and joined
+    (giving the sandbox `with` blocks their normal teardown) before the exit
+    proceeds."""
     view = TuiView()
     outcome: dict[str, BaseException] = {}
 
     def worker():
         try:
             body(view)
+            kind = "complete"
         except BaseException as exc:
             outcome["exc"] = exc
-        finally:
-            try:
-                app.call_from_thread(app.exit)
-            except Exception:
-                pass  # app already gone (detached before the worker finished)
+            kind = ("interrupted" if isinstance(exc, KeyboardInterrupt)
+                    else "error")
+        try:
+            app.call_from_thread(app.worker_finished, kind)
+        except Exception:
+            pass  # app already gone (detached before the worker finished)
 
     app = GerbilApp(view, threading.Thread(
         target=worker, daemon=True, name="gerbil-session",
-    ))
+    ), theme=theme)
     view.bind(app)
     try:
         app.run()
