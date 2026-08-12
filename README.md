@@ -4,7 +4,7 @@
 
 <img src="assets/gerbil.png" align="right" width="220" hspace="20" alt="gerbil sitting in its sandbox">
 
-A teensy tiny sandboxed agent for Lean projects. gerbil sessions run in a
+A sandboxed agent for Lean projects. gerbil sessions run in a
 container (Docker or podman) and produce git patches.
 
 ```console
