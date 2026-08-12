@@ -6,13 +6,13 @@ few times a second for ~30 seconds (argv[2] overrides), then records status
 "complete" and exits. While it runs (from the repo root):
 
     uv run python tests/fake_runner.py &
-    uv run python -m gerbil running
+    uv run python -m gerbil ps
     uv run python -m gerbil grab fake-run
 
 Try: scrollback while lines stream, `d` (detach + reattach), Ctrl-C (it
 really does SIGINT this process -- the wrapper records "interrupted"), and
 the held finished screen at the end. The viewer's confirm-exit removes the
-run dir; until then the finished run stays in `gerbil running` (grab it
+run dir; until then the finished run stays in `gerbil ps` (grab it
 again to dismiss it).
 """
 

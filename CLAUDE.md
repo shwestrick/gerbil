@@ -239,9 +239,9 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   are already committed (same stable patch-id test as `gerbil commit`); patches
   not yet committed are never touched, and the `~/.gerbil/sessions/` archive
   copies are kept.
-- `gerbil running` — list the background runs (name, status, project, model,
-  session, turns, context %, elapsed). Listing never cleans up: finished/died
-  runs stay until grabbed and dismissed.
+- `gerbil ps` — list the background runs (name, status — running, paused, or
+  an outcome — project, model, session, turns, context %, elapsed). Listing
+  never cleans up: finished/died runs stay until grabbed and dismissed.
 - `gerbil grab [NAME]` — reattach the full-screen viewer to a background run;
   for a finished one it opens straight onto the held finished screen, and
   confirming the exit there is the one and only thing that removes a run's
@@ -268,10 +268,16 @@ ANSI kept alive by `GERBIL_FORCE_STYLE`), `stats.json` (SessionStats over the
 wire; monotonic anchors ship as elapsed seconds), and `meta.json` (pid +
 status, the authority on how a run ended — written by `runs.run_runner`, the
 `main()`-level wrapper, whatever the exit path). One run name spans a whole
-ralph chain. Keys: `d` detaches (the run continues; `gerbil running` lists it,
+ralph chain. Keys: `d` detaches (the run continues; `gerbil ps` lists it,
 `gerbil grab NAME` reattaches, bare `gerbil grab` picks the only live run);
-Ctrl-C/q interrupt — a real SIGINT to the runner, i.e. exactly a `--plain`
-Ctrl-C over there — and a second press closes the viewer while it unwinds.
+`p`/`r` pause/resume — pause SIGSTOPs the runner in place (`runs.pause_run`;
+the sandbox container stays alive, and the status write ordering around the
+stop/continue signals is deliberate — see the docstrings) so `r`, from this or
+any later viewer, continues the very same process exactly where it stood;
+nothing like `gerbil resume`'s rebuild-and-replay happens. Ctrl-C/q
+interrupt — a real SIGINT to the runner, i.e. exactly a `--plain` Ctrl-C over
+there (a paused runner is SIGCONTed first; a stopped process can't receive
+the interrupt) — and a second press closes the viewer while it unwinds.
 When the run ends (complete/interrupted/error, or the runner died), the viewer
 holds the finished screen until q/enter/Ctrl-C confirms; only a confirmed exit
 removes the registry entry and reprints the `session:`/`patch:`/usage tail
@@ -416,8 +422,8 @@ uv run python tests/test_tui.py          # live view: stats model, wip-patch fil
                                          # parser, left pane, PrintView byte-compat,
                                          # RunnerView (no Docker, no terminal)
 uv run python tests/test_runs.py         # background-run registry: naming, liveness,
-                                         # display tailing, stats wire format,
-                                         # running/grab commands (no Docker)
+                                         # pause/resume, display tailing, stats wire
+                                         # format, ps/grab commands (no Docker)
 uv run python tests/test_empty_turn.py   # glitched empty-turn guard + filter (no network)
 uv run python tests/test_sandbox_cleanup.py  # container cleanup on interrupt (no Docker)
 uv run python tests/test_ollama.py       # ollama provider plumbing (no Docker; live smoke if a server is up)

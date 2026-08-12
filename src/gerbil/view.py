@@ -250,6 +250,11 @@ class SessionStats:
     # Set when the user asked to interrupt; render_stats shows a banner.
     interrupt_requested: bool = False
 
+    # Set while the runner is SIGSTOPped (viewer-owned, like the fields below:
+    # the viewer derives it from meta.json each poll; it never crosses the
+    # stats wire).
+    paused: bool = False
+
     # Set once the whole run (every ralph session) has ended and the TUI is
     # holding the screen for the user to read: "complete", "interrupted", or
     # "error". finished_at pins the clocks so elapsed stops counting the time
@@ -455,6 +460,11 @@ def render_stats(stats: SessionStats, width: int, now: float | None = None) -> s
         lines.append(render.style(
             "interrupting: finishing the current operation;\n"
             "press again to detach", "bold", "yellow"))
+    elif stats.paused:
+        lines.append("")
+        lines.append(render.style("paused: press r to resume", "bold", "blue"))
+        lines.append(render.style(
+            "(the sandbox stays alive; d detaches)", "gray"))
 
     lines.append("")
     header = f"{rule * 2} files {rule * 2}"
@@ -499,9 +509,9 @@ def render_stats(stats: SessionStats, width: int, now: float | None = None) -> s
 # time.monotonic() anchors (meaningless in another process -- shipped as
 # elapsed seconds, re-anchored against the reader's own clock so its 1s tick
 # keeps counting between writes) and the files dict's tuple/None values.
-# `finished`/`finished_at`/`interrupt_requested` are deliberately NOT carried:
-# meta.json's status is the authority for how a run ended, and the interrupt
-# banner belongs to the viewer that pressed the key.
+# `finished`/`finished_at`/`interrupt_requested`/`paused` are deliberately NOT
+# carried: meta.json's status is the authority for how a run ended (and for
+# pause), and the interrupt banner belongs to the viewer that pressed the key.
 # ---------------------------------------------------------------------------
 
 

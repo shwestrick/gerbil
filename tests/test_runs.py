@@ -1,7 +1,7 @@
 """Tests for the background-run registry (runs.py) and the running/grab
 commands: naming, meta round-trips, liveness classification, display tailing,
 the SessionStats wire format, the runner exit-status wrapper, and the
-cmd_running/cmd_grab behavior against fabricated run dirs.
+cmd_ps/cmd_grab behavior against fabricated run dirs.
 
 No Docker, no network, no terminal. The textual viewer that consumes all of
 this is exercised by hand (see tests/fake_runner.py).
@@ -111,6 +111,54 @@ def test_liveness() -> None:
         {"status": "running", "pid": dead}) == "died", "")
     check("starting + no pid -> died", runs.classify(
         {"status": "starting", "pid": None}) == "died", "")
+    check("paused + live pid", runs.classify(
+        {"status": "paused", "pid": live}) == "paused", "")
+    check("paused + dead pid -> died", runs.classify(
+        {"status": "paused", "pid": dead}) == "died", "")
+
+
+def _proc_state(pid: int) -> str:
+    """The kernel's view of a process: 'T...' when stopped."""
+    return subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def test_pause_resume() -> None:
+    with tmp_running_dir():
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"])
+        try:
+            runs.create_run("nap-run", project_dir=Path("/p"), model="m",
+                            theme=None, command=[])
+            runs.save_meta("nap-run", pid=sleeper.pid, status="running")
+
+            check("pause_run stops a running run", runs.pause_run("nap-run"), "")
+            check("paused in the registry",
+                  runs.classify(runs.load_meta("nap-run")) == "paused", "")
+            check("process actually SIGSTOPped",
+                  _proc_state(sleeper.pid).startswith("T"),
+                  _proc_state(sleeper.pid))
+            check("pausing a paused run is a no-op",
+                  not runs.pause_run("nap-run"), "")
+
+            check("resume_run continues it", runs.resume_run("nap-run"), "")
+            check("running again in the registry",
+                  runs.classify(runs.load_meta("nap-run")) == "running", "")
+            check("process actually SIGCONTed",
+                  not _proc_state(sleeper.pid).startswith("T"),
+                  _proc_state(sleeper.pid))
+            check("resuming a running run is a no-op",
+                  not runs.resume_run("nap-run"), "")
+
+            runs.save_meta("nap-run", status="complete")
+            check("pausing a finished run refused",
+                  not runs.pause_run("nap-run"), "")
+        finally:
+            sleeper.kill()
+            sleeper.wait()
+        runs.save_meta("nap-run", status="running")  # pid now dead
+        check("pausing a dead run refused", not runs.pause_run("nap-run"), "")
+        check("resuming a dead run refused", not runs.resume_run("nap-run"), "")
 
 
 def test_tail_display() -> None:
@@ -262,27 +310,30 @@ def _fab_run(name: str, *, status: str, pid, turns: int = 0,
         })
 
 
-def test_cmd_running_and_grab() -> None:
-    from gerbil.cli import cmd_grab, cmd_running
+def test_cmd_ps_and_grab() -> None:
+    from gerbil.cli import cmd_grab, cmd_ps
 
     with tmp_running_dir():
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            cmd_running(Namespace())
+            cmd_ps(Namespace())
         check("empty registry message", "no background runs." in out.getvalue(),
               out.getvalue())
 
         _fab_run("live-run", status="running", pid=os.getpid(), turns=4,
                  session="gerbil-260812-01")
         _fab_run("done-run", status="complete", pid=None, turns=9)
+        _fab_run("nap-run", status="paused", pid=os.getpid(), turns=2)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            cmd_running(Namespace())
+            cmd_ps(Namespace())
         text = out.getvalue()
         check("live run listed", "live-run" in text and "running" in text
               and "gerbil-260812-01" in text and "50%" in text, text)
         check("finished run listed", "done-run" in text
               and "complete" in text, text)
+        check("paused run listed", "nap-run" in text and "paused" in text,
+              text)
         check("grab hint names a live run", "gerbil grab live-run" in text, text)
         check("dismiss hint names the finished run",
               "dismiss" in text and "gerbil grab done-run" in text, text)
@@ -290,20 +341,29 @@ def test_cmd_running_and_grab() -> None:
         # grabs it and confirms the exit from the finished screen.
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            cmd_running(Namespace())
+            cmd_ps(Namespace())
         check("finished run survives repeated listings",
               runs.run_dir("done-run").exists()
               and "done-run" in out.getvalue(), out.getvalue())
 
-        # grab: bare with one live run resolves it -- but stdout is not a tty
-        # here, so it must exit with the tail -f pointer instead of attaching.
+        # grab resolves, but stdout is not a tty here, so it must exit with
+        # the tail -f pointer instead of attaching.
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                cmd_grab(Namespace(name=None))
+                cmd_grab(Namespace(name="live-run"))
             check("grab without a tty exits", False, "no SystemExit")
         except SystemExit as exc:
             check("grab without a tty points at the display file",
                   "display.ansi" in str(exc), str(exc))
+
+        # Bare grab with several live/paused runs must list the candidates,
+        # paused ones included (they are grabbable and resumable).
+        try:
+            cmd_grab(Namespace(name=None))
+            check("bare grab with several active exits", False, "no SystemExit")
+        except SystemExit as exc:
+            check("paused runs are bare-grab candidates",
+                  "live-run" in str(exc) and "nap-run" in str(exc), str(exc))
 
         try:
             cmd_grab(Namespace(name="no-such-run"))
@@ -346,10 +406,11 @@ def main() -> None:
     test_names()
     test_meta_roundtrip()
     test_liveness()
+    test_pause_resume()
     test_tail_display()
     test_wire_roundtrip()
     test_run_runner()
-    test_cmd_running_and_grab()
+    test_cmd_ps_and_grab()
     print("\nAll runs tests passed.")
 
 

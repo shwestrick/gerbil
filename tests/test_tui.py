@@ -313,6 +313,20 @@ def test_render_stats_finished() -> None:
             out = render_stats(stats, 40, now=9_999.0)
         check(f"finished banner: {kind}", f"session {kind}" in out, out)
 
+    # The paused banner shows only while nothing weightier is going on.
+    stats.finished = None
+    stats.finished_at = None
+    stats.interrupt_requested = False
+    stats.paused = True
+    with contextlib.redirect_stderr(io.StringIO()):
+        out = render_stats(stats, 40, now=9_999.0)
+    check("paused banner", "paused: press r to resume" in out, out)
+    stats.interrupt_requested = True
+    with contextlib.redirect_stderr(io.StringIO()):
+        out = render_stats(stats, 40, now=9_999.0)
+    check("interrupt banner outranks paused", "interrupting" in out
+          and "paused:" not in out, out)
+
 
 def test_resolve_theme() -> None:
     """`theme` in .gerbil/config.toml: light/dark accepted, absence is None,

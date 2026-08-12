@@ -31,6 +31,7 @@ import json
 import os
 import random
 import shutil
+import signal
 import time
 from pathlib import Path
 from typing import Callable
@@ -167,14 +168,64 @@ TERMINAL_STATUSES = ("complete", "interrupted", "error")
 
 
 def classify(meta: dict) -> str:
-    """The one liveness rule, shared by the viewer's poll and `gerbil running`:
+    """The one liveness rule, shared by the viewer's poll and `gerbil ps`:
     a recorded terminal status is the truth (it survives pid reuse); otherwise
-    a live pid means running and a dead one means the runner died without
-    getting to record how (SIGKILL, OOM, power loss)."""
+    a live pid is running -- or paused, when a viewer has SIGSTOPped it -- and
+    a dead one means the runner died without getting to record how (SIGKILL,
+    OOM, power loss)."""
     status = meta.get("status")
     if status in TERMINAL_STATUSES:
         return status
-    return "running" if pid_alive(meta.get("pid")) else "died"
+    if not pid_alive(meta.get("pid")):
+        return "died"
+    return "paused" if status == "paused" else "running"
+
+
+def pause_run(name: str) -> bool:
+    """Freeze a running runner with SIGSTOP. The whole process stops exactly
+    where it is -- mid-turn, mid-tool-call -- while its sandbox container (a
+    separate process tree under the container daemon) stays alive, so a later
+    resume_run continues the session precisely where it left off. Nothing like
+    `gerbil resume` happens here: no replay, no new process, no new log.
+
+    The status write comes AFTER the stop lands: a stopped process cannot
+    write, so there is no concurrent writer to race with. The one hole -- the
+    runner recorded a terminal status in the instant before the stop landed --
+    is checked for explicitly, and the near-corpse is released to finish
+    exiting rather than being recorded as paused forever.
+
+    Returns False (having done nothing lasting) unless the run was running."""
+    meta = load_meta(name) or {}
+    if classify(meta) != "running":
+        return False
+    try:
+        os.kill(meta["pid"], signal.SIGSTOP)
+    except (OSError, TypeError):
+        return False
+    if (load_meta(name) or {}).get("status") in TERMINAL_STATUSES:
+        try:
+            os.kill(meta["pid"], signal.SIGCONT)
+        except OSError:
+            pass
+        return False
+    save_meta(name, status="paused")
+    return True
+
+
+def resume_run(name: str) -> bool:
+    """Continue a paused runner with SIGCONT. The status write comes BEFORE
+    the wake-up -- while the runner is still frozen and cannot write meta
+    concurrently (its exit path would otherwise race a terminal status
+    against this "running"). Returns False unless the run was paused."""
+    meta = load_meta(name) or {}
+    if classify(meta) != "paused":
+        return False
+    save_meta(name, status="running")
+    try:
+        os.kill(meta["pid"], signal.SIGCONT)
+    except (OSError, TypeError):
+        return False
+    return True
 
 
 def list_runs() -> list[dict]:
@@ -253,7 +304,7 @@ def initial_display(path: Path, limit: int = INITIAL_DISPLAY_LIMIT,
 
 def run_runner(name: str, body: Callable[[], None]) -> None:
     """The child-side wrapper around the whole command: record the pid, run,
-    and -- however it ends -- record how, so the viewer and `gerbil running`
+    and -- however it ends -- record how, so the viewer and `gerbil ps`
     can tell a finished run from a killed one. sys.exit unwinds through here
     (SystemExit is a BaseException), so _abort's exit codes are readable:
     130 is its KeyboardInterrupt convention."""

@@ -21,6 +21,11 @@ Key semantics (user-facing):
   "interrupted:" + resume lines into the display stream). A second press
   closes the viewer while the runner unwinds.
 - d: detach -- the viewer exits, the run continues in the background.
+- p / r: pause / resume. Pause SIGSTOPs the runner where it stands -- the
+  sandbox container stays alive -- and r (from this or any later viewer;
+  paused runs detach and grab like running ones) SIGCONTs the same process,
+  which continues exactly where it left off. Unrelated to `gerbil resume`,
+  which rebuilds a crashed session in a fresh sandbox.
 - When the run ends (complete, interrupted, error, or the runner died), the
   viewer holds the finished screen until q/enter/Ctrl-C confirms; only a
   confirmed exit removes the run's registry entry and reprints the
@@ -74,6 +79,8 @@ class ViewerApp(App):
         Binding("ctrl+c", "interrupt", "interrupt", priority=True),
         Binding("q", "interrupt", "interrupt"),
         Binding("d", "detach", "background"),
+        Binding("p", "pause", "pause"),
+        Binding("r", "resume", "resume"),
         Binding("enter", "confirm_exit", "exit", show=False),
         Binding("end", "follow", "follow tail"),
     ]
@@ -151,7 +158,8 @@ class ViewerApp(App):
             meta = runs.load_meta(self._name) or self._meta
             self._meta = meta
             state = runs.classify(meta)
-            if state != "running":
+            self.stats.paused = state == "paused"
+            if state not in ("running", "paused"):
                 self._drain_display()  # the runner's last words, incl. _abort's
                 if state == "died":
                     self._write_log(
@@ -189,6 +197,11 @@ class ViewerApp(App):
             self.outcome = "detach-unwinding"
             self.exit()  # second press: stop watching the unwind
             return
+        # A SIGINT queued on a stopped process is not delivered until it is
+        # continued -- interrupting a paused run means waking it first.
+        if self.stats.paused:
+            runs.resume_run(self._name)
+            self.stats.paused = False
         try:
             os.kill(self._meta.get("pid") or 0, signal.SIGINT)
         except (ProcessLookupError, PermissionError):
@@ -196,6 +209,23 @@ class ViewerApp(App):
         self._interrupt_sent = True
         self.stats.interrupt_requested = True
         self.refresh_stats()
+
+    def action_pause(self) -> None:
+        """Freeze the runner in place (SIGSTOP; see runs.pause_run). The
+        sandbox container stays alive, so this is nothing like `gerbil
+        resume`: pressing r continues the very same process mid-thought."""
+        if self.stats.finished is not None or self._interrupt_sent:
+            return
+        if runs.pause_run(self._name):
+            self.stats.paused = True
+            self.refresh_stats()
+
+    def action_resume(self) -> None:
+        if self.stats.finished is not None:
+            return
+        if runs.resume_run(self._name):
+            self.stats.paused = False
+            self.refresh_stats()
 
     def action_detach(self) -> None:
         if self.stats.finished is not None:
@@ -222,7 +252,7 @@ def attach_viewer(name: str) -> int:
     meta = runs.load_meta(name)
     if meta is None:
         sys.exit(f"error: no background run named {name!r} "
-                 "(see `gerbil running`)")
+                 "(see `gerbil ps`)")
 
     app = ViewerApp(name, meta)
     app.run()

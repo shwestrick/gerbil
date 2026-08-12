@@ -32,7 +32,7 @@ about disagreements.
 
 On a terminal, run/resume execute in a detached runner process registered
 under ~/.gerbil/running/<name>/ (see runs.py) with the full-screen app as a
-detachable viewer over it; `gerbil running` lists these and `gerbil grab NAME`
+detachable viewer over it; `gerbil ps` lists these and `gerbil grab NAME`
 reattaches. The registry is bookkeeping only -- the outputs above are
 unaffected.
 
@@ -503,10 +503,11 @@ def main() -> None:
                           help=argparse.SUPPRESS)
     resume_p.set_defaults(func=cmd_resume)
 
-    running_p = sub.add_parser(
-        "running", help="list gerbil runs currently active in the background"
+    ps_p = sub.add_parser(
+        "ps", help="list the background gerbil runs (running, paused, and "
+        "finished-awaiting-dismissal)"
     )
-    running_p.set_defaults(func=cmd_running)
+    ps_p.set_defaults(func=cmd_ps)
 
     grab_p = sub.add_parser(
         "grab", help="reattach the full-screen view to a background run"
@@ -515,7 +516,7 @@ def main() -> None:
         "name",
         metavar="NAME",
         nargs="?",
-        help="The run to attach to (see `gerbil running`). May be omitted "
+        help="The run to attach to (see `gerbil ps`). May be omitted "
         "when exactly one run is active.",
     )
     grab_p.set_defaults(func=cmd_grab)
@@ -593,7 +594,7 @@ def main() -> None:
         # This process is the detached runner behind a TUI run: record its
         # pid up front and, however the command ends (clean return, _abort's
         # sys.exit, a signal-handler SystemExit), record how -- the viewer and
-        # `gerbil running` read that status as the truth about the run.
+        # `gerbil ps` read that status as the truth about the run.
         runs.run_runner(args._runner, lambda: args.func(args))
     else:
         args.func(args)
@@ -1950,7 +1951,7 @@ def _elapsed_str(seconds: float) -> str:
     return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
 
 
-def cmd_running(args) -> None:
+def cmd_ps(args) -> None:
     """List the background runs. Finished (or died) runs stay listed with
     their outcome until the user grabs them and confirms the exit from the
     finished screen -- that confirmation, in tui.attach_viewer, is the ONLY
@@ -1993,10 +1994,11 @@ def cmd_running(args) -> None:
         line = "  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip()
         print(style(line, "bold") if i == 0 else line)
 
-    live = [e["name"] for e in entries if e["state"] == "running"]
+    active = [e["name"] for e in entries
+              if e["state"] in ("running", "paused")]
     hints = []
-    if live:
-        hints.append(f"reattach with: gerbil grab {live[0]}")
+    if active:
+        hints.append(f"reattach with: gerbil grab {active[0]}")
     if finished:
         hints.append("review and dismiss finished runs with: "
                      f"gerbil grab {finished[0]}")
@@ -2010,16 +2012,17 @@ def cmd_grab(args) -> None:
     """Reattach the full-screen viewer to a background run. Finished runs are
     grabbable too -- the viewer opens straight onto the held finished screen,
     and confirming the exit there is what dismisses the run from the
-    registry (`gerbil running` never cleans one up on its own)."""
+    registry (`gerbil ps` never cleans one up on its own)."""
     entries = runs.list_runs()
-    live = [e["name"] for e in entries if e["state"] == "running"]
+    live = [e["name"] for e in entries
+            if e["state"] in ("running", "paused")]
     name = args.name
     if name is None:
-        # Bare grab: a live run is what the user most likely means; with none
-        # live, a finished run awaiting review/dismissal is the next best.
+        # Bare grab: a live (running or paused) run is what the user most
+        # likely means; with none, a finished run awaiting dismissal is next.
         candidates = live or [e["name"] for e in entries]
         if not candidates:
-            sys.exit("no background runs. (see `gerbil running`)")
+            sys.exit("no background runs. (see `gerbil ps`)")
         if len(candidates) > 1:
             sys.exit("several runs are registered -- name one:\n  "
                      + "\n  ".join(f"gerbil grab {n}" for n in candidates))
