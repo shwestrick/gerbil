@@ -601,6 +601,7 @@ def run_session(
         base_commit=session.base_commit,
         zoom_in_available=small_model is not None,
         submodules=sandbox.submodule_paths,
+        check_goal_available=bool(getattr(toolset, "check_script", None)),
     )
     tools = toolset.schemas(zoom="outer" if small_model is not None else None)
 

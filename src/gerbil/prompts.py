@@ -64,6 +64,24 @@ try to do everything at once.
 """
 
 
+# Appended to the system prompt when the session has a termination check
+# installed (--ralph_done, or the check --fill-sorry generates) and the
+# check_goal tool is therefore available. Without this, an agent that
+# believes the task is done can only watch the loop restart with no idea
+# which condition it is failing.
+CHECK_GOAL_NOTE = """\
+
+This task has a termination check: a script that decides, after each \
+session, whether the task is complete (exit 0 ends the session loop). Your \
+`check_goal` tool runs that exact script and shows you its verdict and \
+output. The check is the definition of done for this task -- if you believe \
+you are finished but the loop keeps going, run check_goal and read WHY it \
+disagrees, then fix that, rather than re-verifying by other means. It \
+typically runs a full build, so call it at natural checkpoints (in \
+particular: when you think the task is complete), not after every edit.
+"""
+
+
 # Appended to the system prompt to pin down how the final state must be left.
 # gerbil reads the result purely as `git format-patch <base>..HEAD`, so the
 # agent's work must end up reachable from that range. {base} is the commit the
@@ -202,6 +220,7 @@ def context_pressure_note(level: float, used: int, limit: int) -> str:
 def build_system_prompt(
     has_lsp_tools: bool, ralph: bool = False, base_commit: str = "",
     zoom_in_available: bool = False, submodules: list[str] | None = None,
+    check_goal_available: bool = False,
 ) -> str:
     """The system prompt, with notes appended for active features."""
     prompt = SYSTEM_PROMPT
@@ -209,6 +228,8 @@ def build_system_prompt(
         prompt += LSP_TOOLS_NOTE
     if ralph:
         prompt += RALPH_NOTE
+    if check_goal_available:
+        prompt += CHECK_GOAL_NOTE
     if zoom_in_available:
         prompt += ZOOM_NOTE
     if base_commit:

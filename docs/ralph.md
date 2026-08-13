@@ -49,6 +49,11 @@ $ gerbil run --prompt ralph-prompt.md --ralph 20 --ralph_done ./no-sorries.sh
 This is the usual way to use `--ralph`: set `N` to a budget you're willing to
 spend and let the check end the run when the goal is met.
 
+When a termination check is installed, the agent also gets a `check_goal`
+tool that runs the same script and shows it the verdict and output -- so a
+session that believes it is done can verify against the actual stop
+condition (and see exactly which part fails) instead of guessing.
+
 For the common "prove these specific `sorry`s" task, you don't have to write
 the prompt or the check yourself: [`--fill-sorry`](fill-sorry.md) generates
 both (and a cross-session plan file) and defaults to a ralph loop.

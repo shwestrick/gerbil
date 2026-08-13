@@ -140,6 +140,92 @@ def test_resolver() -> None:
     name, why = r("-- just a comment\nsorry\n", 2)
     check("no header at all is a resolution error",
           name is None and "no declaration" in why)
+    check("named instance is supported",
+          r("instance inst : C := sorry\n", 1) == ("inst", ""))
+    # Sorries in structure/inductive/class/opaque sites hide in
+    # auto-generated constants the axiom check cannot see -- refused.
+    for kind, src in [
+        ("structure", "structure Cfg where\n  x : Nat := sorry\n"),
+        ("inductive", "inductive T where\n  | mk (n : Nat := sorry)\n"),
+        ("class", "class C where\n  y : Nat := sorry\n"),
+        ("opaque", "opaque o : Nat := sorry\n"),
+    ]:
+        name, why = r(src, 2 if "\n  " in src else 1)
+        check(f"{kind} site is a resolution error",
+              name is None and kind in why and "auto-generated" in why)
+
+
+def test_designations() -> None:
+    print("\n=== mixed position/name designations ===")
+
+    from gerbil.fill_sorry import parse_designations, spec_from_arg
+
+    pos, names = parse_designations("A.lean:1,Ns.foo,B/C.lean:2:3,bar")
+    check("positions and names split correctly",
+          pos == [SorryPos("A.lean", 1), SorryPos("B/C.lean", 2, 3)]
+          and names == ["Ns.foo", "bar"])
+    rejects("bare .lean file is still a position error",
+            parse_designations, "Foo.lean")
+    rejects("path without a line is still a position error",
+            parse_designations, "A/B.lean")
+    rejects("empty designation list", parse_designations, " , ")
+    spec = spec_from_arg("Ns.foo")
+    check("name-only CLI arg builds a spec",
+          spec.sorries == [] and spec.names == ["Ns.foo"])
+
+    proj = git_project({
+        "A/B.lean": LEAN,
+        "A/N.lean": "namespace N\ntheorem t : 5 = 5 := by\n  sorry\nend N\n",
+        "A/S.lean": "structure Cfg where\n  x : Nat := 0\n",
+        "Dup.lean": "theorem foo : 9 = 9 := sorry\n",
+    })
+
+    spec = spec_from_arg("bar,t")
+    errors, warnings, excerpts = validate(
+        spec, project_dir=proj, repo_root=proj)
+    check("names located across the sources", errors == [], "\n".join(errors))
+    check("name -> header position + declaration",
+          SorryPos("A/B.lean", 4) in spec.sorries
+          and SorryPos("A/N.lean", 2) in spec.sorries
+          and spec.decls["A/B.lean:4"] == "bar"
+          and spec.decls["A/N.lean:2"] == "N.t", repr(spec.decls))
+    check("by-style header from a name does not warn about `sorry`",
+          not any("does not contain" in w for w in warnings),
+          "\n".join(warnings))
+
+    spec = spec_from_arg("foo")
+    errors, _, _ = validate(spec, project_dir=proj, repo_root=proj)
+    check("ambiguous name is an error (both sites listed)",
+          any("ambiguous" in e and "A/B.lean" in e and "Dup.lean" in e
+              for e in errors), "\n".join(errors))
+
+    spec = spec_from_arg("N.t")
+    errors, _, _ = validate(spec, project_dir=proj, repo_root=proj)
+    check("qualified name disambiguates", errors == [], "\n".join(errors))
+
+    # Module-qualified forms: users naturally write Hello.Basic.foo for a
+    # bare `foo` in Hello/Basic.lean (module path and namespace coincide by
+    # convention), and module+namespace combined must work too.
+    spec = spec_from_arg("Dup.foo")
+    errors, _, _ = validate(spec, project_dir=proj, repo_root=proj)
+    check("module-qualified bare declaration resolves",
+          errors == [] and spec.decls == {"Dup.lean:1": "foo"},
+          "\n".join(errors) or repr(spec.decls))
+    spec = spec_from_arg("A.N.N.t")
+    errors, _, _ = validate(spec, project_dir=proj, repo_root=proj)
+    check("module+namespace qualified resolves",
+          errors == [] and spec.decls == {"A/N.lean:2": "N.t"},
+          "\n".join(errors) or repr(spec.decls))
+
+    spec = spec_from_arg("nonexistent")
+    errors, _, _ = validate(spec, project_dir=proj, repo_root=proj)
+    check("unknown name is an error",
+          any("no declaration with this name" in e for e in errors))
+
+    spec = spec_from_arg("Cfg")
+    errors, _, _ = validate(spec, project_dir=proj, repo_root=proj)
+    check("unsupported kind by name is an error",
+          any("`structure`" in e for e in errors), "\n".join(errors))
 
 
 def test_modules() -> None:
@@ -192,6 +278,11 @@ def test_spec() -> None:
     check("table entry pins the declaration",
           tabled.sorries == [SorryPos("A.lean", 1), SorryPos("B.lean", 2, 3)]
           and tabled.decls == {"B.lean:2:3": "Ns.tricky"})
+
+    named = load_spec(spec_file('sorries = ["A.lean:1", "Ns.foo"]\n'))
+    check("name entries accepted in the spec",
+          named.sorries == [SorryPos("A.lean", 1)]
+          and named.names == ["Ns.foo"])
 
     def bad(label: str, content: str, expect: str) -> None:
         try:
@@ -419,6 +510,8 @@ def test_prompt() -> None:
     check("designated-only scoping stated",
           "Fill only the designated sorries" in p
           and "do not block completion" in p)
+    check("check_goal tool explained",
+          "`check_goal` tool" in p and "definition of done" in p)
     check("standard axioms named", "`Quot.sound`" in p)
     check("no off-limits section by default",
           "OFF-LIMITS" not in p and "whole repository is yours" in p)
@@ -455,12 +548,15 @@ def test_check_script() -> None:
     s = build_check_script(spec, base="deadbeefcafe", subdir="")
     check("base embedded", "BASE=deadbeefcafe" in s)
     check("no off-limits sweep when unrestricted", "OFF_LIMITS" not in s)
-    check("module built by name", "lake build +Foo.Bar" in s)
-    check("module imported", "import Foo.Bar\n" in s)
+    check("library modules enumerated dynamically at check time",
+          "ls-files -- Foo.lean 'Foo/*.lean'" in s
+          and "for m in $MODULES; do echo \"import $m\"; done" in s
+          and "lake build $(printf '+%s ' $MODULES)" in s)
     check("designated (module, decl) pairs in Lean list",
           '[(`Foo.Bar, "Ns.foo")]' in s)
     check("allowed axioms in Lean list",
           "[`propext, `Classical.choice, `Quot.sound]" in s)
+    check("resolution unmangles private names", "privateToUserName?" in s)
     check("no computability block by default", "computability" not in s)
     check("no unexpanded markers", "@GERBIL_" not in s)
     check("exits 0 at DONE", s.rstrip().endswith("exit 0"))
@@ -483,6 +579,51 @@ def test_check_script() -> None:
     s = build_check_script(spec, base="d", subdir="")
     check("partial check omitted when only noncomputable forbidden",
           "isNoncomputable" in s and "opaqueInfo" not in s)
+
+
+def test_check_goal_tool() -> None:
+    print("\n=== check_goal tool ===")
+
+    from gerbil.prompts import build_system_prompt
+    from gerbil.sandbox import CommandResult
+    from gerbil.tools import Toolset
+
+    class FakeSandbox:
+        def __init__(self, code):
+            self.code = code
+            self.ran = None
+
+        def run_script(self, script, timeout=300.0):
+            self.ran = (script, timeout)
+            return CommandResult(command="check", exit_code=self.code,
+                                 stdout="NOT DONE: frozen files differ\n",
+                                 stderr="", timeout_occurred=False)
+
+    ts = Toolset(FakeSandbox(1))
+    check("tool absent without a check",
+          all(t["name"] != "check_goal" for t in ts.schemas()))
+    check("dispatch without a check errors",
+          ts.dispatch("check_goal", {}).is_error)
+
+    sb = FakeSandbox(1)
+    ts = Toolset(sb, check_script="#!/bin/sh\nexit 1\n", check_timeout=7.0)
+    check("tool advertised with a check",
+          any(t["name"] == "check_goal" for t in ts.schemas()))
+    r = ts.dispatch("check_goal", {})
+    check("failing check: verdict plus output, not a tool error",
+          not r.is_error and "CHECK NOT PASSED (exit 1)" in r.content
+          and "frozen files differ" in r.content)
+    check("script and timeout forwarded",
+          sb.ran == ("#!/bin/sh\nexit 1\n", 7.0))
+    r = Toolset(FakeSandbox(0), check_script="x").dispatch("check_goal", {})
+    check("passing check verdict",
+          "CHECK PASSED" in r.content and "loop will stop" in r.content)
+
+    withnote = build_system_prompt(False, ralph=True, check_goal_available=True)
+    check("system prompt gains the note when available",
+          "check_goal" in withnote and "definition of done" in withnote)
+    check("note absent otherwise",
+          "check_goal" not in build_system_prompt(False, ralph=True))
 
 
 def test_session_round_trip() -> None:
@@ -539,6 +680,7 @@ def parse_session_none(tmp: Path):
 def main() -> None:
     test_positions()
     test_resolver()
+    test_designations()
     test_modules()
     test_spec()
     test_plan_name()
@@ -547,6 +689,7 @@ def main() -> None:
     test_off_limits()
     test_prompt()
     test_check_script()
+    test_check_goal_tool()
     test_session_round_trip()
     print("\nAll fill-sorry tests passed.")
 

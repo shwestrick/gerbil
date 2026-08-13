@@ -8,12 +8,20 @@ then runs a [ralph loop](ralph.md) until the goal check passes:
 ```console
 $ gerbil run --fill-sorry MyProj/Basic.lean:42
 $ gerbil run --fill-sorry MyProj/A.lean:42:5,MyProj/B.lean:107
+$ gerbil run --fill-sorry MyNs.foo               # by declaration name
+$ gerbil run --fill-sorry MyNs.foo,MyProj/B.lean:107
 $ gerbil run --fill-sorry task.toml
 ```
 
-Positions are `FILE:LINE[:COL]` -- project-root-relative, 1-indexed, the
-same format the [big-small mode](big-small.md) `zoom_in` tool uses. An
-argument ending in `.toml` is read as a task spec instead (below).
+A sorry is designated by position -- `FILE:LINE[:COL]`, project-root-
+relative, 1-indexed, the same format the [big-small mode](big-small.md)
+`zoom_in` tool uses -- or by the name of the top-level declaration
+holding it, optionally namespace-qualified (`foo`, `MyNs.foo`; the name
+is located across the tracked `.lean` sources, and an ambiguous or
+unknown name is a preflight error naming the candidates). Entries
+containing `:`, `/`, or a `.lean` suffix are parsed as positions;
+anything else is a name. An argument ending in `.toml` is read as a task
+spec instead (below).
 
 The mode runs directly on the current repo, like any other gerbil session:
 preflight requires a clean tree, the session starts from `HEAD`, and the
@@ -74,6 +82,14 @@ rejected alongside `--fill-sorry`) that exits 0 only when:
    declarations and everything they use within their modules (no
    `noncomputable`, no `partial`, per `forbid`).
 
+The agent can run this exact check itself, via a **`check_goal` tool**
+that gerbil adds whenever a termination check is installed: it returns
+the check's verdict (`CHECK PASSED` / `CHECK NOT PASSED (exit N)`) and
+its output, so an agent that believes it is finished can see precisely
+which condition the harness still considers unmet instead of watching
+the loop restart blind. The prompt tells it the check is the definition
+of done and to use it at natural checkpoints.
+
 The check is scoped to **exactly the designated sorries**, not their whole
 files: other sorries in the same module are not part of the goal and never
 block completion, so the loop stops the moment the listed ones are done.
@@ -84,12 +100,23 @@ and fails.
 Positions drift as the agent edits, so the check works by *name*: at
 preflight gerbil resolves each position to its enclosing declaration (a
 syntactic scan tracking `namespace` blocks), and the check re-resolves
-that name against the live Lean environment -- exact match in the module,
-or a unique suffix match, so `private` name mangling and namespace
-subtleties still land. A designated declaration that is renamed or deleted
-is a **hard failure**, never a pass. Where the scan can't name the
-declaration (an `example`, an anonymous `instance`), preflight stops and
-asks you to name it in the spec:
+that name against the live Lean environment across **every module of the
+declaration's library** -- enumerated from the tracked `.lean` files as
+of each check, so a declaration legitimately moved to another file (even
+one created mid-task) is found where it landed. Matching is exact on the
+display name first, unique-suffix as fallback, so `private` name mangling
+and namespace subtleties still land. A designated declaration that is
+renamed or deleted is a **hard failure**, never a pass.
+
+**Supported sorry sites**: the bodies of top-level `theorem` / `lemma` /
+`def` / `abbrev` / named `instance` declarations -- anywhere inside them
+(deep in a tactic proof, in a `where` clause, in a `mutual` block), since
+the axiom sweep covers the whole elaborated term. Sorries in `example`s
+(never enter the environment), anonymous `instance`s, and
+`structure`/`inductive`/`class`/`opaque` declarations (their sorries hide
+in auto-generated constants the axiom check cannot see -- a field-default
+sorry would go undetected) are refused at preflight: move the sorry into
+a named top-level declaration, or point preflight at one explicitly:
 
 ```toml
 sorries = [
@@ -104,11 +131,13 @@ sorries = [
 # task.toml -- read by `gerbil run --fill-sorry task.toml`.
 # Paths are project-root-relative; positions are 1-indexed.
 
-# Required. A string is auto-resolved to its enclosing declaration; the
+# Required. A position string is auto-resolved to its enclosing
+# declaration; a name string is located across the tracked sources; the
 # table form names the declaration explicitly (needed for anonymous
 # instances and other layouts the source scan cannot name).
 sorries = [
   "MyProj/A.lean:42",
+  "MyNs.foo",
   { pos = "MyProj/B.lean:107:9", decl = "Ns.tricky" },
 ]
 

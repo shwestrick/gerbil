@@ -38,6 +38,12 @@ gerbil also offers a `reset_lean_server` tool alongside them, so a stuck or
 hung language server can be torn down and restarted mid-session without losing
 any of the agent's work. It is advertised only when MCP is enabled.
 
+When the session has a termination check installed (`--ralph_done`, or the
+check [`--fill-sorry`](fill-sorry.md) generates), gerbil additionally offers a
+`check_goal` tool that runs that exact script and returns its verdict and
+output -- so the agent can verify "done" against the actual stop condition
+instead of guessing, and see which condition fails when the loop keeps going.
+
 `gerbil run --no-mcp` disables the MCP tools entirely and runs with the
 built-ins only. If the MCP server fails to start, gerbil warns and continues
 that way automatically.

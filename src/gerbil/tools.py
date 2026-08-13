@@ -199,6 +199,28 @@ RESET_LEAN_SERVER_TOOL = {
 }
 
 
+# A gerbil-provided tool available whenever the session has a termination
+# check installed (--ralph_done, or the check --fill-sorry generates). It
+# lets the model run the EXACT script the harness runs between sessions --
+# closing the gap between "I believe the task is done" and "the harness
+# agrees": without it, an agent that considers itself finished can only
+# watch the loop restart with no idea which condition it is failing.
+# Handled directly by the Toolset (see _check_goal).
+CHECK_GOAL_TOOL = {
+    "name": "check_goal",
+    "description": (
+        "Run this task's termination check: the exact script the harness runs "
+        "between sessions to decide whether the task is complete (exit 0 ends "
+        "the loop). Returns the check's verdict and output. The check is the "
+        "definition of done -- if it says the goal is not met, the task is "
+        "not done, whatever you believe. It typically runs a full build, so "
+        "call it at natural checkpoints (e.g. when you think you are "
+        "finished), not after every edit."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+
 # The big-small mode tools. Both are gerbil-provided and neither is ever
 # dispatched: agent.py intercepts them by name before Toolset.dispatch is
 # reached (zoom_in launches the inner small-model loop; zoom_out ends it).
@@ -281,10 +303,18 @@ class Toolset:
         sandbox: LeanSandbox,
         mcp: "McpClient | None" = None,
         ralph: bool = False,
+        check_script: str | None = None,
+        check_timeout: float = 300.0,
     ):
         self._sandbox = sandbox
         self._mcp = mcp
         self.ralph = ralph
+        # The termination check's script text and timeout, when the session
+        # has one (--ralph_done or --fill-sorry). Advertises and backs the
+        # check_goal tool; may also be assigned after construction (cli.py
+        # generates the --fill-sorry check only once the sandbox is up).
+        self.check_script = check_script
+        self.check_timeout = check_timeout
         self._mcp_schemas: list[dict] = []
         self._mcp_names: set[str] = set()
         if mcp is not None:
@@ -303,7 +333,8 @@ class Toolset:
         small model's sub-session). None -- the default, and the only value used
         outside big-small mode -- advertises neither."""
         reset = [RESET_LEAN_SERVER_TOOL] if self._mcp is not None else []
-        base = TOOLS + reset + self._mcp_schemas
+        check = [CHECK_GOAL_TOOL] if self.check_script else []
+        base = TOOLS + check + reset + self._mcp_schemas
         if zoom == "outer":
             return base + [ZOOM_IN_TOOL]
         if zoom == "inner":
@@ -317,6 +348,8 @@ class Toolset:
         """Route to the reset tool, a built-in, or an MCP handler. Never raises."""
         if name == "reset_lean_server":
             return self._reset_lean_server()
+        if name == "check_goal":
+            return self._check_goal()
         if name in self._mcp_names:
             try:
                 return self._mcp.call_tool(name, args)
@@ -327,6 +360,35 @@ class Toolset:
                     f"{type(e).__name__}: {e}" + RESET_HINT, is_error=True
                 )
         return dispatch(self._sandbox, name, args)
+
+    def _check_goal(self) -> ToolResult:
+        """Run the session's termination check for the model (see
+        CHECK_GOAL_TOOL). The verdict line comes first so it survives even a
+        truncated transcript; is_error stays False on a failing CHECK -- the
+        tool ran fine, and the failure detail is the content the model asked
+        for. Never raises."""
+        if not self.check_script:
+            return ToolResult(
+                "no termination check is installed for this session",
+                is_error=True,
+            )
+        try:
+            result = self._sandbox.run_script(
+                self.check_script, timeout=self.check_timeout
+            )
+        except Exception as e:
+            return ToolResult(
+                f"failed to run the termination check: {type(e).__name__}: {e}",
+                is_error=True,
+            )
+        out = (result.stdout + result.stderr).strip()
+        verdict = (
+            "CHECK PASSED (exit 0): the goal is met; the session loop will stop."
+            if result.exit_code == 0
+            else f"CHECK NOT PASSED (exit {result.exit_code}): the goal is "
+            "not met yet. The output below says which condition failed."
+        )
+        return ToolResult(f"{verdict}\n\n{truncate_tool_output(out)}".rstrip())
 
     def _reset_lean_server(self) -> ToolResult:
         """Restart the lean-lsp server (see RESET_LEAN_SERVER_TOOL). Never raises."""

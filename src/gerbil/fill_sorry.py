@@ -99,6 +99,10 @@ class FillSorrySpec:
     # entry's explicit `decl`, or by `validate` via resolve_decl. Kept beside
     # the positions (not on SorryPos) so position identity/dedup is untouched.
     decls: dict[str, str] = field(default_factory=dict)
+    # Name-designated sorries ("Ns.foo" instead of a position), pending until
+    # `validate` locates each in the tracked sources and converts it into a
+    # SorryPos (the header line) + decls entry. Always [] after validate.
+    names: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +151,38 @@ def _check_rel_path(path: str, what: str) -> None:
         raise ValueError(f"{what}: path must not contain `..`")
 
 
+def parse_designations(arg: str) -> tuple[list[SorryPos], list[str]]:
+    """Parse a comma-separated designation list, each entry a position
+    (FILE:LINE[:COL]) or a declaration name (`foo`, `Ns.foo`). The rule: an
+    entry containing `:`, a path separator, or a `.lean` suffix is meant as
+    a position (and gets position errors -- a misremembered `Foo.lean` must
+    not silently become a doomed name lookup); anything else is a name,
+    checked against the tracked sources by `validate`."""
+    positions: list[SorryPos] = []
+    names: list[str] = []
+    for entry in arg.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if (":" in entry or "/" in entry or "\\" in entry
+                or entry.endswith(".lean")):
+            positions.extend(parse_positions(entry))
+        else:
+            names.append(entry)
+    if not positions and not names:
+        raise ValueError("no sorry designations given")
+    return positions, names
+
+
+def spec_from_arg(arg: str) -> FillSorrySpec:
+    """The all-defaults spec for the CLI shorthand (positions and/or
+    declaration names)."""
+    positions, names = parse_designations(arg)
+    return FillSorrySpec(sorries=positions, names=names)
+
+
 def spec_from_positions(positions: list[SorryPos]) -> FillSorrySpec:
-    """The all-defaults spec for a bare CLI position list."""
+    """The all-defaults spec for a bare position list."""
     return FillSorrySpec(sorries=list(positions))
 
 
@@ -184,11 +218,13 @@ def load_spec(path: Path) -> FillSorrySpec:
             return []
         return val
 
-    # A sorries entry is a position string, or an inline table naming the
-    # declaration explicitly -- { pos = "Foo.lean:42", decl = "MyNs.foo" } --
-    # for the cases source scanning cannot resolve (anonymous instances,
-    # unusual layouts).
+    # A sorries entry is a position string (FILE:LINE[:COL]), a declaration
+    # name ("Ns.foo" -- located in the sources by validate), or an inline
+    # table pinning the declaration explicitly --
+    # { pos = "Foo.lean:42", decl = "MyNs.foo" } -- for the cases source
+    # scanning cannot resolve (anonymous instances, unusual layouts).
     sorries: list[SorryPos] = []
+    names: list[str] = []
     decls: dict[str, str] = {}
     raw_sorries = data.get("sorries")
     if not isinstance(raw_sorries, list) or not raw_sorries:
@@ -197,7 +233,9 @@ def load_spec(path: Path) -> FillSorrySpec:
     for entry in raw_sorries:
         try:
             if isinstance(entry, str):
-                sorries.extend(parse_positions(entry))
+                p, n = parse_designations(entry)
+                sorries.extend(p)
+                names.extend(n)
             elif isinstance(entry, dict):
                 if set(entry) != {"pos", "decl"} or not all(
                     isinstance(v, str) for v in entry.values()
@@ -289,7 +327,7 @@ def load_spec(path: Path) -> FillSorrySpec:
     return FillSorrySpec(
         sorries=sorries, off_limits=off_limits, axioms=axioms, forbid=forbid,
         approach=approach.strip(), plan=plan, check_timeout=check_timeout,
-        ralph=ralph, decls=decls,
+        ralph=ralph, decls=decls, names=names,
     )
 
 
@@ -362,22 +400,19 @@ _SCOPE_RE = re.compile(r"^\s*(?:(?:noncomputable|private)\s+)?(?:section\b|mutua
 _END_RE = re.compile(r"^\s*end\b")
 
 
-def resolve_decl(lines: list[str], line: int) -> tuple[str | None, str]:
-    """The fully-qualified name of the declaration containing 1-indexed
-    `line`: the last declaration header at or above it, qualified by the
-    `namespace` blocks open at that point. Returns (name, "") on success or
-    (None, why) when the source defeats the scan -- an `example` (not in the
-    environment, nothing to check) or an anonymous instance (its generated
-    name is not derivable from source). A best-effort *syntactic* scan on
-    purpose: elaborating the project host-side just to name a declaration
-    would cost a full build at preflight, and the check re-resolves the name
-    against the live environment anyway (suffix match within the module), so
-    a `private` prefix or a plausible mis-qualification still lands. Block
+def _scan_decls(lines: list[str]) -> list[tuple[int, str, str | None]]:
+    """Every declaration header in a file, as (1-indexed line, kind,
+    fully-qualified name or None when anonymous), with names qualified by
+    the `namespace` blocks open at each point. A best-effort *syntactic*
+    scan on purpose: elaborating the project host-side just to name a
+    declaration would cost a full build at preflight, and the check
+    re-resolves names against the live environment anyway (suffix match
+    within the module), so a plausible mis-qualification still lands. Block
     comments are tracked so a commented-out header is not picked up."""
+    out: list[tuple[int, str, str | None]] = []
     stack: list[tuple[str, str]] = []  # ("namespace", name) | ("scope", "")
-    found: tuple[str, str | None, list[str]] | None = None  # kind, name, ns
     depth = 0  # block-comment nesting
-    for text in lines[:line]:
+    for i, text in enumerate(lines, start=1):
         if depth == 0:
             if m := _NS_RE.match(text):
                 stack.append(("namespace", m.group(1)))
@@ -387,24 +422,53 @@ def resolve_decl(lines: list[str], line: int) -> tuple[str | None, str]:
                 if stack:
                     stack.pop()
             elif m := _DECL_RE.match(text):
-                ns = [] if m.group(2) else [
-                    n for kind, n in stack if kind == "namespace"
-                ]
-                found = (m.group(1), m.group(3), ns)
+                if m.group(3):
+                    ns = [] if m.group(2) else [
+                        n for kind, n in stack if kind == "namespace"
+                    ]
+                    fqn = ".".join(ns + [m.group(3)])
+                else:
+                    fqn = None
+                out.append((i, m.group(1), fqn))
         depth += text.count("/-") - text.count("-/")
         depth = max(depth, 0)
+    return out
+
+
+def resolve_decl(lines: list[str], line: int) -> tuple[str | None, str]:
+    """The fully-qualified name of the declaration containing 1-indexed
+    `line`: the last declaration header at or above it. Returns (name, "")
+    on success or (None, why) when the source defeats the scan or the site
+    is one --fill-sorry cannot soundly check (see the messages)."""
+    found: tuple[str, str | None] | None = None  # kind, fqn
+    for decl_line, kind, fqn in _scan_decls(lines):
+        if decl_line > line:
+            break
+        found = (kind, fqn)
     if found is None:
         return None, "no declaration header found above it"
-    kind, name, ns = found
+    kind, name = found
     if kind == "example":
         return None, ("it sits in an `example`, which never enters the "
                       "environment -- name the statement (e.g. make it a "
                       "theorem) so the goal can be checked")
+    if kind in ("structure", "inductive", "class", "opaque"):
+        # A sorry in e.g. a structure field default elaborates into an
+        # auto-generated constant (Cfg.x._default) that collectAxioms on the
+        # type itself never visits -- the check would pass with the sorry
+        # still present. Refusing here is what keeps the goal sound.
+        return None, (
+            f"it sits in a `{kind}` declaration, whose sorries live in "
+            "auto-generated constants the declaration's axiom check cannot "
+            "see. --fill-sorry supports sorries only in the bodies of "
+            "top-level theorem/lemma/def/abbrev/instance declarations -- "
+            "move the sorry into one (e.g. a plain def used as the default)"
+        )
     if not name:
         return None, (f"the enclosing `{kind}` is anonymous -- give the "
                       "declaration a name, or state it explicitly in a spec "
                       "entry: { pos = \"...\", decl = \"TheName\" }")
-    return ".".join(ns + [name]), ""
+    return name, ""
 
 
 def seed_plan(spec: FillSorrySpec) -> str:
@@ -508,6 +572,74 @@ def validate(
 
     normalized = normalize_off_limits(spec.off_limits)
 
+    # Name designations: locate each declaration across the tracked .lean
+    # sources (the reverse of resolve_decl) and fold it into the position
+    # list as its header line. from_name suppresses the "line does not
+    # contain sorry" warning below -- a header like `theorem foo : P := by`
+    # is the expected shape there.
+    from_name: set[SorryPos] = set()
+    if spec.names:
+        prefix = subdir + "/" if subdir else ""
+        scans: dict[str, list] = {}
+        for t in sorted(tracked):
+            if not t.endswith(".lean") or (prefix and not t.startswith(prefix)):
+                continue
+            f = t[len(prefix):]
+            try:
+                scans[f] = _scan_decls(
+                    (project_dir / f).read_text().splitlines())
+            except (OSError, UnicodeDecodeError):
+                continue
+        for name in spec.names:
+            # A designation matches a declaration when it names it by its
+            # (possibly namespace-suffixed) Lean name -- and also when it is
+            # MODULE-qualified: users naturally write Hello.Basic.foo for a
+            # bare `foo` in Hello/Basic.lean, since module path and namespace
+            # coincide by convention. Per file, a leading module prefix is
+            # stripped before the name match.
+            def hits(f: str, fqn: str) -> bool:
+                if fqn == name or fqn.endswith("." + name):
+                    return True
+                mod_prefix = module_of(f) + "."
+                if name.startswith(mod_prefix):
+                    rest = name[len(mod_prefix):]
+                    return fqn == rest or fqn.endswith("." + rest)
+                return False
+
+            matches = [
+                (f, line, kind, fqn)
+                for f, headers in scans.items()
+                for line, kind, fqn in headers
+                if fqn and hits(f, fqn)
+            ]
+            if not matches:
+                errors.append(
+                    f"`{name}`: no declaration with this name found in the "
+                    "project's tracked .lean sources (a name is matched by "
+                    "its namespace-qualified form, optionally prefixed by "
+                    "its file's module path)"
+                )
+            elif len(matches) > 1:
+                cand = ", ".join(
+                    f"{fqn} ({f}:{line})" for f, line, _, fqn in matches)
+                errors.append(
+                    f"`{name}` is ambiguous: {cand} -- qualify the name")
+            elif matches[0][2] in ("structure", "inductive", "class",
+                                   "opaque", "example"):
+                f, line, kind, _ = matches[0]
+                errors.append(
+                    f"`{name}` is a `{kind}` ({f}:{line}) -- --fill-sorry "
+                    "supports only top-level theorem/lemma/def/abbrev/"
+                    "instance declarations"
+                )
+            else:
+                f, line, _, fqn = matches[0]
+                pos = SorryPos(f, line)
+                spec.sorries.append(pos)
+                spec.decls.setdefault(str(pos), fqn)
+                from_name.add(pos)
+        spec.names = []
+
     seen: set[SorryPos] = set()
     deduped: list[SorryPos] = []
     for pos in spec.sorries:
@@ -538,7 +670,7 @@ def validate(
             errors.append(f"{pos}: file has only {len(lines)} lines")
             continue
         text = lines[pos.line - 1]
-        if "sorry" not in text:
+        if "sorry" not in text and pos not in from_name:
             warnings.append(f"{pos}: the line does not contain `sorry` "
                             f"(it reads: {text.strip()[:60]!r})")
         if pos.column is not None and pos.column > len(text) + 1:
@@ -579,6 +711,11 @@ def validate(
                 f"{n_listed} designated -- they are not part of the goal; "
                 "the agent is told to leave them alone"
             )
+
+    if not spec.sorries:
+        # Every designation failed to resolve (errors above say why);
+        # nothing is left to derive a plan name from.
+        return errors, warnings, excerpts
 
     # The plan file lives at .gerbil/plans/<name>.md and its updates ship
     # inside each session's patch (force-included past the conventional
@@ -695,7 +832,8 @@ def build_prompt(
         "\n"
         "  * `lake build` succeeds with no errors;\n"
         f"  * each designated declaration -- {decl_list} -- still exists "
-        "under its original name, and depends on no `sorryAx` (a surviving "
+        "under its original name (anywhere in the library: moving it to "
+        "another file is fine), and depends on no `sorryAx` (a surviving "
         "`sorry` in any disguise, anywhere in its proof or in anything it "
         f"uses) and on no axiom beyond: {axioms};\n"
     )
@@ -725,7 +863,8 @@ def build_prompt(
         "fails the check).\n"
         "  * **Do not change the statement a sorry lives in**, and do not "
         "rename or delete its declaration -- the check looks the "
-        "declaration up by name and fails if it is gone. Your task is "
+        "declaration up by name and fails if it is gone (moving it to "
+        "another file in the library, unchanged, is fine). Your task is "
         "to prove what is asked, not to ask an easier question. If you "
         "conclude a statement is wrong or unprovable as written, do not edit "
         "it and do not route around it: write the argument into the plan "
@@ -761,6 +900,15 @@ def build_prompt(
         "other file -- it is committed with your work. The next session "
         "cannot see this one; that file is the only thing that carries "
         "over.\n"
+        "  * **Verify with the `check_goal` tool.** It runs the exact "
+        "termination check described in the GOAL -- the one the harness "
+        "runs between sessions -- and shows you its verdict and output. "
+        "When you believe the GOAL is reached, run it and read the result: "
+        "the check is the definition of done, and its opinion overrides "
+        "yours. If it says NOT PASSED, the output names the failing "
+        "condition -- fix that, do not argue with it in prose. It runs a "
+        "full build, so use it at natural checkpoints, not after every "
+        "edit.\n"
         "  * When you finish a session the project must build without "
         "errors. A remaining `sorry` is far better than a broken proof.\n"
         "  * Store temporary files in /tmp via mktemp; leave none in the "
@@ -849,34 +997,45 @@ fi
 _CHECK_BUILD = """\
 
 # ---------------------------------------------------------------------
-# 2. The project must build, and so must the target module(s) by name --
-#    their .oleans must exist for the sweep below even if nothing in the
-#    default targets imports them.
+# 2. The project must build -- and so must every module of the
+#    designated declarations' library, enumerated from the tracked
+#    .lean files AS OF THIS CHECK: a designated declaration may
+#    legitimately have moved to a file created mid-task, and an
+#    unimported new file still needs its .olean for the sweep below.
+#    (A path containing whitespace cannot be a Lean module: skipped.)
 # ---------------------------------------------------------------------
 LOG=$(mktemp); DIR=$(mktemp -d)
 trap 'rm -f "$LOG"; rm -rf "$DIR"' EXIT
+MODULES=$(git -C "$ROOT" ls-files -- @GERBIL_LEAN_PATHSPECS@ \\
+  | grep -v ' ' | sed -e 's|^@GERBIL_STRIP@||' -e 's|\\.lean$||' -e 's|/|.|g')
+[ -n "$MODULES" ] || fail "no tracked .lean files under: @GERBIL_ROOTS@"
 if ! lake build >"$LOG" 2>&1; then
   tail -n 40 "$LOG"; fail "lake build failed"
 fi
-if ! lake build @GERBIL_MODULE_TARGETS@ >>"$LOG" 2>&1; then
-  tail -n 40 "$LOG"; fail "building the target module(s) failed"
+if ! lake build $(printf '+%s ' $MODULES) >>"$LOG" 2>&1; then
+  tail -n 40 "$LOG"; fail "building the library's module(s) failed"
 fi
 
 # ---------------------------------------------------------------------
 # 3. Declaration-scoped Lean checks, elaborated against the built
 #    library. Each designated sorry is checked through its enclosing
-#    declaration, re-resolved here BY NAME against the live environment
-#    (line numbers drift under the agent's edits; a renamed or deleted
-#    declaration is a hard failure, never a pass). collectAxioms is
-#    transitive, so "no sorryAx, no disallowed axiom" covers every
-#    helper a designated proof routes through -- while other sorries in
-#    the same files are simply not part of the goal. native_decide
-#    needs no dedicated check: its axioms are absent from the allowed
-#    list unless the spec permitted them.
+#    declaration, re-resolved BY NAME across every module of the
+#    library (line numbers drift under the agent's edits, and whole
+#    declarations may legitimately move between files; a renamed or
+#    deleted declaration is a hard failure, never a pass).
+#    collectAxioms is transitive, so "no sorryAx, no disallowed axiom"
+#    covers every helper a designated proof routes through -- while
+#    other sorries in the same files are simply not part of the goal.
+#    native_decide needs no dedicated check: its axioms are absent from
+#    the allowed list unless the spec permitted them.
 # ---------------------------------------------------------------------
-cat >"$DIR/Check.lean" <<'GERBIL_CHECK_EOF'
-import Lean
-@GERBIL_MODULE_IMPORTS@
+{
+  echo "import Lean"
+  for m in $MODULES; do echo "import $m"; done
+  MODLIST="["
+  for m in $MODULES; do MODLIST="$MODLIST\\`$m, "; done
+  echo "def gerbilModules : List Lean.Name := ${MODLIST%, }]"
+  cat <<'GERBIL_CHECK_EOF'
 
 open Lean
 
@@ -884,25 +1043,38 @@ open Lean
   let env ← getEnv
   let designated : List (Name × String) := @GERBIL_DECLS@
   let allowed : List Name := @GERBIL_ALLOWED_AXIOMS@
-  -- Resolve each (module, name): an exact match in the module, or a
-  -- unique suffix match (private declarations carry a mangled prefix,
-  -- and the preflight scan may under-qualify a namespace).
+  let projIdxs := gerbilModules.filterMap env.getModuleIdx?
+  -- Resolve each designated name across the library: an exact match on
+  -- the display name, with a unique suffix match as the fallback (the
+  -- preflight scan may under-qualify a namespace). Exact wins outright
+  -- so a designated bare `foo` is never blocked by a namespaced
+  -- `Ns.foo` cousin. Display names because a private declaration's
+  -- real name is mangled (_private.<Mod>.0.<Name>), which both fails a
+  -- suffix match and is classified isInternal -- privateToUserName?
+  -- undoes that, so private theorems resolve like public ones. The
+  -- recorded origin module is error-message context only: the
+  -- declaration is free to move between the library's files.
   let mut resolved : Array Name := #[]
   for (mod, s) in designated do
-    let some midx := env.getModuleIdx? mod
-      | throwError "target module {mod} is not in the environment"
+    let mut exact : Array Name := #[]
     let mut cands : Array Name := #[]
     for (c, _) in env.constants.toList do
-      if env.getModuleIdxFor? c == some midx && !c.isInternal then
-        if c.toString == s || c.toString.endsWith ("." ++ s) then
-          cands := cands.push c
-    if cands.size == 1 then
-      resolved := resolved.push cands[0]!
-    else if cands.isEmpty then
-      throwError "no declaration matching {s} in module {mod} -- the \\
-designated sorry's declaration must keep its name and statement"
+      if (env.getModuleIdxFor? c).any (projIdxs.contains ·) then
+        let d := (privateToUserName? c).getD c
+        if !d.isInternal then
+          if d.toString == s then
+            exact := exact.push c
+          else if d.toString.endsWith ("." ++ s) then
+            cands := cands.push c
+    let picked := if exact.isEmpty then cands else exact
+    if picked.size == 1 then
+      resolved := resolved.push picked[0]!
+    else if picked.isEmpty then
+      throwError "no declaration matching {s} (originally in {mod}) \\
+anywhere in the library -- the designated sorry's declaration must \\
+keep its name and statement"
     else
-      throwError "several declarations match {s} in module {mod}: {cands}"
+      throwError "several declarations match {s}: {picked}"
   let mut uniq : Array Name := #[]
   for c in resolved do
     unless uniq.contains c do uniq := uniq.push c
@@ -918,16 +1090,16 @@ designated sorry's declaration must keep its name and statement"
 {allowed}"
 @GERBIL_FORBID_BLOCK@
 GERBIL_CHECK_EOF
+} >"$DIR/Check.lean"
 """
 
-# Spliced into the #eval above (same do-block, so `env`/`designated`/
+# Spliced into the #eval above (same do-block, so `env`/`projIdxs`/
 # `uniq` are in scope) when the spec forbids noncomputable/partial.
 # Walks the designated declarations and everything they use,
-# transitively, WITHIN the target modules: library dependencies are not
-# the agent's doing, and helpers the agent hides in other files are
-# still caught by the axiom sweep (sorry-wise) if used.
+# transitively, WITHIN the library's modules: dependencies outside the
+# library are not the agent's doing.
 _CHECK_FORBID_BLOCK = """\
-  let idxs := (designated.map (·.1)).filterMap env.getModuleIdx?
+  let idxs := projIdxs
   let mut queue := uniq.toList
   let mut seenc : Array Name := #[]
   let mut badc : Array (Name × String) := #[]
@@ -1016,12 +1188,23 @@ def build_check_script(spec: FillSorrySpec, *, base: str, subdir: str) -> str:
                      _FORBID_PARTIAL + "\n"
                      if "partial" in spec.forbid else "")
         )
+    # The library's modules are enumerated at CHECK time (a declaration may
+    # move to a file created mid-task); generation only fixes which library
+    # roots to look under -- the first path component of each designated
+    # file, e.g. Hello/Basic.lean -> the `Hello.lean` + `Hello/*.lean`
+    # tracked files. Git's plain pathspec `*` crosses `/`.
+    prefix = f"{subdir}/" if subdir else ""
+    roots = sorted({m.split(".")[0] for m in modules})
+    pathspecs = " ".join(
+        shlex.quote(p)
+        for r in roots
+        for p in (f"{prefix}{r}.lean", f"{prefix}{r}/*.lean")
+    )
     script += (
         _CHECK_BUILD
-        .replace("@GERBIL_MODULE_TARGETS@",
-                 " ".join(shlex.quote("+" + m) for m in modules))
-        .replace("@GERBIL_MODULE_IMPORTS@",
-                 "\n".join(f"import {m}" for m in modules))
+        .replace("@GERBIL_LEAN_PATHSPECS@", pathspecs)
+        .replace("@GERBIL_STRIP@", prefix)
+        .replace("@GERBIL_ROOTS@", ", ".join(prefix + r for r in roots))
         .replace("@GERBIL_DECLS@", lean_decls)
         .replace("@GERBIL_ALLOWED_AXIOMS@", lean_axioms)
         .replace("@GERBIL_FORBID_BLOCK@\n",

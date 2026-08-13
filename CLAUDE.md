@@ -94,8 +94,10 @@ src/gerbil/
                         podman CLI, so sandbox.py never branches on the engine)
   sandbox.py            LeanSandbox — container lifecycle, the sandbox-image
                         compatibility check, and all git plumbing
-  tools.py              built-in tools (bash/read_file/write_file/edit_file) and
-                        the Toolset that merges them with MCP tools
+  tools.py              built-in tools (bash/read_file/write_file/edit_file,
+                        plus check_goal whenever a --ralph_done/fill-sorry
+                        termination check is installed) and the Toolset that
+                        merges them with MCP tools
   mcp_client.py         sync façade over the lean-lsp-mcp server (runs in-container,
                         reached via `docker`/`podman exec -i`)
   session.py            append-only JSONL session recorder
@@ -254,7 +256,7 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
 ## Subcommands
 
 - `gerbil run --prompt FILE [--model M] [--small-model M] [--zoom-max-turns N]
-  [--fill-sorry POS[,POS..]|SPEC.toml] [--ralph N] [--ralph_done SCRIPT]
+  [--fill-sorry SORRY[,SORRY..]|SPEC.toml] [--ralph N] [--ralph_done SCRIPT]
   [--max-turns N] [--image IMAGE] [--skip-cache] [--no-mcp]
   [--omit-session-log] [--plain]`
 - `gerbil resume LOG [--at DIR] [--max-turns N] [--zoom-max-turns N] [--image
@@ -338,16 +340,29 @@ model's bucket at its own rates.
 in one sandbox, each building on the previous one's commit. Each session records
 its `chain_base` + ordered `ancestors` (prior patches) so any mid-chain session
 is independently resumable. `--ralph_done SCRIPT` runs in-container after each
-session; exit 0 stops the loop.
+session; exit 0 stops the loop. Whenever a termination check is installed
+(user-supplied or fill-sorry-generated), the model also gets a `check_goal`
+tool (tools.py) that runs the same script and returns its verdict + output,
+with a system-prompt note (`prompts.CHECK_GOAL_NOTE`) telling it the check is
+the definition of done.
 
-**Fill-sorry mode** (`--fill-sorry FILE:LINE[:COL],...` or `--fill-sorry
+**Fill-sorry mode** (`--fill-sorry FILE:LINE[:COL],...`, `--fill-sorry
+Ns.decl,...` (positions and declaration names mix freely; names are located
+across the tracked sources by `fill_sorry.validate`), or `--fill-sorry
 SPEC.toml`): "prove these sorries" as a generated task. gerbil builds the task
 prompt, a cross-session plan file, and a `--ralph_done`-style goal check
 scoped to **exactly the designated sorries**: each position is resolved to its
 enclosing declaration at preflight (`fill_sorry.resolve_decl`, a syntactic
-namespace-tracking scan; a spec entry `{ pos = ..., decl = ... }` overrides),
-and the check re-resolves the name against the live environment (rename or
-delete = hard failure) then runs `collectAxioms` on those declarations only --
+namespace-tracking scan; a spec entry `{ pos = ..., decl = ... }` overrides;
+only top-level theorem/lemma/def/abbrev/named-instance bodies are supported --
+structure/inductive/class sites are refused because their sorries hide in
+auto-generated constants the axiom check cannot see), and the check
+re-resolves the name against the live environment across every module of the
+declaration's library, enumerated from the tracked .lean files at check time
+-- so a declaration moved to another file (even a new one) is found, while a
+rename or delete is a hard failure (`privateToUserName?` unmangles private
+declarations; exact display-name match beats suffix). It then runs
+`collectAxioms` on those declarations only --
 transitive, so a proof routed through a sorried helper still fails, while
 undesignated sorries in the same file never block the loop from stopping.
 Optional noncomputable/partial bans walk the designated declarations'

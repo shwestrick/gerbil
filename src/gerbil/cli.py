@@ -341,10 +341,12 @@ def main() -> None:
     run_p.add_argument(
         "--fill-sorry",
         dest="fill_sorry",
-        metavar="POS[,POS..]|SPEC.toml",
+        metavar="SORRY[,SORRY..]|SPEC.toml",
         default=None,
-        help="Fill specific Lean sorries: each POS is FILE:LINE[:COL] "
-        "(project-root-relative, 1-indexed), or give a path to a TOML task "
+        help="Fill specific Lean sorries: each SORRY is a position "
+        "FILE:LINE[:COL] (project-root-relative, 1-indexed) or the name of "
+        "the top-level declaration holding it (e.g. MyNs.foo). Or give a "
+        "path to a TOML task "
         "spec (keys: sorries, off_limits, axioms, forbid, approach, plan, "
         "check_timeout, ralph). gerbil generates the task prompt, a "
         "cross-session plan file (at .gerbil/plans/, shipped inside the "
@@ -1565,6 +1567,15 @@ def cmd_run(args) -> None:
                         f"{fs_subdir}/{fs_plan}" if fs_subdir else fs_plan]
                     _seed_plan_file(sandbox, spec, fs_plan)
 
+                # Whenever a termination check exists (--ralph_done, or the
+                # generated one above), the model gets the check_goal tool to
+                # run it and see the verdict itself -- closing the gap
+                # between "I believe I'm done" and "the harness agrees".
+                if ralph_done_script:
+                    toolset.check_script = ralph_done_script
+                    toolset.check_timeout = (
+                        spec.check_timeout if spec is not None else 300.0)
+
                 # The whole (ralph) loop runs under one view -- the TUI spans
                 # the chain exactly like the sandbox and MCP client above it,
                 # while the preflight/boot output above stayed on the plain
@@ -1889,6 +1900,11 @@ def cmd_resume(args) -> None:
                     _start_mcp(sandbox, stack) if args.mcp else (None, None)
                 )
                 toolset = Toolset(sandbox, mcp, ralph=bool(ralph))
+                # The check_goal tool, exactly as in cmd_run.
+                if ralph_done_script:
+                    toolset.check_script = ralph_done_script
+                    toolset.check_timeout = (
+                        fs_spec.check_timeout if fs_spec is not None else 300.0)
 
                 # Rebuild the committed history this session started from.
                 # (The --fill-sorry plan file needs no rebuilding of its own:
@@ -2386,8 +2402,7 @@ def _load_fill_sorry_spec(args, project_dir, repo_root):
                 sys.exit(f"error: --fill-sorry spec {spec_path} is not a file")
             spec = fill_sorry.load_spec(spec_path)
         else:
-            spec = fill_sorry.spec_from_positions(
-                fill_sorry.parse_positions(args.fill_sorry))
+            spec = fill_sorry.spec_from_arg(args.fill_sorry)
     except ValueError as exc:
         sys.exit(f"error: --fill-sorry: {exc}")
     errors, warnings, excerpts = fill_sorry.validate(
@@ -2397,6 +2412,12 @@ def _load_fill_sorry_spec(args, project_dir, repo_root):
     if errors:
         sys.exit("error: --fill-sorry:\n"
                  + "".join(f"  - {e}\n" for e in errors).rstrip("\n"))
+    # Echo what each designation resolved to -- the one moment a surprising
+    # module/namespace resolution is cheap to catch.
+    for pos in spec.sorries:
+        print(style(
+            f"[fill-sorry: designated {spec.decls.get(str(pos), '?')} "
+            f"({pos})]", "gray"), flush=True)
 
     # The task's memory (the plan file, prior proofs) travels through the
     # patch chain, and this run builds on HEAD only -- so patches from an
