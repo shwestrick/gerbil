@@ -36,8 +36,17 @@ ENABLED = (
 ) and not os.environ.get("NO_COLOR")
 
 
-_BOX_GLYPHS = {"rule": "─", "sep": "·"}
-_ASCII_GLYPHS = {"rule": "-", "sep": "|"}
+_BOX_GLYPHS = {
+    "rule": "─", "sep": "·",
+    # File-tree connectors (view.render_file_tree): entry, last entry, a
+    # continuing ancestor level, a finished one. All the same width so the
+    # ASCII layout lines up column for column.
+    "tee": "├── ", "corner": "└── ", "pipe": "│   ", "blank": "    ",
+}
+_ASCII_GLYPHS = {
+    "rule": "-", "sep": "|",
+    "tee": "|-- ", "corner": "`-- ", "pipe": "|   ", "blank": "    ",
+}
 
 
 def _supports_unicode(stream=None) -> bool:
@@ -54,8 +63,8 @@ def _supports_unicode(stream=None) -> bool:
     if not encoding:
         return False
     try:
-        _BOX_GLYPHS["rule"].encode(encoding)
-        _BOX_GLYPHS["sep"].encode(encoding)
+        for glyph in _BOX_GLYPHS.values():
+            glyph.encode(encoding)
     except (LookupError, UnicodeEncodeError):
         return False
     return True

@@ -75,16 +75,19 @@ src/gerbil/
                         RunnerView (PrintView + live stats persisted for a
                         viewer), and the live view's pure state -- SessionStats
                         (+ its wire format), the wip-patch per-file +/- parser,
-                        render_stats. Never imports textual
+                        render_stats, and the tree-style file summary
+                        (render_file_tree / file_summary, session + summed
+                        chain sections). Never imports textual
   runs.py               the background-run registry (~/.gerbil/running/<name>/):
                         adjective-animal naming, meta/stats files (atomic
                         replace, tolerant reads), pid liveness + the one
                         classify() rule, display-file tailing, and the runner
                         exit-status wrapper. Stdlib only
-  tui.py                the full-screen viewer (textual): stats pane left,
-                        scrolling display-stream tail right, attached to a
-                        detached runner process via the registry files. The
-                        only module that imports textual
+  tui.py                the full-screen viewer (textual): stats pane left
+                        (headline stats fixed, tree-style file summary
+                        scrollable below), scrolling display-stream tail
+                        right, attached to a detached runner process via the
+                        registry files. The only module that imports textual
   providers.py          unified LLM streaming over gemini/anthropic/openai/
                         ollama/portkey
   ollama.py             host-side ollama server detect/start/stop + model check

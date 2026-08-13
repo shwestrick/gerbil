@@ -15,6 +15,8 @@ import io
 from gerbil import render
 from gerbil.pricing import MODEL_PRICING
 from gerbil.providers import Usage
+import json
+
 from gerbil.view import (
     PrintView,
     SessionStats,
@@ -22,6 +24,8 @@ from gerbil.view import (
     live_cost,
     patch_file_stats,
     render_stats,
+    stats_from_wire,
+    stats_to_wire,
 )
 
 
@@ -257,17 +261,8 @@ def test_render_stats() -> None:
     check("context percent", "62.0%" in out and "62,000 / 100,000" in out, out)
     check("token totals", "in 60,000" in out and "out 2,000" in out, out)
     check("unknown model cost is N/A", "N/A" in out, out)
-    lines = out.splitlines()
-    big = next(i for i, l in enumerate(lines) if "Big/Change.lean" in l)
-    small = next(i for i, l in enumerate(lines) if "Small.lean" in l)
-    binary = next(i for i, l in enumerate(lines) if "img.png" in l)
-    check("files sorted by churn, binary last", big < small < binary,
-          out)
-    check("binary marked bin", "bin" in lines[binary], lines[binary])
-    check("per-file figures", "+120" in lines[big] and "-8" in lines[big],
-          lines[big])
-    check("totals row", any("total (3 files)" in l and "+121" in l and "-8" in l
-                            for l in lines), out)
+    check("file table lives in its own pane now",
+          "Big/Change.lean" not in out, out)
 
     # Zoom indicator and interrupt banner.
     stats.on_zoom_begin("Foo.lean:42", "small-x", 10_000)
@@ -288,7 +283,84 @@ def test_render_stats() -> None:
     check("unknown window shows raw tokens",
           "123,456 tokens (window unknown)" in out3, out3)
     check("no ralph rows for a single session", "ralph" not in out3, out3)
-    check("empty file table placeholder", "(none yet)" in out3, out3)
+
+
+def test_file_summary() -> None:
+    """The scrollable file pane: tree layout, chain accumulation, wire."""
+    from gerbil import render
+    from gerbil.view import file_summary, merge_file_stats
+
+    tee, corner = render.GLYPHS["tee"], render.GLYPHS["corner"]
+    pipe, blank = render.GLYPHS["pipe"], render.GLYPHS["blank"]
+
+    stats = SessionStats()
+    stats.on_session_begin(name="s", model="m", small_model=None, ralph=None,
+                           resumed_from=None, now=0.0)
+    out = file_summary(stats, 40)
+    check("placeholder before any diff", "(none yet)" in out, out)
+    check("no chain section for a single session", "chain" not in out, out)
+
+    stats.files = {
+        "Toy/Basic.lean": (120, 8),
+        "Toy/Sub/Deep/X.lean": (1, 0),
+        "Root.lean": (2, 1),
+        "img.png": None,
+    }
+    out = file_summary(stats, 40)
+    lines = out.splitlines()
+    check("directories first, tree connectors drawn",
+          any(l.startswith(f"{tee}Toy/") for l in lines)
+          and any(l.startswith(f"{corner}img.png") for l in lines), out)
+    check("single-child directory chain compressed",
+          any(l.startswith(f"{pipe}{tee}Sub/Deep/") for l in lines), out)
+    check("nested leaf under the compressed chain",
+          any(l.startswith(f"{pipe}{pipe}{corner}X.lean") and "+1" in l
+              for l in lines), out)
+    check("per-file figures right-aligned",
+          any("Basic.lean" in l and l.rstrip().endswith("-8") and "+120" in l
+              for l in lines), out)
+    check("binary marked bin",
+          any("img.png" in l and l.rstrip().endswith("bin") for l in lines),
+          out)
+    check("totals row", any("total (4 files)" in l and "+123" in l
+                            and "-9" in l for l in lines), out)
+
+    # A ralph chain: session 1's diff folds into the chain at the next
+    # session_begin, and the chain section shows the running sum.
+    chain = SessionStats()
+    ralph1 = {"iteration": 1, "total": 3, "chain_base": "", "ancestors": []}
+    chain.on_session_begin(name="s1", model="m", small_model=None,
+                           ralph=ralph1, resumed_from=None, now=0.0)
+    chain.files = {"A.lean": (10, 2), "B.lean": (1, 1), "img.png": None}
+    chain.on_session_begin(name="s2", model="m", small_model=None,
+                           ralph={**ralph1, "iteration": 2},
+                           resumed_from=None, now=5.0)
+    check("session_begin folds files into the chain",
+          chain.chain_files == {"A.lean": (10, 2), "B.lean": (1, 1),
+                                "img.png": None}
+          and chain.files == {}, str(chain.chain_files))
+    chain.files = {"A.lean": (5, 5), "C.lean": (7, 0)}
+    out = file_summary(chain, 40)
+    check("both sections shown mid-chain",
+          "files (this session)" in out and "files (chain)" in out, out)
+    session_part, chain_part = out.split("files (chain)")
+    check("chain sums this session on top of finished ones",
+          any("A.lean" in l and "+15" in l and "-7" in l
+              for l in chain_part.splitlines())
+          and any("C.lean" in l and "+7" in l
+                  for l in chain_part.splitlines()), chain_part)
+    check("session section shows only the live diff",
+          not any("B.lean" in l for l in session_part.splitlines()),
+          session_part)
+    check("binary absorbs in a merge",
+          merge_file_stats({"x": (1, 1)}, {"x": None}) == {"x": None}
+          and merge_file_stats({"x": None}, {"x": (1, 1)}) == {"x": None})
+
+    # chain_files crosses the wire like files.
+    doc = json.loads(json.dumps(stats_to_wire(chain, now=6.0)))
+    r = stats_from_wire(doc, now=6.0)
+    check("chain_files round-trips the wire",
+          r.chain_files == chain.chain_files, str(r.chain_files))
 
 
 def test_render_stats_finished() -> None:
@@ -542,6 +614,7 @@ def main() -> None:
     test_patch_parser_edges()
     test_stats_replay()
     test_render_stats()
+    test_file_summary()
     test_render_stats_finished()
     test_resolve_theme()
     test_printview_byte_compat()

@@ -46,12 +46,12 @@ import time
 from rich.text import Text
 from textual.app import App
 from textual.binding import Binding
-from textual.containers import Horizontal
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Print
 from textual.widgets import Footer, RichLog, Static
 
 from . import runs
-from .view import SessionStats, render_stats, stats_from_wire
+from .view import SessionStats, file_summary, render_stats, stats_from_wire
 
 # Right-pane scrollback bound. Old lines beyond it fall out of the pane (the
 # display.ansi file and the .jsonl session log remain the complete records).
@@ -70,11 +70,12 @@ class ViewerApp(App):
     TITLE = "gerbil"
     CSS = f"""
     Horizontal {{ height: 1fr; }}
-    #stats {{
+    #left {{
         width: {STATS_PANE_WIDTH};
-        padding: 0 1;
         border-right: solid $accent;
     }}
+    #stats {{ height: auto; padding: 0 1; }}
+    #filepane {{ height: 1fr; padding: 0 1; }}
     #log {{ width: 1fr; }}
     """
     BINDINGS = [
@@ -111,7 +112,13 @@ class ViewerApp(App):
 
     def compose(self):
         with Horizontal():
-            yield Static(id="stats")
+            # Left column: the headline stats stay put; the file summary
+            # below them scrolls on its own (mouse wheel, or focus + arrows)
+            # once the tree outgrows the pane.
+            with Vertical(id="left"):
+                yield Static(id="stats")
+                with VerticalScroll(id="filepane"):
+                    yield Static(id="files")
             yield RichLog(id="log", wrap=True, max_lines=LOG_MAX_LINES,
                           auto_scroll=True)
         yield Footer()
@@ -215,6 +222,8 @@ class ViewerApp(App):
         pane = self.query_one("#stats", Static)
         width = pane.content_size.width or (STATS_PANE_WIDTH - 2)
         pane.update(Text.from_ansi(render_stats(self.stats, width)))
+        self.query_one("#files", Static).update(
+            Text.from_ansi(file_summary(self.stats, width)))
 
     # -- user actions ----------------------------------------------------------
 

@@ -246,6 +246,11 @@ class SessionStats:
 
     # path -> (added, removed), None = binary; first-appearance order.
     files: dict[str, tuple[int, int] | None] = field(default_factory=dict)
+    # The finished ralph sessions' file stats, accumulated at each
+    # session_begin (a sum of the per-session diffs, the same "sum of the
+    # patches" metric `gerbil summarize` reports). The live chain view is
+    # merge_file_stats(chain_files, files), computed at render time.
+    chain_files: dict[str, tuple[int, int] | None] = field(default_factory=dict)
 
     # Set when the user asked to interrupt; render_stats shows a banner.
     interrupt_requested: bool = False
@@ -281,6 +286,9 @@ class SessionStats:
         self.zoom_active = None
         self.outer = Usage()
         self.inner = Usage()
+        # Fold the finished session's diff into the chain totals before the
+        # new session starts from a clean slate.
+        self.chain_files = merge_file_stats(self.chain_files, self.files)
         self.files = {}
 
     def on_turn_header(self, max_context: int | None) -> None:
@@ -317,6 +325,24 @@ class SessionStats:
 
     def on_wip_patch(self, patch_text: str) -> None:
         self.files = patch_file_stats(patch_text)
+
+
+def merge_file_stats(
+    base: dict[str, tuple[int, int] | None],
+    extra: dict[str, tuple[int, int] | None],
+) -> dict[str, tuple[int, int] | None]:
+    """Per-file sums of two diff-stat dicts (binary None absorbs). Used for
+    the chain view: each session's numbers are exact, and the sum across
+    sessions is the sum-of-patches metric summarize also reports."""
+    merged = dict(base)
+    for path, counts in extra.items():
+        prev = merged.get(path)
+        if counts is None or (path in merged and prev is None):
+            merged[path] = None
+        else:
+            pa, pr = prev or (0, 0)
+            merged[path] = (pa + counts[0], pr + counts[1])
+    return merged
 
 
 def _bucket_cost(model: str, small_model: str | None,
@@ -366,15 +392,6 @@ def _usage_any(u: Usage) -> bool:
 def _hms(seconds: float) -> str:
     s = max(0, int(seconds))
     return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
-
-
-def _elide_path(path: str, width: int) -> str:
-    """Left-elide a path to fit `width` columns: the filename end is the
-    distinctive part."""
-    if len(path) <= width or width < 2:
-        return path
-    return "…" + path[-(width - 1):] if render.UNICODE else \
-        "..." + path[-(width - 3):]
 
 
 def _stat_row(label: str, value: str) -> str:
@@ -466,38 +483,100 @@ def render_stats(stats: SessionStats, width: int, now: float | None = None) -> s
         lines.append(render.style(
             "(the sandbox stays alive; d detaches)", "gray"))
 
-    lines.append("")
-    header = f"{rule * 2} files {rule * 2}"
-    lines.append(render.style(header, "gray"))
-    if not stats.files:
-        lines.append(render.style("(none yet)", "gray"))
-    else:
-        # Biggest churn first; binary entries (no counts) last.
-        def churn(item):
-            counts = item[1]
-            return -1 if counts is None else counts[0] + counts[1]
-        ordered = sorted(stats.files.items(), key=churn, reverse=True)
-        total_added = total_removed = 0
-        for path, counts in ordered:
-            if counts is None:
-                figures = "bin"
+    return "\n".join(lines)
+
+
+def render_file_tree(
+    files: dict[str, tuple[int, int] | None], width: int
+) -> list[str]:
+    """A `tree`-style listing of a diff-stat dict, one line per directory or
+    file, +/- figures right-aligned. Chains of single-child directories are
+    compressed onto one line (A/B/C/), so depth costs width only where the
+    tree actually branches. Connector glyphs come from render.GLYPHS and
+    degrade to ASCII exactly like every other decoration."""
+    tee, corner = render.GLYPHS["tee"], render.GLYPHS["corner"]
+    pipe, blank = render.GLYPHS["pipe"], render.GLYPHS["blank"]
+
+    # path components -> nested dict; a leaf holds its counts under None key.
+    tree: dict = {}
+    for path, counts in files.items():
+        node = tree
+        parts = path.split("/")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = {None: counts}
+
+    def row(prefix: str, name: str, counts=None, leaf=False) -> str:
+        if not leaf:
+            return prefix + name
+        if counts is None:
+            figures = "bin"
+        else:
+            figures = (render.style(f"+{counts[0]}", "green") + " "
+                       + render.style(f"-{counts[1]}", "red"))
+        fig_width = render._visible_len(figures)
+        label = prefix + name
+        avail = max(2, width - fig_width - 1)
+        if len(label) > avail:
+            label = label[:avail - 1] + "…"
+        pad = max(1, width - len(label) - fig_width)
+        return f"{label}{' ' * pad}{figures}"
+
+    lines: list[str] = []
+
+    def walk(node: dict, prefix: str) -> None:
+        dirs = sorted(k for k, v in node.items() if k and None not in v)
+        leaves = sorted(k for k, v in node.items() if k and None in v)
+        entries = dirs + leaves
+        for i, name in enumerate(entries):
+            last = i == len(entries) - 1
+            connector = corner if last else tee
+            child = node[name]
+            if None in child:
+                lines.append(row(prefix + connector, name,
+                                 child[None], leaf=True))
             else:
-                figures = (render.style(f"+{counts[0]}", "green") + " "
-                           + render.style(f"-{counts[1]}", "red"))
-                total_added += counts[0]
-                total_removed += counts[1]
-            fig_width = render._visible_len(figures)
-            path_width = max(2, width - fig_width - 2)
-            shown = _elide_path(path, path_width)
-            pad = max(1, width - len(shown) - fig_width)
-            lines.append(f"{shown}{' ' * pad}{figures}")
-        if len(ordered) > 1:
-            total = (render.style(f"+{total_added}", "green") + " "
-                     + render.style(f"-{total_removed}", "red"))
-            label = f"total ({len(ordered)} files)"
+                # Compress single-child directory chains: A/B/C/ on one line.
+                label = name
+                while len(child) == 1 and None not in next(iter(child.values())):
+                    (only,) = child
+                    label += "/" + only
+                    child = child[only]
+                lines.append(row(prefix + connector, label + "/"))
+                walk(child, prefix + (blank if last else pipe))
+
+    walk(tree, "")
+    return lines
+
+
+def file_summary(stats: SessionStats, width: int) -> str:
+    """The scrollable file pane: this session's diff as a tree, and -- for a
+    ralph chain past its first session -- the whole chain's summed diff
+    below it. Pure over (stats, width), like render_stats."""
+    rule = render.GLYPHS["rule"]
+
+    def section(title: str, files: dict) -> list[str]:
+        lines = [render.style(f"{rule * 2} {title} {rule * 2}", "gray")]
+        if not files:
+            lines.append(render.style("(none yet)", "gray"))
+            return lines
+        lines += render_file_tree(files, width)
+        counted = [c for c in files.values() if c is not None]
+        if len(files) > 1:
+            total = (render.style(f"+{sum(a for a, _ in counted)}", "green")
+                     + " "
+                     + render.style(f"-{sum(r for _, r in counted)}", "red"))
+            label = f"total ({len(files)} files)"
             pad = max(1, width - len(label) - render._visible_len(total))
             lines.append(render.style(f"{label}{' ' * pad}", "gray") + total)
+        return lines
 
+    chain = stats.ralph_total is not None and stats.ralph_total > 1
+    lines = section("files (this session)" if chain else "files", stats.files)
+    if chain:
+        lines.append("")
+        lines += section(
+            "files (chain)", merge_file_stats(stats.chain_files, stats.files))
     return "\n".join(lines)
 
 
@@ -549,6 +628,10 @@ def stats_to_wire(stats: SessionStats, now: float | None = None) -> dict:
             path: None if counts is None else list(counts)
             for path, counts in stats.files.items()
         },
+        "chain_files": {
+            path: None if counts is None else list(counts)
+            for path, counts in stats.chain_files.items()
+        },
     }
 
 
@@ -595,16 +678,17 @@ def stats_from_wire(
     s.inner = _usage("inner")
     s.chain_outer = _usage("chain_outer")
     s.chain_inner = _usage("chain_inner")
-    files_doc = doc.get("files")
-    if isinstance(files_doc, dict):
-        for path, counts in files_doc.items():
-            try:
-                s.files[str(path)] = (
-                    None if counts is None
-                    else (int(counts[0]), int(counts[1]))
-                )
-            except (TypeError, IndexError, ValueError):
-                continue  # one malformed entry costs one row, not the pane
+    for key, dst in (("files", s.files), ("chain_files", s.chain_files)):
+        files_doc = doc.get(key)
+        if isinstance(files_doc, dict):
+            for path, counts in files_doc.items():
+                try:
+                    dst[str(path)] = (
+                        None if counts is None
+                        else (int(counts[0]), int(counts[1]))
+                    )
+                except (TypeError, IndexError, ValueError):
+                    continue  # one malformed entry costs one row, not the pane
     return s
 
 
