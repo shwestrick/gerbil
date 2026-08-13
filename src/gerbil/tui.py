@@ -144,7 +144,17 @@ class ViewerApp(App):
     def _poll(self) -> None:
         self._drain_display()
 
-        doc = runs.load_stats_doc(self._name)
+        # Stop consuming the stats wire once the run has finished. The doc is
+        # final by then (the runner writes its last stats before the meta
+        # status that marks the outcome, so the poll that detects the ending
+        # has already absorbed the final numbers) -- and re-reading it would
+        # actively corrupt the frozen screen: stats_from_wire re-anchors the
+        # shipped elapsed seconds against the CURRENT clock, so each reload
+        # pushes session_started forward while render_stats holds `now` at
+        # finished_at, and the elapsed display ticks backwards one second per
+        # poll.
+        doc = None if self.stats.finished is not None \
+            else runs.load_stats_doc(self._name)
         if doc is not None and isinstance(doc.get("stats"), dict):
             # A torn or foreign doc keeps the last-good stats instead.
             finished, finished_at = self.stats.finished, self.stats.finished_at
