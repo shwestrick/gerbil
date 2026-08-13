@@ -11,9 +11,10 @@ processes, three files, and a 4 Hz poll.
 Everything the right pane shows is the ANSI-styled classic stream the runner
 prints (GERBIL_FORCE_STYLE keeps render.style live despite its redirected
 stdout), converted with rich's Text.from_ansi. Everything the left pane shows
-is view.SessionStats, reconstructed each poll by view.stats_from_wire -- the
-elapsed clocks re-anchor to this process's monotonic clock, so the 1s tick
-keeps counting between the runner's writes.
+is view.SessionStats, reconstructed by view.stats_from_wire whenever the
+runner writes a fresh stats.json (never from a stale one) -- the elapsed
+clocks re-anchor to this process's monotonic clock at that moment, and the
+1s tick keeps counting between the runner's writes.
 
 Key semantics (user-facing):
 - Ctrl-C / q: interrupt the run -- a real SIGINT to the runner, which is
@@ -98,6 +99,7 @@ class ViewerApp(App):
         self.tail: list[str] = []       # result/usage lines, from stats.json
         self._offset = 0                # read position in display.ansi
         self._pending = b""             # partial display line, bytes
+        self._stats_written_at = None   # written_at of the last doc absorbed
         self._interrupt_sent = False    # this viewer asked the runner to stop
         # How the viewer session ended, read by attach_viewer after run():
         # "detach" | "detach-unwinding" | "complete" | "interrupted" | "error".
@@ -155,10 +157,27 @@ class ViewerApp(App):
         # poll.
         doc = None if self.stats.finished is not None \
             else runs.load_stats_doc(self._name)
-        if doc is not None and isinstance(doc.get("stats"), dict):
+        if (doc is not None and isinstance(doc.get("stats"), dict)
+                and doc.get("written_at") != self._stats_written_at):
+            # Re-anchor the clocks only on a NEW doc (the runner stamps each
+            # write with written_at). Between the runner's writes -- easily
+            # tens of seconds inside a long model turn -- this process's own
+            # 1s tick carries the elapsed clocks; re-anchoring the same stale
+            # doc every poll would pin them to the last event's values and
+            # make elapsed advance in event-sized jumps instead of seconds.
+            # (A consequence embraced on purpose: the clock also keeps
+            # ticking while the run is paused, which matches the runner's own
+            # monotonic anchors across a SIGSTOP -- so nothing jumps on
+            # continue.) `age` corrects for how stale the doc already is when
+            # first absorbed, so attaching to a run mid-turn shows its true
+            # elapsed rather than the last event's.
+            written_at = doc.get("written_at")
+            self._stats_written_at = written_at
+            age = (max(0.0, time.time() - written_at)
+                   if isinstance(written_at, (int, float)) else 0.0)
             # A torn or foreign doc keeps the last-good stats instead.
             finished, finished_at = self.stats.finished, self.stats.finished_at
-            self.stats = stats_from_wire(doc["stats"])
+            self.stats = stats_from_wire(doc["stats"], age=age)
             # Viewer-owned state is deliberately not on the wire; reapply it.
             self.stats.finished, self.stats.finished_at = finished, finished_at
             self.stats.interrupt_requested = self._interrupt_sent

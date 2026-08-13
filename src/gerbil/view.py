@@ -509,6 +509,13 @@ def render_stats(stats: SessionStats, width: int, now: float | None = None) -> s
 # time.monotonic() anchors (meaningless in another process -- shipped as
 # elapsed seconds, re-anchored against the reader's own clock so its 1s tick
 # keeps counting between writes) and the files dict's tuple/None values.
+# The re-anchoring contract: the reader anchors ONCE per fresh doc (tui._poll
+# gates on written_at) and its own clock carries the time in between --
+# re-anchoring the same stale doc again would pin the clocks to the doc's
+# values and make elapsed advance only in event-sized jumps. `age` is how
+# stale the doc already is at anchoring time (reader wall clock minus the
+# doc's written_at), so a viewer attaching mid-turn shows the run's true
+# elapsed rather than the last event's.
 # `finished`/`finished_at`/`interrupt_requested`/`paused` are deliberately NOT
 # carried: meta.json's status is the authority for how a run ended (and for
 # pause), and the interrupt banner belongs to the viewer that pressed the key.
@@ -545,7 +552,9 @@ def stats_to_wire(stats: SessionStats, now: float | None = None) -> dict:
     }
 
 
-def stats_from_wire(doc: dict, now: float | None = None) -> SessionStats:
+def stats_from_wire(
+    doc: dict, now: float | None = None, *, age: float = 0.0
+) -> SessionStats:
     """Tolerant inverse of stats_to_wire: every field falls back to its
     default, so a document written by a different gerbil version (or torn in
     some way the atomic replace didn't catch) degrades the display rather
@@ -573,8 +582,8 @@ def stats_from_wire(doc: dict, now: float | None = None) -> SessionStats:
     s.ralph_iteration = _opt_int("ralph_iteration")
     s.ralph_total = _opt_int("ralph_total")
     s.resumed_from = doc.get("resumed_from") or None
-    s.session_started = now - float(doc.get("session_elapsed") or 0.0)
-    s.chain_started = now - float(doc.get("chain_elapsed") or 0.0)
+    s.session_started = now - float(doc.get("session_elapsed") or 0.0) - age
+    s.chain_started = now - float(doc.get("chain_elapsed") or 0.0) - age
     s.turns = int(doc.get("turns") or 0)
     s.zoom_turns = int(doc.get("zoom_turns") or 0)
     s.max_context = _opt_int("max_context")

@@ -225,6 +225,14 @@ def test_wire_roundtrip() -> None:
     check("anchors shift by exactly the now delta",
           r.session_started == 190.0 and r.chain_started == 160.0,
           f"{r.session_started}/{r.chain_started}")
+    # `age` = how stale the doc already is when the reader anchors: the
+    # anchors move back by exactly that much, so a viewer attaching mid-turn
+    # (or after a long stale gap) starts from the run's true elapsed. Fresh
+    # docs pass age ~0 and nothing changes.
+    aged = stats_from_wire(doc, now=250.0, age=7.5)
+    check("age backdates the anchors",
+          aged.session_started == 182.5 and aged.chain_started == 152.5,
+          f"{aged.session_started}/{aged.chain_started}")
     check("counters and identity survive",
           (r.turns, r.zoom_turns, r.run_name, r.session_name,
            r.ralph_iteration, r.ralph_total, r.zoom_active)
