@@ -326,6 +326,33 @@ def test_spec() -> None:
         "one position")
 
 
+def test_spec_template() -> None:
+    print("\n=== new-fill spec template ===")
+
+    from gerbil.fill_sorry import _SPEC_KEYS, SPEC_TEMPLATE
+
+    check("template mentions every spec key",
+          all(k in SPEC_TEMPLATE for k in _SPEC_KEYS),
+          str([k for k in _SPEC_KEYS if k not in SPEC_TEMPLATE]))
+
+    tmp = spec_file(SPEC_TEMPLATE)
+    try:
+        load_spec(tmp)
+    except ValueError as exc:
+        check("bare template fails on the empty sorries list",
+              "sorries" in str(exc))
+    else:
+        check("bare template fails on the empty sorries list", False)
+
+    filled = SPEC_TEMPLATE.replace(
+        "sorries = [\n]", 'sorries = ["A.lean:1"]')
+    spec = load_spec(spec_file(filled))
+    check("template with a sorry loads with pure defaults",
+          spec.sorries == [SorryPos("A.lean", 1)]
+          and spec.off_limits == [] and spec.axioms == STANDARD_AXIOMS
+          and spec.forbid == [] and spec.plan is None)
+
+
 def test_plan_name() -> None:
     print("\n=== plan naming ===")
 
@@ -681,6 +708,7 @@ def main() -> None:
     test_positions()
     test_resolver()
     test_designations()
+    test_spec_template()
     test_modules()
     test_spec()
     test_plan_name()

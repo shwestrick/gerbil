@@ -259,6 +259,13 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   [--fill-sorry SORRY[,SORRY..]|SPEC.toml] [--ralph N] [--ralph_done SCRIPT]
   [--max-turns N] [--image IMAGE] [--skip-cache] [--no-mcp]
   [--omit-session-log] [--plain]`
+- `gerbil new-fill [same options as run]` — author a `--fill-sorry` task spec
+  interactively: opens `$VISUAL`/`$EDITOR`/`vi` on `fill_sorry.SPEC_TEMPLATE`
+  (written to `<project>/.gerbil/fill-task-<ts>.toml`, kept regardless),
+  re-edits on validation problems, shows a task summary, and on confirmation
+  delegates to `cmd_run` — rewriting `sys.argv` from `new-fill` to
+  `run --fill-sorry <spec>` first, so the TUI's detached runner re-enters
+  cmd_run rather than the editor loop.
 - `gerbil resume LOG [--at DIR] [--max-turns N] [--zoom-max-turns N] [--image
   IMAGE] [--skip-cache] [--no-mcp] [--ralph_done SCRIPT] [--omit-session-log]
   [--plain]` —

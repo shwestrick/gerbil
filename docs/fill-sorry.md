@@ -23,6 +23,15 @@ containing `:`, `/`, or a `.lean` suffix are parsed as positions;
 anything else is a name. An argument ending in `.toml` is read as a task
 spec instead (below).
 
+Prefer not to write the spec by hand? **`gerbil new-fill`** opens your
+editor (`$VISUAL`, then `$EDITOR`, then `vi`) on a commented template of
+every spec key, validates what you save, loops back into the editor on
+problems, then shows a summary of the task -- resolved declarations,
+off-limits paths, axiom policy, session budget -- and starts the run on
+your confirmation, exactly as `gerbil run --fill-sorry <spec>` would. It
+accepts all of `gerbil run`'s options, and the spec file is kept in
+`.gerbil/` either way, so a declined task can be started later by path.
+
 The mode runs directly on the current repo, like any other gerbil session:
 preflight requires a clean tree, the session starts from `HEAD`, and the
 output is an ordinary patch in `.gerbil/` that `gerbil commit` applies.

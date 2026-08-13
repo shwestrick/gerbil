@@ -306,6 +306,133 @@ def _warn_context_window_drift() -> None:
     ), file=sys.stderr)
 
 
+def _add_run_options(p) -> None:
+    """The `gerbil run` options, shared with `gerbil new-fill` (which
+    delegates to cmd_run after interactively authoring a --fill-sorry
+    spec, and therefore accepts everything run does)."""
+    p.add_argument(
+        "--at",
+        metavar="DIRECTORY",
+        help="Path to the Lean/Lake project (a git repo). Default: current dir.",
+    )
+    p.add_argument(
+        "--prompt",
+        metavar="FILE",
+        help="Path to a file containing the task description (required, "
+        "unless --fill-sorry generates one). To continue a crashed session "
+        "instead, use `gerbil resume`.",
+    )
+    p.add_argument(
+        "--fill-sorry",
+        dest="fill_sorry",
+        metavar="SORRY[,SORRY..]|SPEC.toml",
+        default=None,
+        help="Fill specific Lean sorries: each SORRY is a position "
+        "FILE:LINE[:COL] (project-root-relative, 1-indexed) or the name of "
+        "the top-level declaration holding it (e.g. MyNs.foo). Or give a "
+        "path to a TOML task "
+        "spec (keys: sorries, off_limits, axioms, forbid, approach, plan, "
+        "check_timeout, ralph). gerbil generates the task prompt, a "
+        "cross-session plan file (at .gerbil/plans/, shipped inside the "
+        "patches), and the termination check, and defaults to --ralph "
+        f"{fill_sorry.DEFAULT_RALPH}. With "
+        "--prompt FILE, the file's text becomes approach notes spliced into "
+        "the generated prompt.",
+    )
+    p.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        metavar="MODEL",
+        help=(
+            f"LLM to use (default: {DEFAULT_MODEL}). Provider is auto-detected. "
+            f"Use `ollama:<NAME>` for a local model served by ollama (e.g. "
+            f"ollama:qwen2.5-coder); gerbil starts the server if one isn't running. "
+            f"Use `portkey:<MODEL>` (or a bare @provider/model catalog name) to "
+            f"route through a Portkey AI gateway; set PORTKEY_API_KEY and, for a "
+            f"self-hosted gateway, PORTKEY_BASE_URL. "
+            f"Known cloud models: {', '.join(MODEL_PRICING)}."
+        ),
+    )
+    p.add_argument(
+        "--small-model",
+        metavar="MODEL",
+        default=None,
+        help="Enable big-small mode: --model (the big model) drives the session "
+        "and gets a zoom_in tool that hands the mechanical details of a single "
+        "sorry to this smaller model, which works in a focused sub-session "
+        "until it calls zoom_out with a summary. Provider is auto-detected, "
+        "independently of --model.",
+    )
+    p.add_argument(
+        "--zoom-max-turns",
+        type=int,
+        metavar="N",
+        default=None,
+        help=f"Turn cap for each zoomed-in sub-session (default: "
+        f"{DEFAULT_INNER_MAX_TURNS}). On hitting it the small model gets one "
+        "final forced turn to report a mandatory zoom_out summary back to the "
+        "big model. Requires --small-model.",
+    )
+    p.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        help="Safety cap on agent turns (default: unlimited, runs until done).",
+    )
+    p.add_argument(
+        "--image",
+        metavar="IMAGE",
+        help="Container image for the sandbox (default: gerbil's own gerbil-lean-sandbox). Overrides `image` in .gerbil/config.toml. The image must satisfy gerbil's execution model; it is checked at startup.",
+    )
+    p.add_argument(
+        "--skip-cache",
+        action="store_true",
+        help="Skip 'lake exe cache get' at startup (faster, but mathlib will "
+        "rebuild from source on first use). Only relevant to projects that use "
+        "mathlib -- the fetch is skipped automatically for those that do not.",
+    )
+    p.add_argument(
+        "--no-mcp",
+        dest="mcp",
+        action="store_false",
+        help="Disable the lean-lsp MCP tools; use only the built-in tools.",
+    )
+    p.add_argument(
+        "--ralph",
+        type=int,
+        metavar="N",
+        default=None,
+        help="Run N sessions back-to-back on the same prompt, reusing the "
+        "sandbox. Each session is committed inside the container so the next "
+        "builds on it; outputs are numbered gerbil-<ts>-NN.{jsonl,patch}.",
+    )
+    p.add_argument(
+        "--ralph_done",
+        metavar="SCRIPT",
+        help="Path to a script run inside the container after each --ralph "
+        "session (on that session's committed working tree, from the project "
+        "dir). Exit code 0 ends the ralph loop; non-zero continues. Requires "
+        "--ralph.",
+    )
+    p.add_argument(
+        "--omit-session-log",
+        action="store_true",
+        help="Do not include the session .jsonl log in the commit (by default "
+        "it is folded in via commit --amend before the patch is produced). "
+        "The log is always archived in ~/.gerbil/sessions/ regardless.",
+    )
+    p.add_argument(
+        "--plain",
+        action="store_true",
+        help="Use the classic scrolling print output instead of the full-screen "
+        "live view (chosen automatically when stdout is not a terminal).",
+    )
+    # Internal: marks this process as the detached runner behind a TUI run
+    # (see _spawn_and_attach). Hidden from --help; never passed by hand.
+    p.add_argument("--_runner", metavar="NAME", default=None,
+                       help=argparse.SUPPRESS)
+
+
 def main() -> None:
     # SIGTERM (kill, service managers) and SIGHUP (closed terminal) would end
     # the process without unwinding the `with` blocks that own the sandbox
@@ -326,128 +453,15 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     run_p = sub.add_parser("run", help="run a gerbil session on a Lake project")
-    run_p.add_argument(
-        "--at",
-        metavar="DIRECTORY",
-        help="Path to the Lean/Lake project (a git repo). Default: current dir.",
-    )
-    run_p.add_argument(
-        "--prompt",
-        metavar="FILE",
-        help="Path to a file containing the task description (required, "
-        "unless --fill-sorry generates one). To continue a crashed session "
-        "instead, use `gerbil resume`.",
-    )
-    run_p.add_argument(
-        "--fill-sorry",
-        dest="fill_sorry",
-        metavar="SORRY[,SORRY..]|SPEC.toml",
-        default=None,
-        help="Fill specific Lean sorries: each SORRY is a position "
-        "FILE:LINE[:COL] (project-root-relative, 1-indexed) or the name of "
-        "the top-level declaration holding it (e.g. MyNs.foo). Or give a "
-        "path to a TOML task "
-        "spec (keys: sorries, off_limits, axioms, forbid, approach, plan, "
-        "check_timeout, ralph). gerbil generates the task prompt, a "
-        "cross-session plan file (at .gerbil/plans/, shipped inside the "
-        "patches), and the termination check, and defaults to --ralph "
-        f"{fill_sorry.DEFAULT_RALPH}. With "
-        "--prompt FILE, the file's text becomes approach notes spliced into "
-        "the generated prompt.",
-    )
-    run_p.add_argument(
-        "--model",
-        default=DEFAULT_MODEL,
-        metavar="MODEL",
-        help=(
-            f"LLM to use (default: {DEFAULT_MODEL}). Provider is auto-detected. "
-            f"Use `ollama:<NAME>` for a local model served by ollama (e.g. "
-            f"ollama:qwen2.5-coder); gerbil starts the server if one isn't running. "
-            f"Use `portkey:<MODEL>` (or a bare @provider/model catalog name) to "
-            f"route through a Portkey AI gateway; set PORTKEY_API_KEY and, for a "
-            f"self-hosted gateway, PORTKEY_BASE_URL. "
-            f"Known cloud models: {', '.join(MODEL_PRICING)}."
-        ),
-    )
-    run_p.add_argument(
-        "--small-model",
-        metavar="MODEL",
-        default=None,
-        help="Enable big-small mode: --model (the big model) drives the session "
-        "and gets a zoom_in tool that hands the mechanical details of a single "
-        "sorry to this smaller model, which works in a focused sub-session "
-        "until it calls zoom_out with a summary. Provider is auto-detected, "
-        "independently of --model.",
-    )
-    run_p.add_argument(
-        "--zoom-max-turns",
-        type=int,
-        metavar="N",
-        default=None,
-        help=f"Turn cap for each zoomed-in sub-session (default: "
-        f"{DEFAULT_INNER_MAX_TURNS}). On hitting it the small model gets one "
-        "final forced turn to report a mandatory zoom_out summary back to the "
-        "big model. Requires --small-model.",
-    )
-    run_p.add_argument(
-        "--max-turns",
-        type=int,
-        default=None,
-        help="Safety cap on agent turns (default: unlimited, runs until done).",
-    )
-    run_p.add_argument(
-        "--image",
-        metavar="IMAGE",
-        help="Container image for the sandbox (default: gerbil's own gerbil-lean-sandbox). Overrides `image` in .gerbil/config.toml. The image must satisfy gerbil's execution model; it is checked at startup.",
-    )
-    run_p.add_argument(
-        "--skip-cache",
-        action="store_true",
-        help="Skip 'lake exe cache get' at startup (faster, but mathlib will "
-        "rebuild from source on first use). Only relevant to projects that use "
-        "mathlib -- the fetch is skipped automatically for those that do not.",
-    )
-    run_p.add_argument(
-        "--no-mcp",
-        dest="mcp",
-        action="store_false",
-        help="Disable the lean-lsp MCP tools; use only the built-in tools.",
-    )
-    run_p.add_argument(
-        "--ralph",
-        type=int,
-        metavar="N",
-        default=None,
-        help="Run N sessions back-to-back on the same prompt, reusing the "
-        "sandbox. Each session is committed inside the container so the next "
-        "builds on it; outputs are numbered gerbil-<ts>-NN.{jsonl,patch}.",
-    )
-    run_p.add_argument(
-        "--ralph_done",
-        metavar="SCRIPT",
-        help="Path to a script run inside the container after each --ralph "
-        "session (on that session's committed working tree, from the project "
-        "dir). Exit code 0 ends the ralph loop; non-zero continues. Requires "
-        "--ralph.",
-    )
-    run_p.add_argument(
-        "--omit-session-log",
-        action="store_true",
-        help="Do not include the session .jsonl log in the commit (by default "
-        "it is folded in via commit --amend before the patch is produced). "
-        "The log is always archived in ~/.gerbil/sessions/ regardless.",
-    )
-    run_p.add_argument(
-        "--plain",
-        action="store_true",
-        help="Use the classic scrolling print output instead of the full-screen "
-        "live view (chosen automatically when stdout is not a terminal).",
-    )
-    # Internal: marks this process as the detached runner behind a TUI run
-    # (see _spawn_and_attach). Hidden from --help; never passed by hand.
-    run_p.add_argument("--_runner", metavar="NAME", default=None,
-                       help=argparse.SUPPRESS)
+    _add_run_options(run_p)
     run_p.set_defaults(func=cmd_run)
+
+    new_p = sub.add_parser(
+        "new-fill",
+        help="author a --fill-sorry task spec in your editor, confirm it, and run it",
+    )
+    _add_run_options(new_p)
+    new_p.set_defaults(func=cmd_new_fill)
 
     resume_p = sub.add_parser(
         "resume",
@@ -2383,6 +2397,120 @@ def _load_ralph_done_script(path_str: str | None, *, have_ralph: bool) -> str | 
     if not p.is_file():
         sys.exit(f"error: --ralph_done script {p} is not a file")
     return p.read_text()
+
+
+def cmd_new_fill(args) -> None:
+    """Interactively author a --fill-sorry task spec and run it.
+
+    Opens the user's editor ($VISUAL, then $EDITOR, then vi -- the git
+    convention) on a fresh spec template, validates the result against the
+    project, shows a summary of what the task will do, and on confirmation
+    delegates to cmd_run exactly as `gerbil run --fill-sorry <spec>` would.
+    Validation problems loop back into the editor rather than dying: the
+    half-written spec is the user's work, not a crash. The spec file lives
+    in the project's .gerbil/ and is kept whatever happens, so a declined
+    task can be started later (or edited and re-run) by path."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        sys.exit("error: new-fill is interactive; run it from a terminal "
+                 "(or write a spec file and use `gerbil run --fill-sorry`).")
+    if args.fill_sorry:
+        sys.exit("error: new-fill authors the spec itself; "
+                 "--fill-sorry only applies to `gerbil run`.")
+
+    # Enough preflight to make editing worthwhile -- the full run preflight
+    # happens in cmd_run after confirmation.
+    project_dir = _resolve_at(args.at)
+    if not project_dir.is_dir():
+        sys.exit(f"error: {project_dir} is not a directory")
+    repo_root = _require_git_repo(project_dir)
+    _require_lake_project(project_dir)
+
+    spec_dir = project_dir / ".gerbil"
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    spec_path = spec_dir / (
+        "fill-task-" + datetime.now().strftime("%y%m%d-%H%M%S") + ".toml")
+    spec_path.write_text(fill_sorry.SPEC_TEMPLATE)
+    print(style(f"[new-fill: editing {spec_path}]", "gray"), flush=True)
+
+    def ask(prompt: str, choices: str) -> str:
+        while True:
+            answer = input(prompt).strip().lower() or choices[0]
+            if answer in choices:
+                return answer
+
+    while True:
+        _open_editor(spec_path)
+        try:
+            spec = fill_sorry.load_spec(spec_path)
+            errors, warnings, excerpts = fill_sorry.validate(
+                spec, project_dir=project_dir, repo_root=repo_root)
+        except ValueError as exc:
+            errors, warnings, excerpts, spec = [str(exc)], [], {}, None
+        if errors:
+            print(style("the spec has problems:", "bold", "red"))
+            for e in errors:
+                print(style(f"  - {e}", "red"))
+            if ask("[e]dit again / [q]uit? ", "eq") == "q":
+                break
+            continue
+
+        print()
+        print(style("fill-sorry task", "bold"))
+        for pos in spec.sorries:
+            decl = spec.decls.get(str(pos), "?")
+            excerpt = excerpts.get(pos, "")
+            print(f"  sorry:       {style(decl, 'bold')}  ({pos})"
+                  + (f"  {style(excerpt, 'gray')}" if excerpt else ""))
+        print("  off-limits:  " + (", ".join(spec.off_limits)
+                                   if spec.off_limits
+                                   else "none -- full repo access"))
+        print("  axioms:      " + ", ".join(spec.axioms))
+        print("  forbid:      " + (", ".join(spec.forbid) or "none"))
+        print("  approach:    " + ("yes" if spec.approach or args.prompt
+                                   else "none"))
+        print("  plan file:   " + fill_sorry.plan_name(spec))
+        ralph_n = args.ralph or spec.ralph or fill_sorry.DEFAULT_RALPH
+        print(f"  sessions:    up to {ralph_n} (ralph), "
+              f"check timeout {spec.check_timeout}s")
+        print(f"  model:       {args.model}")
+        print(f"  project:     {project_dir}")
+        for w in warnings:
+            print(style(f"  ! {w}", "yellow"))
+        print()
+
+        answer = ask("[s]tart / [e]dit again / [q]uit? ", "seq")
+        if answer == "e":
+            continue
+        if answer == "q":
+            break
+        # Delegate to cmd_run as if invoked with --fill-sorry. sys.argv is
+        # rewritten too: the TUI path re-spawns a detached runner from argv,
+        # and that child must re-enter cmd_run, not this editor loop.
+        idx = sys.argv.index("new-fill")
+        sys.argv[idx:idx + 1] = ["run"]
+        sys.argv += ["--fill-sorry", str(spec_path)]
+        args.fill_sorry = str(spec_path)
+        cmd_run(args)
+        return
+
+    print(style(
+        f"[new-fill: kept {spec_path} -- start it later with "
+        f"`gerbil run --fill-sorry {spec_path}`]", "gray"))
+
+
+def _open_editor(path: Path) -> None:
+    """Open the user's editor on `path` and wait for it: $VISUAL, then
+    $EDITOR (both may carry arguments, e.g. \"code -w\"), then vi -- the
+    same convention git uses."""
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    try:
+        result = subprocess.run(shlex.split(editor) + [str(path)])
+    except FileNotFoundError:
+        sys.exit(f"error: editor {editor!r} not found "
+                 "(set $EDITOR or $VISUAL).")
+    if result.returncode != 0:
+        sys.exit(f"error: editor {editor!r} exited with "
+                 f"{result.returncode}; aborting (spec kept at {path}).")
 
 
 def _load_fill_sorry_spec(args, project_dir, repo_root):

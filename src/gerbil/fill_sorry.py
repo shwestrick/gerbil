@@ -1217,6 +1217,29 @@ def build_check_script(spec: FillSorrySpec, *, base: str, subdir: str) -> str:
     return script
 
 
+# The starting point `gerbil new-fill` opens in the user's editor: every
+# spec key present, explained, and commented out except the one required
+# field. Kept beside load_spec so the two cannot drift apart (the test suite
+# asserts every key is mentioned).
+SPEC_TEMPLATE = """\
+# gerbil fill-sorry task spec: fill in `sorries`, save, exit.
+# Paths are project-root-relative, positions 1-indexed. Docs: docs/fill-sorry.md
+
+# Each entry: "FILE:LINE[:COL]" | "Ns.declName" | { pos = "...", decl = "..." }
+sorries = [
+]
+
+# off_limits = ["Spec.lean", "Contracts/"]                 # frozen paths/globs
+# axioms = ["propext", "Classical.choice", "Quot.sound"]   # allowed (= default)
+# forbid = ["noncomputable", "partial"]                    # or "native_decide"
+# approach = "Try induction on n."      # notes spliced into the prompt
+# approach_file = "notes/approach.md"   # ...or read them from a file
+# plan = "my-task.md"                   # plan-file name (in .gerbil/plans/)
+# check_timeout = 1800                  # seconds the goal check may run
+# ralph = 10                            # session budget (CLI --ralph overrides)
+"""
+
+
 # ---------------------------------------------------------------------------
 # Session metadata
 # ---------------------------------------------------------------------------
