@@ -187,7 +187,12 @@ enclosing declaration, failing with a spec-entry hint when it cannot.
 Three layers, each catching what the previous one misses:
 
 1. **The prompt** states the rules, so sessions aren't wasted violating
-   them.
+   them -- and the moment a turn's changes touch a frozen path anyway, a
+   warning is delivered straight into the conversation (piggybacking on
+   the per-turn wip snapshot, so it costs nothing extra): the warning
+   names the paths and tells the agent to restore them byte for byte.
+   It fires once per newly-violated path, not once per turn, and fixing
+   the files is the agent's job.
 2. **The goal check** pins every off-limits path to the starting commit,
    so the ralph loop can never terminate "done" with a frozen file
    changed.

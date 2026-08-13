@@ -316,7 +316,7 @@ def _thought_sig(raw_part) -> str | None:
 def _update_wip_patch(
     sandbox: LeanSandbox, path: Path | None, base: str,
     view: SessionView | None = None,
-) -> None:
+) -> str | None:
     """Refresh the live resume snapshot -- a format-patch from `base` to the
     current state (committed + uncommitted), so a crash can be resumed or the
     patch applied directly. Best-effort: a checkpoint must never be the thing that
@@ -326,20 +326,43 @@ def _update_wip_patch(
     from it), so a live file list costs no container round-trips beyond the
     snapshot the loop was already taking. When no snapshot file is wanted, the
     patch is computed only if the view asks for it -- `wip_patch_path=None`
-    keeps its long-standing meaning of "do nothing" under a PrintView."""
+    keeps its long-standing meaning of "do nothing" under a PrintView.
+
+    Returns the patch text when one was computed (the off-limits monitor
+    reads the same snapshot), else None."""
     view = view if view is not None else PrintView()
     if path is None and not view.wants_wip_patch:
-        return
+        return None
     try:
         text = sandbox.wip_patch(base)
     except Exception:
-        return
+        return None
     view.wip_patch(text)
     if path is not None:
         try:
             path.write_text(text)
         except Exception:
             pass
+    return text
+
+
+def _warn_off_limits(check, wip_text, messages, session, view) -> None:
+    """Fire the --fill-sorry off-limits monitor on this turn's wip snapshot
+    and, when it reports newly-violated paths, put its warning where the
+    model will actually see it: merged into the pending tool-result message
+    (_append_user_text), recorded like a context-pressure warning, and echoed
+    to the display. Warning only -- the patch gate and the termination check
+    remain the enforcement; fixing the files is the model's job."""
+    if check is None or wip_text is None:
+        return
+    note = check(wip_text)
+    if not note:
+        return
+    _append_user_text(messages, note)
+    session.record_warning(note)
+    view.notice(style(
+        "[warned the model: its changes modify off-limits path(s)]",
+        "bold", "yellow"))
 
 
 def _run_zoom(
@@ -353,6 +376,7 @@ def _run_zoom(
     wip_patch_path: Path | None,
     seed_messages: list | None = None,
     view: SessionView | None = None,
+    off_limits_check=None,
 ) -> tuple[str, Usage]:
     """Run a zoomed-in sub-session: the small model works on the single sorry
     named by `zoom_args` (a zoom_in call's arguments) until it calls zoom_out.
@@ -483,8 +507,11 @@ def _run_zoom(
         messages.append({"role": "user", "content": tool_results})
 
         # The sub-session mutates the same working tree; keep the crash
-        # snapshot as fresh as the outer loop does.
-        _update_wip_patch(sandbox, wip_patch_path, session.base_commit, view)
+        # snapshot as fresh as the outer loop does -- and warn the small
+        # model just like the big one when it strays onto a frozen path.
+        wip_text = _update_wip_patch(
+            sandbox, wip_patch_path, session.base_commit, view)
+        _warn_off_limits(off_limits_check, wip_text, messages, session, view)
 
     # Cap hit without a zoom_out: don't just abandon the sub-session -- demand
     # the summary. One final turn where zoom_out is the only tool on offer and
@@ -565,6 +592,7 @@ def run_session(
     inner_max_turns: int = DEFAULT_INNER_MAX_TURNS,
     pending_zoom: dict | None = None,
     view: SessionView | None = None,
+    off_limits_check=None,
 ) -> SessionResult:
     """Run the agent loop until the model stops calling tools (or max_turns).
 
@@ -590,6 +618,11 @@ def run_session(
     defaults to the classic scrolling PrintView, so every existing caller and
     test behaves exactly as before the view abstraction existed. The view is
     display-only -- what is recorded to `session` never depends on it.
+
+    `off_limits_check`, when given (--fill-sorry with off-limits paths, see
+    fill_sorry.off_limits_monitor), is fed each turn's wip-patch text; a
+    warning it returns is delivered into the conversation immediately, so
+    the model learns it strayed onto a frozen path the turn it happens.
     """
     view = view if view is not None else PrintView()
     if messages is None:
@@ -662,6 +695,7 @@ def run_session(
                 sandbox, session, toolset, provider, small_model,
                 pending_zoom.get("args") or {}, inner_max_turns, wip_patch_path,
                 seed_messages=pending_zoom.get("messages") or None, view=view,
+                off_limits_check=off_limits_check,
             )
             _accumulate(total, zoom_usage)
             _accumulate(inner_total, zoom_usage)
@@ -739,6 +773,7 @@ def run_session(
                 summary, zoom_usage = _run_zoom(
                     sandbox, session, toolset, provider, small_model,
                     tc["args"], inner_max_turns, wip_patch_path, view=view,
+                    off_limits_check=off_limits_check,
                 )
                 _accumulate(total, zoom_usage)
                 _accumulate(inner_total, zoom_usage)
@@ -802,7 +837,9 @@ def run_session(
 
         # Snapshot the working tree after every turn that ran tools, so an
         # interruption before the next turn leaves a patch that recreates it.
-        _update_wip_patch(sandbox, wip_patch_path, session.base_commit, view)
+        wip_text = _update_wip_patch(
+            sandbox, wip_patch_path, session.base_commit, view)
+        _warn_off_limits(off_limits_check, wip_text, messages, session, view)
 
     if stopped_at_max:
         view.notice(style(f"[stopped: reached max_turns={max_turns}]",

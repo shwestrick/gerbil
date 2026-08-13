@@ -1715,6 +1715,12 @@ def cmd_run(args) -> None:
                             small_model=args.small_model,
                             inner_max_turns=inner_max_turns,
                             view=view,
+                            # Per session, so the newly-violated tracking
+                            # starts fresh with each fresh conversation.
+                            off_limits_check=(
+                                fill_sorry.off_limits_monitor(
+                                    spec.off_limits, fs_subdir)
+                                if spec is not None else None),
                         )
                         session.close()
                         session = None
@@ -2101,6 +2107,10 @@ def cmd_resume(args) -> None:
                             # later ralph iterations start fresh.
                             pending_zoom=parsed.pending_zoom if seeded else None,
                             view=view,
+                            off_limits_check=(
+                                fill_sorry.off_limits_monitor(
+                                    fs_spec.off_limits, fs_subdir)
+                                if fs_spec is not None else None),
                         )
                         session.close()
                         session = None

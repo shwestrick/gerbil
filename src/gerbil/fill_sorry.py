@@ -524,6 +524,52 @@ def is_off_limits(path: str, normalized: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(path, pat) for pat in normalized)
 
 
+def off_limits_monitor(off_limits: list[str], subdir: str):
+    """A per-session hook for the agent loop: fed each turn's wip-patch
+    text, returns the warning the model must see when its changes have newly
+    touched an off-limits path, else None. None (no hook at all) when the
+    task has no off-limits paths.
+
+    Stateful on purpose: the wip patch is cumulative since the session base,
+    so an unfixed violation would otherwise re-warn every turn and burn the
+    very context the model needs to fix it. The warning fires when the
+    violation set GROWS relative to the previous turn -- once per offense --
+    and a path that is fixed and then broken again warns again. Warning
+    only: reverting is the model's job (the patch gate and the termination
+    check remain the enforcement)."""
+    if not off_limits:
+        return None
+    prev: set[str] = set()
+
+    def check(patch_text: str) -> str | None:
+        # Local import: view is display machinery, and this module stays
+        # otherwise free of gerbil-internal imports.
+        from .view import patch_file_stats
+        nonlocal prev
+        violations = set(gate_violations(
+            list(patch_file_stats(patch_text)), off_limits, subdir))
+        grew = violations - prev
+        prev = violations
+        if not grew:
+            return None
+        listing = "".join(f"  {p}\n" for p in sorted(violations))
+        return (
+            "[OFF-LIMITS] Your changes currently modify path(s) that are "
+            "off-limits for this task:\n"
+            f"{listing}"
+            "These paths are frozen: the termination check pins them to the "
+            "starting commit, and gerbil will refuse to emit a patch that "
+            "touches them -- the session's work cannot land while they "
+            "differ. Restore each one to its exact original content before "
+            "continuing with anything else (the original is available via "
+            "`git show <base-commit>:<path>`, with the base commit named in "
+            "your instructions; rewrite the file to match it byte for byte). "
+            "Do not use git checkout/reset/restore."
+        )
+
+    return check
+
+
 def gate_violations(
     changed: list[str], off_limits: list[str], subdir: str
 ) -> list[str]:

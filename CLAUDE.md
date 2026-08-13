@@ -385,8 +385,12 @@ Optional noncomputable/partial bans walk the designated declarations'
 dependency closure within the target modules; off-limits paths are pinned to
 the chain base. Defaults to `--ralph 10`. Everything lives in `fill_sorry.py`;
 cli.py wires it at preflight (parse/validate, `--prompt` becomes approach
-notes, `--ralph_done` is rejected, uncommitted earlier patches warn) and after
-each session (the off-limits patch gate on `sandbox.changed_paths`). The plan
+notes, `--ralph_done` is rejected, uncommitted earlier patches warn), per turn
+(`fill_sorry.off_limits_monitor`, fed each turn's wip-patch text by
+`agent.run_session`'s `off_limits_check` hook: a warning lands in the pending
+tool-result message the moment a turn newly touches a frozen path -- once per
+offense, not per turn, since the wip is cumulative), and after each session
+(the off-limits patch gate on `sandbox.changed_paths`). The plan
 file -- cross-session memory at `.gerbil/plans/fill-<slug>-<hash>.md`,
 deterministic from the sorry list -- is seeded by gerbil in-container and
 maintained by the agent; it ships in the patches via the force-include

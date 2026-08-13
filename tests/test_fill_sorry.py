@@ -518,6 +518,77 @@ def test_off_limits() -> None:
           gate_violations(changed, [], "") == [])
 
 
+def test_off_limits_monitor() -> None:
+    print("\n=== off-limits turn monitor ===")
+
+    from gerbil.fill_sorry import off_limits_monitor
+
+    def patch(*paths):
+        return "".join(
+            f"diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@\n+x\n"
+            for p in paths)
+
+    check("no off-limits paths -> no hook at all",
+          off_limits_monitor([], "") is None)
+
+    mon = off_limits_monitor(["Spec.lean", "Contracts/"], "")
+    check("clean turn is silent", mon(patch("Mine.lean")) is None)
+    note = mon(patch("Mine.lean", "Spec.lean"))
+    check("new violation warns, naming the path and the fix",
+          note is not None and "Spec.lean" in note and "OFF-LIMITS" in note
+          and "git show" in note, str(note))
+    check("unfixed violation does not re-warn every turn",
+          mon(patch("Mine.lean", "Spec.lean")) is None)
+    note = mon(patch("Spec.lean", "Contracts/A.lean"))
+    check("a further newly-violated path warns, listing all current",
+          note is not None and "Contracts/A.lean" in note
+          and "Spec.lean" in note, str(note))
+    check("fixing everything is silent", mon(patch("Mine.lean")) is None)
+    note = mon(patch("Spec.lean"))
+    check("re-breaking after a fix warns again",
+          note is not None and "Spec.lean" in note)
+
+    sub = off_limits_monitor(["Spec.lean"], "sub")
+    check("nested project: repo-relative patch paths match",
+          sub(patch("sub/Spec.lean")) is not None)
+    check(".gerbil bookkeeping stays exempt",
+          off_limits_monitor(["*"], "")(patch(".gerbil/plans/x.md")) is None)
+
+    # Delivery: the warning merges into the PENDING tool-result message
+    # (the providers reject a second user message in a row), is recorded
+    # like a context-pressure warning, and is echoed to the display.
+    from gerbil.agent import _warn_off_limits
+
+    class FakeSession:
+        warnings: list = []
+
+        def record_warning(self, text):
+            self.warnings.append(text)
+
+    class FakeView:
+        notices: list = []
+
+        def notice(self, text, **kw):
+            self.notices.append(text)
+
+    sess, view = FakeSession(), FakeView()
+    messages = [{"role": "user",
+                 "content": [{"type": "tool_result", "content": "ok"}]}]
+    mon = off_limits_monitor(["Spec.lean"], "")
+    _warn_off_limits(mon, patch("Spec.lean"), messages, sess, view)
+    parts = messages[-1]["content"]
+    check("warning merged into the pending tool-result message",
+          len(messages) == 1 and parts[-1]["type"] == "text"
+          and "OFF-LIMITS" in parts[-1]["text"], str(messages))
+    check("warning recorded and echoed",
+          any("OFF-LIMITS" in w for w in sess.warnings)
+          and any("off-limits" in n for n in view.notices))
+    _warn_off_limits(None, patch("Spec.lean"), messages, sess, view)
+    _warn_off_limits(mon, None, messages, sess, view)
+    check("no hook / no wip text are clean no-ops",
+          len(messages[-1]["content"]) == 2, str(messages))
+
+
 def test_prompt() -> None:
     print("\n=== generated prompt ===")
 
@@ -715,6 +786,7 @@ def main() -> None:
     test_validate()
     test_seed_plan()
     test_off_limits()
+    test_off_limits_monitor()
     test_prompt()
     test_check_script()
     test_check_goal_tool()
