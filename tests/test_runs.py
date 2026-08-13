@@ -219,6 +219,7 @@ def test_wire_roundtrip() -> None:
     s.files = {"A.lean": (3, 1), "img.png": None}
     s.interrupt_requested = True   # viewer-owned: must NOT cross the wire
     s.finished = "complete"
+    s.stopping = True              # runner-owned: MUST cross the wire
 
     doc = json.loads(json.dumps(stats_to_wire(s, now=100.0)))
     r = stats_from_wire(doc, now=250.0)
@@ -244,6 +245,7 @@ def test_wire_roundtrip() -> None:
     check("viewer-owned state excluded from the wire",
           "finished" not in doc and "interrupt_requested" not in doc
           and r.finished is None and not r.interrupt_requested, str(doc))
+    check("runner-owned stopping crosses the wire", r.stopping is True, str(doc))
 
     degraded = stats_from_wire({"turns": 1, "unknown_future_key": [1, 2]},
                                now=5.0)

@@ -2688,6 +2688,11 @@ def _ralph_done(sandbox, script: str, view: SessionView,
         view.notice(style(out.replace("\n", "\n  "), "gray"),
                     newline_before=False)
     if result.exit_code == 0:
+        # Flip the live view's status to "stopping loop..." right away: the
+        # remaining activity (teardown, the finished screen) is no longer
+        # work toward the goal, and a viewer that still says "running" would
+        # misreport it.
+        view.loop_stopping()
         view.notice(style("[ralph_done: check passed (exit 0) -- stopping loop]",
                           "bold", "magenta"), newline_before=False)
         return True

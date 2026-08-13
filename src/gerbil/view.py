@@ -89,6 +89,7 @@ class SessionView(Protocol):
     # -- data feeds (PrintView no-ops) ---------------------------------------
     def turn_complete(self, usage: Usage, *, zoom: bool) -> None: ...
     def wip_patch(self, patch_text: str) -> None: ...
+    def loop_stopping(self) -> None: ...
     # -- results -------------------------------------------------------------
     def usage_summary(self, turns: int, usage: Usage, cost: float | None) -> None: ...
     def result_line(self, text: str) -> None: ...
@@ -143,6 +144,11 @@ class PrintView:
         pass
 
     def wip_patch(self, patch_text):
+        pass
+
+    def loop_stopping(self):
+        # A stats-only signal: the plain stream already carries cli's
+        # "[ralph_done: check passed ...]" notice.
         pass
 
     def usage_summary(self, turns, usage, cost):
@@ -260,6 +266,11 @@ class SessionStats:
     # stats wire).
     paused: bool = False
 
+    # Set by the runner the moment the --ralph_done check passes: the loop is
+    # about to end and the remaining activity is teardown. Runner-owned, so
+    # unlike paused/finished it DOES cross the stats wire.
+    stopping: bool = False
+
     # Set once the whole run (every ralph session) has ended and the TUI is
     # holding the screen for the user to read: "complete", "interrupted", or
     # "error". finished_at pins the clocks so elapsed stops counting the time
@@ -286,6 +297,7 @@ class SessionStats:
         self.zoom_active = None
         self.outer = Usage()
         self.inner = Usage()
+        self.stopping = False
         # Fold the finished session's diff into the chain totals before the
         # new session starts from a clean slate.
         self.chain_files = merge_file_stats(self.chain_files, self.files)
@@ -466,22 +478,30 @@ def render_stats(stats: SessionStats, width: int, now: float | None = None) -> s
             zoom += f" {sep} ctx {zpct:.1f}%"
         lines.append(render.style(f"zoom: {zoom}", "magenta"))
 
+    # The status banner: always present, one state at a time, most decisive
+    # first. The trailing blank line keeps a gap between the banner and the
+    # file-summary pane rendered below the stats widget.
+    lines.append("")
     if stats.finished is not None:
         color = {"complete": "green", "interrupted": "yellow"}.get(
             stats.finished, "red")
-        lines.append("")
         lines.append(render.style(f"session {stats.finished}", "bold", color))
         lines.append(render.style("press q or enter to exit", "gray"))
     elif stats.interrupt_requested:
-        lines.append("")
         lines.append(render.style(
             "interrupting: finishing the current operation;\n"
             "press again to detach", "bold", "yellow"))
+    elif stats.stopping:
+        lines.append(render.style("stopping loop...", "bold", "magenta"))
+        lines.append(render.style(
+            "(the termination check passed)", "gray"))
     elif stats.paused:
-        lines.append("")
         lines.append(render.style("paused: press c to continue", "bold", "blue"))
         lines.append(render.style(
             "(the sandbox stays alive; d detaches)", "gray"))
+    else:
+        lines.append(render.style("running", "bold", "green"))
+    lines.append("")
 
     return "\n".join(lines)
 
@@ -624,6 +644,7 @@ def stats_to_wire(stats: SessionStats, now: float | None = None) -> dict:
         "inner": asdict(stats.inner),
         "chain_outer": asdict(stats.chain_outer),
         "chain_inner": asdict(stats.chain_inner),
+        "stopping": stats.stopping,
         "files": {
             path: None if counts is None else list(counts)
             for path, counts in stats.files.items()
@@ -678,6 +699,7 @@ def stats_from_wire(
     s.inner = _usage("inner")
     s.chain_outer = _usage("chain_outer")
     s.chain_inner = _usage("chain_inner")
+    s.stopping = bool(doc.get("stopping"))
     for key, dst in (("files", s.files), ("chain_files", s.chain_files)):
         files_doc = doc.get(key)
         if isinstance(files_doc, dict):
@@ -757,6 +779,10 @@ class RunnerView(PrintView):
 
     def wip_patch(self, patch_text):
         self.stats.on_wip_patch(patch_text)
+        self._save()
+
+    def loop_stopping(self):
+        self.stats.stopping = True
         self._save()
 
     def usage_summary(self, turns, usage, cost):

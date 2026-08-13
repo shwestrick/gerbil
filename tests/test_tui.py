@@ -283,6 +283,9 @@ def test_render_stats() -> None:
     check("unknown window shows raw tokens",
           "123,456 tokens (window unknown)" in out3, out3)
     check("no ralph rows for a single session", "ralph" not in out3, out3)
+    check("running status always shown", "running" in out3, out3)
+    check("gap after the banner (trailing blank line)",
+          out3.endswith("\n"), repr(out3[-20:]))
 
 
 def test_file_summary() -> None:
@@ -393,11 +396,33 @@ def test_render_stats_finished() -> None:
     with contextlib.redirect_stderr(io.StringIO()):
         out = render_stats(stats, 40, now=9_999.0)
     check("paused banner", "paused: press c to continue" in out, out)
+    check("paused replaces running", "running" not in out, out)
     stats.interrupt_requested = True
     with contextlib.redirect_stderr(io.StringIO()):
         out = render_stats(stats, 40, now=9_999.0)
     check("interrupt banner outranks paused", "interrupting" in out
           and "paused:" not in out, out)
+
+    # "stopping loop..." -- the ralph_done check passed and only teardown
+    # remains. Beats paused/running; outranked by interrupt and finished.
+    stats.interrupt_requested = False
+    stats.stopping = True
+    with contextlib.redirect_stderr(io.StringIO()):
+        out = render_stats(stats, 40, now=9_999.0)
+    check("stopping banner outranks paused",
+          "stopping loop..." in out and "paused:" not in out
+          and "running" not in out, out)
+    stats.interrupt_requested = True
+    with contextlib.redirect_stderr(io.StringIO()):
+        out = render_stats(stats, 40, now=9_999.0)
+    check("interrupt outranks stopping",
+          "interrupting" in out and "stopping loop" not in out, out)
+    stats.finished = "complete"
+    stats.finished_at = 60.0
+    with contextlib.redirect_stderr(io.StringIO()):
+        out = render_stats(stats, 40, now=9_999.0)
+    check("finished outranks stopping",
+          "session complete" in out and "stopping loop" not in out, out)
 
 
 def test_resolve_theme() -> None:
@@ -590,6 +615,7 @@ def test_runner_view() -> None:
         ("result_line", lambda v: v.result_line("session: /tmp/x")),
         ("usage_summary", lambda v: v.usage_summary(
             1, Usage(input_tokens=10, output_tokens=1), None)),
+        ("loop_stopping", lambda v: v.loop_stopping()),
     ]
     for label, call in cases:
         got, _ = _capture(lambda: call(rv))
@@ -622,6 +648,12 @@ def test_runner_view() -> None:
           s.turns == 1 and s.files == {"A.lean": (1, 0)}
           and s.session_name == "gerbil-x-01" and s.run_name == "brave-otter",
           str(doc["stats"]))
+    check("session_begin cleared an earlier stopping flag",
+          s.stopping is False, str(doc["stats"]))
+    rv.loop_stopping()
+    doc = json.loads((d / "stats.json").read_text())
+    check("loop_stopping persists immediately",
+          stats_from_wire(doc["stats"]).stopping is True, str(doc["stats"]))
     # (the byte-compat sweep above also exercised result_line/usage_summary,
     # so the tail holds those entries too -- assert on the latest pair)
     check("tail carried in the doc", len(doc["tail"]) >= 2
