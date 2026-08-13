@@ -56,7 +56,7 @@ import tomllib
 from datetime import datetime
 from pathlib import Path
 
-from . import runs, runtime
+from . import fill_sorry, runs, runtime
 from .agent import DEFAULT_INNER_MAX_TURNS, run_session
 from .context_windows import OBSERVATIONS_PATH, table_drift
 from .pricing import (
@@ -333,8 +333,23 @@ def main() -> None:
     run_p.add_argument(
         "--prompt",
         metavar="FILE",
-        help="Path to a file containing the task description (required). To "
-        "continue a crashed session instead, use `gerbil resume`.",
+        help="Path to a file containing the task description (required, "
+        "unless --fill-sorry generates one). To continue a crashed session "
+        "instead, use `gerbil resume`.",
+    )
+    run_p.add_argument(
+        "--fill-sorry",
+        dest="fill_sorry",
+        metavar="POS[,POS..]|SPEC.toml",
+        default=None,
+        help="Fill specific Lean sorries: each POS is FILE:LINE[:COL] "
+        "(project-root-relative, 1-indexed), or give a path to a TOML task "
+        "spec (keys: sorries, off_limits, axioms, forbid, approach, plan, "
+        "check_timeout, ralph). gerbil generates the task prompt, a "
+        "cross-session plan file under .gerbil/plans/, and the termination "
+        f"check, and defaults to --ralph {fill_sorry.DEFAULT_RALPH}. With "
+        "--prompt FILE, the file's text becomes approach notes spliced into "
+        "the generated prompt.",
     )
     run_p.add_argument(
         "--model",
@@ -1418,9 +1433,14 @@ def _session_view(args) -> SessionView:
 
 
 def cmd_run(args) -> None:
-    if not args.prompt:
-        sys.exit("error: --prompt is required "
+    if not args.prompt and not args.fill_sorry:
+        sys.exit("error: --prompt (or --fill-sorry) is required "
                  "(to continue a crashed session, use `gerbil resume SESSION_FILE`).")
+    if args.fill_sorry and args.ralph_done:
+        sys.exit("error: --ralph_done is incompatible with --fill-sorry: the "
+                 "generated goal check IS the termination check, and replacing "
+                 "it would silently drop the mode's enforcement. Tune the "
+                 "check through a --fill-sorry spec file instead.")
     if args.ralph is not None and args.ralph < 1:
         sys.exit("error: --ralph N must be >= 1")
     if args.zoom_max_turns is not None and not args.small_model:
@@ -1433,7 +1453,7 @@ def cmd_run(args) -> None:
     )
 
     project_dir = _resolve_at(args.at)
-    prompt_file = Path(args.prompt).resolve()
+    prompt_file = Path(args.prompt).resolve() if args.prompt else None
 
     if not project_dir.is_dir():
         sys.exit(f"error: {project_dir} is not a directory")
@@ -1443,8 +1463,14 @@ def cmd_run(args) -> None:
     _require_clean_submodules(repo_root)
     _require_container_runtime()
     _warn_context_window_drift()
-    if not prompt_file.is_file():
+    if prompt_file is not None and not prompt_file.is_file():
         sys.exit(f"error: {prompt_file} is not a file")
+    spec, fs_excerpts = _load_fill_sorry_spec(args, project_dir, repo_root)
+    if spec is not None and args.ralph is None:
+        # --fill-sorry defaults to a ralph loop: the generated check is what
+        # gates it. Spec `ralph` first, then the mode default; an explicit
+        # --ralph always wins.
+        args.ralph = spec.ralph if spec.ralph else fill_sorry.DEFAULT_RALPH
     theme = _resolve_theme(project_dir)  # validated pre-spawn, like the rest
 
     # TUI mode never runs the session here: with the preflight passed on the
@@ -1456,7 +1482,25 @@ def cmd_run(args) -> None:
         _spawn_and_attach(project_dir=project_dir, model=args.model,
                           theme=theme)
 
-    prompt = prompt_file.read_text()
+    if spec is not None:
+        # The task prompt is generated; a --prompt file, when given, supplies
+        # the APPROACH notes instead (overriding the spec's own approach).
+        if prompt_file is not None:
+            spec.approach = prompt_file.read_text().strip()
+        fs_plan = fill_sorry.plan_name(spec)
+        fs_subdir = fill_sorry.project_subdir(project_dir, repo_root)
+        fs_plan_rel = f".gerbil/plans/{fs_plan}"  # project-relative
+        prompt = fill_sorry.build_prompt(
+            spec, plan_rel=fs_plan_rel, excerpts=fs_excerpts)
+        if prompt_file is None:
+            # Recorded in session_start for provenance only (resume takes the
+            # prompt from the first user turn): the spec file when one was
+            # given, else a marker naming the CLI positions.
+            prompt_file = (Path(args.fill_sorry).resolve()
+                           if args.fill_sorry.endswith(".toml")
+                           else Path(f"fill-sorry:{args.fill_sorry}"))
+    else:
+        prompt = prompt_file.read_text()
     timestamp = datetime.now().strftime("%y%m%d-%H%M%S")
     iterations = args.ralph if args.ralph else 1
     width = max(2, len(str(iterations)))
@@ -1506,6 +1550,21 @@ def cmd_run(args) -> None:
                 chain_base = sandbox.head() if args.ralph else ""
                 ancestors: list[str] = []
 
+                # --fill-sorry: with the base commit known, generate the
+                # termination check pinned to it, arm the plan-file
+                # containment (see sandbox._reset_internal_paths), and seed
+                # the container's plan file from the host copy of a previous
+                # run of this same task (or the fresh header).
+                if spec is not None:
+                    sandbox.internal_paths = [
+                        f"{fs_subdir}/.gerbil/plans" if fs_subdir
+                        else ".gerbil/plans"
+                    ]
+                    ralph_done_script = fill_sorry.build_check_script(
+                        spec, base=chain_base, subdir=fs_subdir)
+                    _upload_plan_file(sandbox, project_dir, fs_plan_rel,
+                                      spec, fs_plan)
+
                 # The whole (ralph) loop runs under one view -- the TUI spans
                 # the chain exactly like the sandbox and MCP client above it,
                 # while the preflight/boot output above stayed on the plain
@@ -1547,6 +1606,10 @@ def cmd_run(args) -> None:
                                 inner_max_turns if args.small_model else None
                             ),
                             image=image,
+                            fill_sorry=(
+                                fill_sorry.session_meta(spec, fs_plan)
+                                if spec is not None else None
+                            ),
                         )
                         if mcp_warning:
                             session.record_warning(mcp_warning)
@@ -1583,12 +1646,26 @@ def cmd_run(args) -> None:
                         if patch_name and args.ralph:
                             ancestors.append(patch_name)
 
+                        # --fill-sorry: bring the plan file home (before the
+                        # gate, so an aborting gate still saves it), then
+                        # refuse a patch that touches an off-limits path.
+                        if spec is not None:
+                            _download_plan_file(sandbox, project_dir,
+                                                fs_plan_rel, fs_plan, view)
+                            _enforce_off_limits(
+                                sandbox, spec.off_limits, fs_subdir,
+                                session_base, patch_path, view)
+
                         # Optionally run the user's termination check on this session's
                         # committed tree. Skip it on the final iteration (nothing left
                         # to skip) -- the loop ends anyway.
                         if ralph_done_script and i < iterations:
                             view.notice("", newline_before=False)
-                            if _ralph_done(sandbox, ralph_done_script, view):
+                            if _ralph_done(
+                                sandbox, ralph_done_script, view,
+                                timeout=(spec.check_timeout if spec is not None
+                                         else 300.0),
+                            ):
                                 break
 
                 _sessions(_session_view(args))
@@ -1737,6 +1814,15 @@ def cmd_resume(args) -> None:
         print(style(
             f"using --ralph_done check recorded in {resume_file.name}", "gray",
         ), flush=True)
+    # --fill-sorry survives a resume: the recorded metadata re-arms the plan
+    # file and the patch gate (the generated check script already rides in
+    # ralph_done_script above).
+    fs_spec = (fill_sorry.spec_from_meta(parsed.fill_sorry)
+               if parsed.fill_sorry else None)
+    if fs_spec is not None:
+        fs_plan = fill_sorry.plan_name(fs_spec)
+        fs_subdir = fill_sorry.project_subdir(project_dir, repo_root)
+        fs_plan_rel = f".gerbil/plans/{fs_plan}"
     # The session-log setting survives a resume: inherit the choice recorded in
     # the log, and let `gerbil resume --omit-session-log` still force it off.
     include_session = parsed.include_session and not args.omit_session_log
@@ -1811,6 +1897,18 @@ def cmd_resume(args) -> None:
                 # Rebuild the committed history this session started from.
                 _rebuild_base(sandbox, anchor, ancestor_patches)
 
+                # --fill-sorry: re-arm the plan-file containment and re-seed
+                # the container's plan from the host copy (the crashed run
+                # downloaded it after each *finished* session; a mid-session
+                # crash loses only that session's plan edits).
+                if fs_spec is not None:
+                    sandbox.internal_paths = [
+                        f"{fs_subdir}/.gerbil/plans" if fs_subdir
+                        else ".gerbil/plans"
+                    ]
+                    _upload_plan_file(sandbox, project_dir, fs_plan_rel,
+                                      fs_spec, fs_plan)
+
                 # `ancestors` for the continuation: the original prior patches,
                 # then each session we (re)produce here, so the new logs stay
                 # resumable across the resume boundary.
@@ -1866,6 +1964,7 @@ def cmd_resume(args) -> None:
                                 inner_max_turns if parsed.small_model else None
                             ),
                             image=image,
+                            fill_sorry=parsed.fill_sorry,
                         )
                         view.session_begin(
                             name=name, model=parsed.model,
@@ -1933,10 +2032,23 @@ def cmd_resume(args) -> None:
                         if patch_name and ralph:
                             running_ancestors.append(patch_name)
 
+                        # --fill-sorry: plan home first (an aborting gate must
+                        # not lose it), then the off-limits patch gate.
+                        if fs_spec is not None:
+                            _download_plan_file(sandbox, project_dir,
+                                                fs_plan_rel, fs_plan, view)
+                            _enforce_off_limits(
+                                sandbox, fs_spec.off_limits, fs_subdir,
+                                iter_base, patch_path, view)
+
                         # Same termination check as a fresh run; skip on the last iter.
                         if ralph_done_script and i < total_iters:
                             view.notice("", newline_before=False)
-                            if _ralph_done(sandbox, ralph_done_script, view):
+                            if _ralph_done(
+                                sandbox, ralph_done_script, view,
+                                timeout=(fs_spec.check_timeout
+                                         if fs_spec is not None else 300.0),
+                            ):
                                 break
 
                 _sessions(_session_view(args))
@@ -2264,13 +2376,110 @@ def _load_ralph_done_script(path_str: str | None, *, have_ralph: bool) -> str | 
     return p.read_text()
 
 
-def _ralph_done(sandbox, script: str, view: SessionView) -> bool:
+def _load_fill_sorry_spec(args, project_dir, repo_root):
+    """Parse and validate --fill-sorry: a comma-separated position list, or a
+    path to a TOML task spec (anything ending in .toml -- deterministic, no
+    stat-based guessing). Returns (spec, excerpts); (None, {}) when the flag
+    is absent. Exits on any error; warnings are printed and the run proceeds.
+    Runs at preflight, before the sandbox boots, like every other validation
+    -- and re-runs harmlessly in the TUI's detached runner child, since the
+    tree is clean and the spec is deterministic."""
+    if not args.fill_sorry:
+        return None, {}
+    try:
+        if args.fill_sorry.endswith(".toml"):
+            spec_path = Path(args.fill_sorry).resolve()
+            if not spec_path.is_file():
+                sys.exit(f"error: --fill-sorry spec {spec_path} is not a file")
+            spec = fill_sorry.load_spec(spec_path)
+        else:
+            spec = fill_sorry.spec_from_positions(
+                fill_sorry.parse_positions(args.fill_sorry))
+    except ValueError as exc:
+        sys.exit(f"error: --fill-sorry: {exc}")
+    errors, warnings, excerpts = fill_sorry.validate(
+        spec, project_dir=project_dir, repo_root=repo_root)
+    for w in warnings:
+        print(style(f"[fill-sorry: {w}]", "yellow"), flush=True)
+    if errors:
+        sys.exit("error: --fill-sorry:\n"
+                 + "".join(f"  - {e}\n" for e in errors).rstrip("\n"))
+    return spec, excerpts
+
+
+def _upload_plan_file(sandbox, project_dir, plan_rel: str, spec, plan: str) -> None:
+    """Seed the container's plan file for a --fill-sorry run: the host copy
+    left by a previous run of this same task (deterministic name, so the task
+    finds its own memory), or the fresh header. The plan file is untracked on
+    both sides on purpose -- it rides neither the upload tar nor any patch
+    (sandbox._reset_internal_paths guarantees the latter); gerbil carries it
+    itself. The .git/info/exclude entry just keeps it out of the agent's
+    `git status`; the index reset is the real containment."""
+    host = project_dir / ".gerbil" / "plans" / plan
+    content = (host.read_text() if host.is_file()
+               else fill_sorry.seed_plan(spec, plan))
+    sandbox.write_file(plan_rel, content)
+    sandbox.run(
+        'g="$(git rev-parse --absolute-git-dir)" && mkdir -p "$g/info" '
+        '&& echo ".gerbil/" >> "$g/info/exclude"'
+    )
+
+
+def _download_plan_file(sandbox, project_dir, plan_rel: str, plan: str,
+                        view: SessionView) -> None:
+    """Bring the plan file home after a --fill-sorry session, so the next
+    invocation of the same task (in a fresh container) inherits it. Called
+    after every session of a ralph chain: the chain shares one container, but
+    a crash mid-chain must not lose the finished sessions' notes."""
+    try:
+        content = sandbox.read_file(plan_rel)
+    except FileNotFoundError:
+        view.notice(style(
+            f"[fill-sorry: plan file {plan_rel} is gone from the container "
+            "-- nothing saved for the next run]", "yellow"),
+            newline_before=False)
+        return
+    plans = project_dir / ".gerbil" / "plans"
+    plans.mkdir(parents=True, exist_ok=True)
+    (plans / plan).write_text(content)
+
+
+def _enforce_off_limits(sandbox, off_limits: list[str], subdir: str,
+                        base: str, patch_path: Path,
+                        view: SessionView) -> None:
+    """The --fill-sorry patch gate: the last of the mode's three enforcement
+    layers (prompt prose, the generated check's pinning sweep, and this). The
+    patch is gerbil's output contract, so this is the actual guarantee: a
+    session whose patch touches an off-limits path does not get to end
+    quietly. The patch is deliberately kept -- the user may want to see what
+    the agent tried -- and SystemExit unwinds the sandbox/MCP context
+    managers cleanly past cmd_run's except clause (it is a BaseException the
+    handler does not name)."""
+    if not off_limits:
+        return
+    violations = fill_sorry.gate_violations(
+        sandbox.changed_paths(base), off_limits, subdir)
+    if not violations:
+        return
+    view.notice(style(
+        "[fill-sorry: this session's patch touches off-limits path(s)]",
+        "bold", "red"), newline_before=False)
+    sys.exit(
+        "error: --fill-sorry: this session's patch touches off-limits path(s):\n"
+        + "".join(f"  {p}\n" for p in violations)
+        + f"The patch is kept for inspection at {patch_path} -- do not "
+        "`gerbil commit` it as-is."
+    )
+
+
+def _ralph_done(sandbox, script: str, view: SessionView,
+                timeout: float = 300.0) -> bool:
     """Run the --ralph_done check inside the container on the session's committed
     tree. Exit code 0 means the loop is finished (return True to stop); any other
     code means keep going. The script's output is shown either way."""
     view.notice(style("running --ralph_done check...", "bold", "magenta"),
                 newline_before=False)
-    result = sandbox.run_script(script)
+    result = sandbox.run_script(script, timeout=timeout)
     out = (result.stdout + result.stderr).strip()
     if out:
         view.notice(style(out.replace("\n", "\n  "), "gray"),
@@ -2296,6 +2505,8 @@ def _run_footer(args, iteration=None, total=None) -> str:
     ]
     if getattr(args, "small_model", None):
         lines.append(f"--small-model {args.small_model}")
+    if getattr(args, "fill_sorry", None):
+        lines.append(f"--fill-sorry {args.fill_sorry}")
     if iteration is not None:
         lines.append(f"--ralph (session {iteration}/{total})")
     return "\n".join(lines)

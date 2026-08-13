@@ -20,6 +20,9 @@ run. These pages go deeper.
   `gerbil cleanup`.
 - **[Ralph loops](ralph.md)** -- running the same prompt across many
   back-to-back sessions with `--ralph`.
+- **[Filling sorries](fill-sorry.md)** -- `--fill-sorry`: point gerbil at
+  specific `sorry`s and let it generate the prompt, plan file, and goal
+  check itself.
 - **[Big-small mode](big-small.md)** -- a big model driving the session and
   delegating individual `sorry`s to a smaller, cheaper one.
 - **[Resuming and reconstructing](resume.md)** -- recovering a session that

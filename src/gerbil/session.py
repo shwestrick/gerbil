@@ -54,6 +54,7 @@ class Session:
         small_model: str | None = None,
         inner_max_turns: int | None = None,
         image: str = "",
+        fill_sorry: dict[str, Any] | None = None,
     ):
         self.path = path
         self.model = model
@@ -67,6 +68,7 @@ class Session:
         self.small_model = small_model
         self.inner_max_turns = inner_max_turns
         self.image = image
+        self.fill_sorry = fill_sorry
         self._total_input_tokens = 0
         self._total_output_tokens = 0
         self._total_thinking_tokens = 0
@@ -110,6 +112,13 @@ class Session:
         # it (a command-line --ralph_done still overrides).
         if ralph_done_script is not None:
             start["ralph_done_script"] = ralph_done_script
+        # In --fill-sorry mode: {sorries, off_limits, axioms, forbid, plan,
+        # check_timeout} (see fill_sorry.session_meta). What `gerbil resume`
+        # needs to rehydrate the mode -- the patch gate's off_limits, the plan
+        # file to re-upload, the check timeout. The generated check script
+        # itself rides in ralph_done_script above.
+        if fill_sorry is not None:
+            start["fill_sorry"] = fill_sorry
         # Big-small mode: the small (zoom) model and the per-zoom turn cap,
         # recorded so `gerbil resume` inherits them without the user
         # re-supplying either (like model and include_session above).

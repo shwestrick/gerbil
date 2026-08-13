@@ -51,6 +51,11 @@ src/gerbil/
   agent.py              the agent loop (run_session) and transient-error retry
   prompts.py            system/task prompt text + build_system_prompt, plus the
                         context-pressure thresholds and their notes
+  fill_sorry.py         the --fill-sorry mode: position/TOML-spec parsing and
+                        validation, the generated task prompt + check-goal
+                        script, plan-file naming, and the off-limits glob
+                        matching shared by the generated check and cli.py's
+                        patch gate. Pure except validate() (host file reads)
   pricing.py            MODEL_PRICING table and cost estimation (N/A when unknown)
   context_windows.py    everything about a model's context window: the static
                         CONTEXT_WINDOWS table (snapshot of benchlm.ai/llm-pricing)
@@ -192,6 +197,20 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   It is append-only (last line wins) like a session log, and every read is
   failure-tolerant — a corrupt line is skipped and an unwritable home costs the
   observation, never the session.
+- **gerbil's in-container bookkeeping never reaches a patch.** The
+  --fill-sorry plan file lives untracked at `.gerbil/plans/` in the container;
+  `sandbox._reset_internal_paths` resets `sandbox.internal_paths` out of the
+  index right after `_reset_submodule_state` in both `squash_commit` and
+  `wip_patch`, so the squash/wip index is built purely from `add -A` plus
+  these resets -- airtight even against an agent's `git add -f`, exactly like
+  the submodule invariant above. The host copy in `<project>/.gerbil/plans/`
+  is what persists across runs; gerbil uploads/downloads it itself
+  (`cli._upload_plan_file`/`_download_plan_file`). The off-limits *patch gate*
+  (`cli._enforce_off_limits` over `sandbox.changed_paths`) is the mode's real
+  output guarantee -- prompt prose and the generated check are the earlier,
+  softer layers. Host gate and in-container check share one glob semantics
+  (fnmatch, `*` crosses `/`; bash `[[ == ]]` agrees) via
+  `fill_sorry.normalize_off_limits` -- don't let them drift apart.
 - **Built-in tool names win** over colliding MCP tool names (today none collide).
 - **Tool output is truncated once** (`tools.truncate_tool_output`, 10k chars,
   head+tail) and the *same* truncated text is what the model sees and what the log
@@ -227,8 +246,9 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
 ## Subcommands
 
 - `gerbil run --prompt FILE [--model M] [--small-model M] [--zoom-max-turns N]
-  [--ralph N] [--ralph_done SCRIPT] [--max-turns N] [--image IMAGE]
-  [--skip-cache] [--no-mcp] [--omit-session-log] [--plain]`
+  [--fill-sorry POS[,POS..]|SPEC.toml] [--ralph N] [--ralph_done SCRIPT]
+  [--max-turns N] [--image IMAGE] [--skip-cache] [--no-mcp]
+  [--omit-session-log] [--plain]`
 - `gerbil resume LOG [--at DIR] [--max-turns N] [--zoom-max-turns N] [--image
   IMAGE] [--skip-cache] [--no-mcp] [--ralph_done SCRIPT] [--omit-session-log]
   [--plain]` —
@@ -311,6 +331,28 @@ in one sandbox, each building on the previous one's commit. Each session records
 its `chain_base` + ordered `ancestors` (prior patches) so any mid-chain session
 is independently resumable. `--ralph_done SCRIPT` runs in-container after each
 session; exit 0 stops the loop.
+
+**Fill-sorry mode** (`--fill-sorry FILE:LINE[:COL],...` or `--fill-sorry
+SPEC.toml`): "prove these sorries" as a generated task. gerbil builds the task
+prompt, a cross-session plan file, and a `--ralph_done`-style goal check
+scoped to **exactly the designated sorries**: each position is resolved to its
+enclosing declaration at preflight (`fill_sorry.resolve_decl`, a syntactic
+namespace-tracking scan; a spec entry `{ pos = ..., decl = ... }` overrides),
+and the check re-resolves the name against the live environment (rename or
+delete = hard failure) then runs `collectAxioms` on those declarations only --
+transitive, so a proof routed through a sorried helper still fails, while
+undesignated sorries in the same file never block the loop from stopping.
+Optional noncomputable/partial bans walk the designated declarations'
+dependency closure within the target modules; off-limits paths are pinned to
+the chain base. Defaults to `--ralph 10`. Everything lives in `fill_sorry.py`;
+cli.py wires it at preflight (parse/validate, `--prompt` becomes approach
+notes, `--ralph_done` is rejected) and around each session (plan upload via
+`sandbox.write_file` / download via `read_file`, the off-limits patch gate on
+`sandbox.changed_paths`). The plan file at `<project>/.gerbil/plans/<name>.md`
+(name deterministic from the sorry list) is untracked on both sides and is
+carried by gerbil itself; `session_start` records a `fill_sorry` dict (like
+`ralph`) so `gerbil resume` rehydrates the mode with no flags. See
+docs/fill-sorry.md.
 
 **Resume** (`gerbil resume LOG`): recreate the session's git starting point (for
 a ralph chain, `git am` the recorded ancestor patches), reapply the `.wip.patch`,
@@ -417,6 +459,8 @@ uv run python tests/test_zoom_resume.py  # big-small resume + summarize accounti
 uv run python tests/test_submodule.py    # submodule upload + containment (phase 2 needs Docker)
 uv run python tests/test_image_config.py # image selection + compatibility check (phase 2 needs Docker)
 uv run python tests/test_mathlib_detect.py  # mathlib dependency detection (no Docker)
+uv run python tests/test_fill_sorry.py   # --fill-sorry: spec/position parsing, prompt +
+                                         # check generation, patch gate, metadata (no Docker)
 uv run python tests/test_summarize_lean.py  # summarize's lean-line deltas + running-total anchor (no Docker)
 uv run python tests/test_render.py       # terminal rendering
 uv run python tests/test_tui.py          # live view: stats model, wip-patch file

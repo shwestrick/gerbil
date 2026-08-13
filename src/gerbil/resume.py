@@ -54,6 +54,10 @@ class ParsedSession:
     # does NOT reuse it -- see Session's note at the recording site.
     image: str = ""
     inner_max_turns: int | None = None
+    # --fill-sorry mode's recorded metadata (see fill_sorry.session_meta),
+    # None for ordinary sessions. Resume uses it to re-upload the plan file
+    # and re-arm the patch gate; the check script rides in ralph_done_script.
+    fill_sorry: dict | None = None
     # Set when the log ends inside a zoomed-in sub-session (the crash happened
     # while the small model was working). The outer `messages` then end on the
     # assistant turn whose zoom_in call is still unanswered:
@@ -310,6 +314,7 @@ def parse_session(path: Path) -> ParsedSession:
         small_model=start.get("small_model"),
         image=start.get("image", ""),
         inner_max_turns=start.get("inner_max_turns"),
+        fill_sorry=start.get("fill_sorry"),
         pending_zoom=pending_zoom,
     )
 

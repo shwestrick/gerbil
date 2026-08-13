@@ -49,6 +49,10 @@ $ gerbil run --prompt ralph-prompt.md --ralph 20 --ralph_done ./no-sorries.sh
 This is the usual way to use `--ralph`: set `N` to a budget you're willing to
 spend and let the check end the run when the goal is met.
 
+For the common "prove these specific `sorry`s" task, you don't have to write
+the prompt or the check yourself: [`--fill-sorry`](fill-sorry.md) generates
+both (and a cross-session plan file) and defaults to a ralph loop.
+
 ## Resumability
 
 Each session records the chain's base commit and the ordered list of ancestor
