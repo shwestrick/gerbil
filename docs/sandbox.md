@@ -76,7 +76,7 @@ $ gerbil run --image my-lean-sandbox:v1 --prompt prompt.md
 `--image` works with `gerbil run`, `gerbil resume`, and
 `gerbil reconstruct-patch`.
 
-### Per-project configuration
+### Per-project and per-user configuration
 
 To make an image the default for one project, write it into that project's
 `.gerbil/config.toml`:
@@ -85,11 +85,17 @@ To make an image the default for one project, write it into that project's
 image = "my-lean-sandbox:v1"
 ```
 
-Image selection goes, highest precedence first: `--image`, then
-`.gerbil/config.toml`, then `GERBIL_SANDBOX_IMAGE`, then
-`gerbil-lean-sandbox:latest`. The project config deliberately outranks the
-environment, because the launcher *always* exports `GERBIL_SANDBOX_IMAGE` (its
-version-matched build) -- otherwise a project could never state its own image.
+The same keys may also live in a user-level `~/.gerbil/config.toml`, as your
+personal defaults across every project; a project's config always overrides
+the user's, key by key. (Today the keys are `image` and `theme`, the live
+view's color scheme.)
+
+Image selection goes, highest precedence first: `--image`, then the project's
+`.gerbil/config.toml`, then `~/.gerbil/config.toml`, then
+`GERBIL_SANDBOX_IMAGE`, then `gerbil-lean-sandbox:latest`. The config files
+deliberately outrank the environment, because the launcher *always* exports
+`GERBIL_SANDBOX_IMAGE` (its version-matched build) -- otherwise a project (or
+user) could never state its own image.
 
 The resolved image is recorded in the session log for provenance, but
 `gerbil resume` re-resolves rather than reusing it: gerbil's own image tag is

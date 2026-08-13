@@ -402,30 +402,59 @@ def test_render_stats_finished() -> None:
 
 def test_resolve_theme() -> None:
     """`theme` in .gerbil/config.toml: light/dark accepted, absence is None,
-    anything else is a preflight error."""
+    anything else is a preflight error; the user-level ~/.gerbil/config.toml
+    supplies a default the project config overrides."""
+    import os
     import tempfile
     from pathlib import Path
 
     from gerbil.cli import _resolve_theme
 
-    root = Path(tempfile.mkdtemp())
-    check("no config file -> default", _resolve_theme(root) is None, "")
-
-    cfg = root / ".gerbil"
-    cfg.mkdir()
-    (cfg / "config.toml").write_text('image = "custom:latest"\n')
-    check("config without theme -> default", _resolve_theme(root) is None, "")
-
-    for value in ("light", "dark"):
-        (cfg / "config.toml").write_text(f'theme = "{value}"\n')
-        check(f"theme {value} accepted", _resolve_theme(root) == value, "")
-
-    (cfg / "config.toml").write_text('theme = "solarized"\n')
+    tmp = Path(tempfile.mkdtemp())
+    home = tmp / "home"
+    (home / ".gerbil").mkdir(parents=True)
+    saved_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(home)  # hermetic: never read the developer's
     try:
-        _resolve_theme(root)
-        check("invalid theme rejected", False, "no SystemExit")
-    except SystemExit as exc:
-        check("invalid theme rejected", "light" in str(exc), str(exc))
+        root = tmp / "proj"
+        root.mkdir()
+        check("no config file -> default", _resolve_theme(root) is None, "")
+
+        cfg = root / ".gerbil"
+        cfg.mkdir()
+        (cfg / "config.toml").write_text('image = "custom:latest"\n')
+        check("config without theme -> default", _resolve_theme(root) is None, "")
+
+        for value in ("light", "dark"):
+            (cfg / "config.toml").write_text(f'theme = "{value}"\n')
+            check(f"theme {value} accepted", _resolve_theme(root) == value, "")
+
+        (cfg / "config.toml").write_text('theme = "solarized"\n')
+        try:
+            _resolve_theme(root)
+            check("invalid theme rejected", False, "no SystemExit")
+        except SystemExit as exc:
+            check("invalid theme rejected", "light" in str(exc), str(exc))
+
+        user_cfg = home / ".gerbil" / "config.toml"
+        user_cfg.write_text('theme = "light"\n')
+        (cfg / "config.toml").write_text('image = "custom:latest"\n')
+        check("user config supplies the default",
+              _resolve_theme(root) == "light", "")
+        (cfg / "config.toml").write_text('theme = "dark"\n')
+        check("project config overrides the user's",
+              _resolve_theme(root) == "dark", "")
+        user_cfg.write_text('theme = "solarized"\n')
+        (cfg / "config.toml").unlink()
+        try:
+            _resolve_theme(root)
+            check("invalid user theme rejected", False, "no SystemExit")
+        except SystemExit as exc:
+            check("invalid user theme rejected, naming the user config",
+                  str(home) in str(exc), str(exc))
+    finally:
+        if saved_home is not None:
+            os.environ["HOME"] = saved_home
 
 
 # ---------------------------------------------------------------------------

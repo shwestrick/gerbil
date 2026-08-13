@@ -48,9 +48,17 @@ def probe(*, missing=(), workspace="ok", uid=str(SANDBOX_UID), mcp=True) -> str:
 def phase_resolution() -> None:
     print("\n=== phase 1a: image resolution (no Docker) ===")
     saved = os.environ.pop("GERBIL_SANDBOX_IMAGE", None)
+    saved_home = os.environ.get("HOME")
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            proj = Path(tmp)
+            # Hermetic HOME: the resolution chain now consults the user-level
+            # ~/.gerbil/config.toml, which must be THIS test's, not the
+            # developer's.
+            home = Path(tmp) / "home"
+            (home / ".gerbil").mkdir(parents=True)
+            os.environ["HOME"] = str(home)
+            proj = Path(tmp) / "proj"
+            proj.mkdir()
             none = Namespace(image=None)
 
             check("falls back to gerbil's default image",
@@ -60,11 +68,30 @@ def phase_resolution() -> None:
             check("env (the launcher's build) beats the fallback",
                   _resolve_image(none, proj) == "launcher-built:abc123")
 
+            user_config = home / ".gerbil" / "config.toml"
+            user_config.write_text('image = "user-image:v9"\n')
+            check("user config beats the launcher's env",
+                  _resolve_image(none, proj) == "user-image:v9")
+
             (proj / ".gerbil").mkdir()
             config = proj / ".gerbil" / "config.toml"
             config.write_text('image = "project-image:v1"\n')
-            check("project config beats the launcher's env",
+            check("project config beats the user config",
                   _resolve_image(none, proj) == "project-image:v1")
+
+            user_config.write_text("image = 42\n")
+            check("a bad user value is shadowed by a project value",
+                  _resolve_image(none, proj) == "project-image:v1")
+            config.unlink()
+            try:
+                _resolve_image(none, proj)
+                check("bad user value exits when it is the one used",
+                      False, "no SystemExit")
+            except SystemExit as e:
+                check("bad user value exits naming the user config",
+                      str(home) in str(e), str(e))
+            user_config.unlink()
+            config.write_text('image = "project-image:v1"\n')
 
             check("--image beats the project config",
                   _resolve_image(Namespace(image="flag-image:v2"), proj)
@@ -106,6 +133,8 @@ def phase_resolution() -> None:
         os.environ.pop("GERBIL_SANDBOX_IMAGE", None)
         if saved is not None:
             os.environ["GERBIL_SANDBOX_IMAGE"] = saved
+        if saved_home is not None:
+            os.environ["HOME"] = saved_home
 
 
 # ----------------------------------------------------------------------

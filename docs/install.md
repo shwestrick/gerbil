@@ -72,7 +72,9 @@ Separately, gerbil maintains a per-project `.gerbil/` directory inside each
 project it runs on: `patches/` (session patches), `sessions/` (committed
 session logs), `plans/` (fill-sorry plan files), `tasks/` (`gerbil new-fill`
 task specs), and an optional
-[`config.toml`](sandbox.md#per-project-configuration).
+[`config.toml`](sandbox.md#per-project-and-per-user-configuration). A
+user-level `~/.gerbil/config.toml` can hold the same keys as personal
+defaults; a project's values win.
 
 ## Environment variables
 

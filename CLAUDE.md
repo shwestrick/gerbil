@@ -330,7 +330,9 @@ removes the registry entry and reprints the `session:`/`patch:`/usage tail
 any non-TTY stdout, skips all of this and runs in-process — byte-for-byte the
 pre-TUI output (PrintView pins it; see view.py). The view is display-only:
 what reaches the session log, the patch, and the model never depends on it.
-`theme = "light" | "dark"` in `<project>/.gerbil/config.toml` picks the
+`theme = "light" | "dark"` in `<project>/.gerbil/config.toml` (or the
+user-level `~/.gerbil/config.toml`, which every project config key falls
+back to -- `cli._config_value`) picks the
 viewer's color scheme (`cli._resolve_theme`, validated at preflight; default
 dark).
 
@@ -407,13 +409,15 @@ handles it.
 **Sandbox image** (`--image IMAGE`): a project may need pre-built artifacts, extra
 packages, or a pinned toolchain that gerbil's stock image does not carry, so the
 image is selectable. `cli._resolve_image` picks it, highest precedence first:
-`--image`, then `image = "..."` in `<project>/.gerbil/config.toml` (stdlib
-`tomllib`, read by `cli._project_config`; unknown keys ignored so the file can
-grow — `theme` for the live view also lives here), then
+`--image`, then `image = "..."` in `<project>/.gerbil/config.toml`, then the
+user-level `~/.gerbil/config.toml` (both stdlib `tomllib`, read through
+`cli._config_value` — project beats user key by key; unknown keys ignored so
+the files can grow — `theme` for the live view also lives here), then
 `GERBIL_SANDBOX_IMAGE` (what the launcher sets to its version-matched build),
-then `gerbil-lean-sandbox:latest` for direct dev use. The project config
-deliberately outranks the environment — the launcher *always* exports
-`GERBIL_SANDBOX_IMAGE`, so a project could otherwise never state its own image.
+then `gerbil-lean-sandbox:latest` for direct dev use. The config files
+deliberately outrank the environment — the launcher *always* exports
+`GERBIL_SANDBOX_IMAGE`, so a project (or user) could otherwise never state its
+own image.
 The resolved image is recorded on `session_start` for provenance, but `gerbil
 resume` re-resolves rather than reusing it: gerbil's own tag is version-pinned
 and the launcher's `remove_old_images` prunes superseded ones, so a recorded

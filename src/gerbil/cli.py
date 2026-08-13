@@ -214,21 +214,20 @@ def _resolve_image(args, project_dir: Path) -> str:
 
       1. --image on the command line
       2. `image = "..."` in <project>/.gerbil/config.toml
-      3. GERBIL_SANDBOX_IMAGE -- what the launcher sets to its version-matched
+      3. `image = "..."` in ~/.gerbil/config.toml (the user-level config)
+      4. GERBIL_SANDBOX_IMAGE -- what the launcher sets to its version-matched
          build, so gerbil's own image stays the default
-      4. the dev fallback, for `uv run python -m gerbil ...` with no launcher
+      5. the dev fallback, for `uv run python -m gerbil ...` with no launcher
 
-    A project config outranks the environment on purpose: the launcher always
-    exports GERBIL_SANDBOX_IMAGE, so a project that needs its own image could
-    otherwise never express it."""
+    The config files outrank the environment on purpose: the launcher always
+    exports GERBIL_SANDBOX_IMAGE, so a project (or user) that needs its own
+    image could otherwise never express it."""
     if getattr(args, "image", None):
         return args.image
 
-    settings = _project_config(project_dir)
-    image = settings.get("image")
+    image, config = _config_value(project_dir, "image")
     if image is not None:
         if not isinstance(image, str) or not image.strip():
-            config = project_dir / ".gerbil" / "config.toml"
             sys.exit(
                 f"error: `image` in {config} must be a non-empty string "
                 f"(got {image!r})."
@@ -238,12 +237,11 @@ def _resolve_image(args, project_dir: Path) -> str:
     return os.environ.get("GERBIL_SANDBOX_IMAGE", DEFAULT_SANDBOX_IMAGE)
 
 
-def _project_config(project_dir: Path) -> dict:
-    """The parsed <project>/.gerbil/config.toml, {} when there isn't one.
-    Unknown keys are deliberately ignored so the file can grow; a file that
-    exists but cannot be parsed is a hard error (silently dropping the user's
-    stated configuration would be worse)."""
-    config = project_dir / ".gerbil" / "config.toml"
+def _read_config(config: Path) -> dict:
+    """A parsed config.toml, {} when there isn't one. Unknown keys are
+    deliberately ignored so the file can grow; a file that exists but cannot
+    be parsed is a hard error (silently dropping the user's stated
+    configuration would be worse)."""
     if not config.exists():
         return {}
     try:
@@ -252,16 +250,36 @@ def _project_config(project_dir: Path) -> dict:
         sys.exit(f"error: could not read {config}:\n  {exc}")
 
 
+def _project_config(project_dir: Path) -> dict:
+    """The parsed <project>/.gerbil/config.toml (see _read_config)."""
+    return _read_config(project_dir / ".gerbil" / "config.toml")
+
+
+def _config_value(project_dir: Path, key: str):
+    """(value, config path) for a config key, from the project's
+    .gerbil/config.toml first and the user-level ~/.gerbil/config.toml as
+    the fallback -- a project states what the project needs, the user states
+    their own defaults. (None, None) when neither file sets the key. The
+    returned path is the file the value actually came from, so validation
+    errors point at the right one."""
+    for config in (project_dir / ".gerbil" / "config.toml",
+                   Path.home() / ".gerbil" / "config.toml"):
+        value = _read_config(config).get(key)
+        if value is not None:
+            return value, config
+    return None, None
+
+
 def _resolve_theme(project_dir: Path) -> str | None:
-    """The live view's color scheme: `theme = "light" | "dark"` in the project
-    config, None (textual's default dark) when unset. Validated here, at
-    preflight, so a typo fails before the sandbox boots rather than being
-    silently ignored on the finished screen. The plain view has no theme."""
-    theme = _project_config(project_dir).get("theme")
+    """The live view's color scheme: `theme = "light" | "dark"` in the
+    project config, then the user config, None (textual's default dark) when
+    neither sets it. Validated here, at preflight, so a typo fails before the
+    sandbox boots rather than being silently ignored on the finished screen.
+    The plain view has no theme."""
+    theme, config = _config_value(project_dir, "theme")
     if theme is None:
         return None
     if theme not in ("light", "dark"):
-        config = project_dir / ".gerbil" / "config.toml"
         sys.exit(
             f'error: `theme` in {config} must be "light" or "dark" '
             f"(got {theme!r})."
