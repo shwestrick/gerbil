@@ -260,12 +260,14 @@ def load_spec(path: Path) -> FillSorrySpec:
             problems.append("`plan` must be a non-empty string")
             plan = None
         else:
-            plan = plan.strip()
+            plan = plan.strip().removeprefix(".gerbil/plans/")
             if not plan.endswith(".md"):
                 plan += ".md"
             if "/" in plan or "\\" in plan or ".." in plan:
-                problems.append("`plan` must be a bare *.md filename "
-                                "(it lives in .gerbil/plans/)")
+                problems.append(
+                    "`plan` must be a bare *.md filename -- the plan always "
+                    "lives at .gerbil/plans/<name>.md"
+                )
                 plan = None
 
     check_timeout = data.get("check_timeout", DEFAULT_CHECK_TIMEOUT)
@@ -297,18 +299,32 @@ def load_spec(path: Path) -> FillSorrySpec:
 
 
 def plan_name(spec: FillSorrySpec) -> str:
-    """The plan file's name: the spec's override, or a deterministic
-    `fill-<slug>-<hash>.md`. Deterministic on purpose -- a second run of the
-    same task must find the same plan file and inherit its memory, while a
-    different sorry list gets a fresh one."""
+    """The plan file's project-root-relative path, always under
+    `.gerbil/plans/` -- gerbil's namespace in the repo, next to where the
+    folded session logs land: `.gerbil/plans/<name>.md`, with the name taken
+    from the spec's override or derived deterministically from the sorry
+    list. The plan is still patch-native: `.gerbil/` is conventionally
+    gitignored, so the squash/wip force-include it exactly the way the
+    session log is force-added, and its updates ship inside each session's
+    patch. Deterministic on purpose: a second run of the same task names the
+    same file and (once the earlier patches are committed) inherits its
+    memory, while a different sorry list gets a fresh one.
+
+    Tolerates a spec.plan that is already fully qualified -- that is how the
+    recorded metadata round-trips through spec_from_meta."""
     if spec.plan:
-        return spec.plan
-    slug = re.sub(r"[^a-z0-9]+", "-", Path(spec.sorries[0].file).stem.lower())
-    slug = slug.strip("-") or "task"
-    h = hashlib.sha256(
-        "\n".join(sorted(str(p) for p in spec.sorries)).encode()
-    ).hexdigest()[:8]
-    return f"fill-{slug}-{h}.md"
+        name = spec.plan
+    else:
+        slug = re.sub(r"[^a-z0-9]+", "-",
+                      Path(spec.sorries[0].file).stem.lower())
+        slug = slug.strip("-") or "task"
+        h = hashlib.sha256(
+            "\n".join(sorted(str(p) for p in spec.sorries)).encode()
+        ).hexdigest()[:8]
+        name = f"fill-{slug}-{h}.md"
+    if not name.startswith(".gerbil/plans/"):
+        name = f".gerbil/plans/{name}"
+    return name
 
 
 def module_of(path: str) -> str:
@@ -391,15 +407,30 @@ def resolve_decl(lines: list[str], line: int) -> tuple[str | None, str]:
     return ".".join(ns + [name]), ""
 
 
-def seed_plan(spec: FillSorrySpec, name: str) -> str:
-    """The plan file's initial content, written when no host copy exists."""
-    files = ", ".join(sorted({p.file for p in spec.sorries}))
+def seed_plan(spec: FillSorrySpec) -> str:
+    """The plan file's initial content. gerbil seeds it into the container at
+    the exact path the generated prompt names, so the agent never decides
+    where the plan lives -- it only ever reads and appends. The seed is
+    ordinary working-tree content: the session squash commits it, so it
+    enters the repository through the session's own patch like every other
+    new file, and it reaches the host only via `gerbil commit`."""
+    lines = "".join(
+        f"  - `{p}` (in `{spec.decls.get(str(p), '?')}`)\n"
+        for p in spec.sorries
+    )
     return (
-        f"# Plan: fill sorries in {files}\n"
-        f"<!-- {name}; maintained by the agent across gerbil sessions -->\n\n"
-        "Append a dated entry at the end of every session; never delete what\n"
-        "is already written. If this header is all there is, no session has\n"
-        "run yet.\n"
+        "# Plan: fill the designated sorries\n"
+        "\n"
+        "The task: resolve these sorries, designated as\n"
+        "FILE:LINE[:COLUMN] (as of the task's starting commit):\n"
+        "\n"
+        f"{lines}"
+        "\n"
+        "This file is the task's only cross-session memory, maintained by\n"
+        "the agent. Append a session entry at the end of every session --\n"
+        "what was done, what worked, what failed and why, and what to do\n"
+        "next. Never delete this file or earlier entries. If there are no\n"
+        "session entries below, no session has run yet.\n"
     )
 
 
@@ -549,14 +580,22 @@ def validate(
                 "the agent is told to leave them alone"
             )
 
-    plan_rel = posixpath.join(subdir, ".gerbil", "plans", plan_name(spec)) \
-        if subdir else posixpath.join(".gerbil", "plans", plan_name(spec))
-    if plan_rel in tracked:
+    # The plan file lives at .gerbil/plans/<name>.md and its updates ship
+    # inside each session's patch (force-included past the conventional
+    # .gerbil gitignore, exactly like the folded session log). The one state
+    # that would silently break the memory chain: an existing host copy the
+    # patch chain does not know about -- invisible to the upload (untracked
+    # files never enter the sandbox), and colliding with `git am` when a
+    # patch later creates its own. A *tracked* plan file is simply a
+    # continuing task.
+    plan = plan_name(spec)
+    plan_repo = posixpath.join(subdir, plan) if subdir else plan
+    if plan_repo not in tracked and (project_dir / plan).exists():
         errors.append(
-            f"the plan file {plan_rel} is tracked by git -- gerbil manages it "
-            "outside the repository history (it is reset out of every patch), "
-            "so a tracked copy would be reverted in each session. Untrack it "
-            "or set `plan` in the spec to another name."
+            f"the plan file {plan} exists but is not tracked by git -- the "
+            "agent would never see it, and the patch that creates its own "
+            "copy would collide with it at `gerbil commit`. Commit it or "
+            "remove it (or set `plan` in the spec to another name)."
         )
 
     spec.sorries = deduped
@@ -643,9 +682,11 @@ def build_prompt(
         "this same task: it is your own work handed forward, not part of the "
         "specification -- edit it, restate it, or delete it freely.\n"
         "\n"
-        f"  * `{plan_rel}` -- the running plan (see RULES). gerbil carries "
-        "this file between sessions itself; it is not part of the repository "
-        "and never appears in your patch.\n"
+        f"  * `{plan_rel}` -- the running plan (see RULES), already present "
+        "in the working tree at exactly that path. An ordinary repository "
+        "file: it is committed with your work, ships in your patch, and is "
+        "how this task remembers anything between sessions. Do not move it "
+        "or start another plan file elsewhere.\n"
         "\n"
         "## GOAL\n"
         "\n"
@@ -712,12 +753,14 @@ def build_prompt(
         )
     out.append(
         f"  * **Keep `{plan_rel}`.** Begin every session by reading it; if "
-        "it contains only the header, you are the first session. End every "
-        "session by appending: what you did, the approach you settled on and "
-        "why, what you tried that did NOT work and why, and what to do next. "
-        "Never delete what is already written there; accumulate. The next "
-        "session cannot see this one -- that file is the only thing that "
-        "carries over.\n"
+        "it holds no session entries yet, you are the first session. End "
+        "every session by appending an entry: what you did, the approach "
+        "you settled on and why, what you tried that did NOT work and why, "
+        "and what to do next. Never delete the file or what is already "
+        "written there; accumulate. Leave it in the working tree like any "
+        "other file -- it is committed with your work. The next session "
+        "cannot see this one; that file is the only thing that carries "
+        "over.\n"
         "  * When you finish a session the project must build without "
         "errors. A remaining `sorry` is far better than a broken proof.\n"
         "  * Store temporary files in /tmp via mktemp; leave none in the "

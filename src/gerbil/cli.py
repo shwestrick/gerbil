@@ -47,6 +47,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -346,8 +347,9 @@ def main() -> None:
         "(project-root-relative, 1-indexed), or give a path to a TOML task "
         "spec (keys: sorries, off_limits, axioms, forbid, approach, plan, "
         "check_timeout, ralph). gerbil generates the task prompt, a "
-        "cross-session plan file under .gerbil/plans/, and the termination "
-        f"check, and defaults to --ralph {fill_sorry.DEFAULT_RALPH}. With "
+        "cross-session plan file (at .gerbil/plans/, shipped inside the "
+        "patches), and the termination check, and defaults to --ralph "
+        f"{fill_sorry.DEFAULT_RALPH}. With "
         "--prompt FILE, the file's text becomes approach notes spliced into "
         "the generated prompt.",
     )
@@ -1489,9 +1491,8 @@ def cmd_run(args) -> None:
             spec.approach = prompt_file.read_text().strip()
         fs_plan = fill_sorry.plan_name(spec)
         fs_subdir = fill_sorry.project_subdir(project_dir, repo_root)
-        fs_plan_rel = f".gerbil/plans/{fs_plan}"  # project-relative
         prompt = fill_sorry.build_prompt(
-            spec, plan_rel=fs_plan_rel, excerpts=fs_excerpts)
+            spec, plan_rel=fs_plan, excerpts=fs_excerpts)
         if prompt_file is None:
             # Recorded in session_start for provenance only (resume takes the
             # prompt from the first user turn): the spec file when one was
@@ -1551,19 +1552,18 @@ def cmd_run(args) -> None:
                 ancestors: list[str] = []
 
                 # --fill-sorry: with the base commit known, generate the
-                # termination check pinned to it, arm the plan-file
-                # containment (see sandbox._reset_internal_paths), and seed
-                # the container's plan file from the host copy of a previous
-                # run of this same task (or the fresh header).
+                # termination check pinned to it, and make sure the plan
+                # file exists at the exact path the prompt names -- the
+                # agent must never have to pick a location for it.
                 if spec is not None:
-                    sandbox.internal_paths = [
-                        f"{fs_subdir}/.gerbil/plans" if fs_subdir
-                        else ".gerbil/plans"
-                    ]
                     ralph_done_script = fill_sorry.build_check_script(
                         spec, base=chain_base, subdir=fs_subdir)
-                    _upload_plan_file(sandbox, project_dir, fs_plan_rel,
-                                      spec, fs_plan)
+                    # The plan lives under .gerbil/ (conventionally
+                    # gitignored), so every squash/wip force-includes it --
+                    # that is what makes its updates ship in the patches.
+                    sandbox.force_include = [
+                        f"{fs_subdir}/{fs_plan}" if fs_subdir else fs_plan]
+                    _seed_plan_file(sandbox, spec, fs_plan)
 
                 # The whole (ralph) loop runs under one view -- the TUI spans
                 # the chain exactly like the sandbox and MCP client above it,
@@ -1646,12 +1646,9 @@ def cmd_run(args) -> None:
                         if patch_name and args.ralph:
                             ancestors.append(patch_name)
 
-                        # --fill-sorry: bring the plan file home (before the
-                        # gate, so an aborting gate still saves it), then
-                        # refuse a patch that touches an off-limits path.
+                        # --fill-sorry: refuse a patch touching an
+                        # off-limits path.
                         if spec is not None:
-                            _download_plan_file(sandbox, project_dir,
-                                                fs_plan_rel, fs_plan, view)
                             _enforce_off_limits(
                                 sandbox, spec.off_limits, fs_subdir,
                                 session_base, patch_path, view)
@@ -1820,9 +1817,8 @@ def cmd_resume(args) -> None:
     fs_spec = (fill_sorry.spec_from_meta(parsed.fill_sorry)
                if parsed.fill_sorry else None)
     if fs_spec is not None:
-        fs_plan = fill_sorry.plan_name(fs_spec)
         fs_subdir = fill_sorry.project_subdir(project_dir, repo_root)
-        fs_plan_rel = f".gerbil/plans/{fs_plan}"
+        fs_plan = fill_sorry.plan_name(fs_spec)
     # The session-log setting survives a resume: inherit the choice recorded in
     # the log, and let `gerbil resume --omit-session-log` still force it off.
     include_session = parsed.include_session and not args.omit_session_log
@@ -1895,19 +1891,12 @@ def cmd_resume(args) -> None:
                 toolset = Toolset(sandbox, mcp, ralph=bool(ralph))
 
                 # Rebuild the committed history this session started from.
+                # (The --fill-sorry plan file needs no rebuilding of its own:
+                # the ancestor patches and the wip patch below carry it.)
                 _rebuild_base(sandbox, anchor, ancestor_patches)
-
-                # --fill-sorry: re-arm the plan-file containment and re-seed
-                # the container's plan from the host copy (the crashed run
-                # downloaded it after each *finished* session; a mid-session
-                # crash loses only that session's plan edits).
                 if fs_spec is not None:
-                    sandbox.internal_paths = [
-                        f"{fs_subdir}/.gerbil/plans" if fs_subdir
-                        else ".gerbil/plans"
-                    ]
-                    _upload_plan_file(sandbox, project_dir, fs_plan_rel,
-                                      fs_spec, fs_plan)
+                    sandbox.force_include = [
+                        f"{fs_subdir}/{fs_plan}" if fs_subdir else fs_plan]
 
                 # `ancestors` for the continuation: the original prior patches,
                 # then each session we (re)produce here, so the new logs stay
@@ -1943,6 +1932,13 @@ def cmd_resume(args) -> None:
                                     "continuing from the base commit only.",
                                     newline_before=False, stderr=True,
                                 )
+
+                        # --fill-sorry: the plan file must exist at the path
+                        # the (replayed) prompt names. Seed only now -- after
+                        # the wip patch, which may itself carry the plan --
+                        # so a rebuilt copy is never clobbered.
+                        if fs_spec is not None:
+                            _seed_plan_file(sandbox, fs_spec, fs_plan)
 
                         ralph_meta = {
                             "iteration": i, "total": total_iters,
@@ -2032,11 +2028,8 @@ def cmd_resume(args) -> None:
                         if patch_name and ralph:
                             running_ancestors.append(patch_name)
 
-                        # --fill-sorry: plan home first (an aborting gate must
-                        # not lose it), then the off-limits patch gate.
+                        # --fill-sorry: the off-limits patch gate.
                         if fs_spec is not None:
-                            _download_plan_file(sandbox, project_dir,
-                                                fs_plan_rel, fs_plan, view)
                             _enforce_off_limits(
                                 sandbox, fs_spec.off_limits, fs_subdir,
                                 iter_base, patch_path, view)
@@ -2404,44 +2397,38 @@ def _load_fill_sorry_spec(args, project_dir, repo_root):
     if errors:
         sys.exit("error: --fill-sorry:\n"
                  + "".join(f"  - {e}\n" for e in errors).rstrip("\n"))
+
+    # The task's memory (the plan file, prior proofs) travels through the
+    # patch chain, and this run builds on HEAD only -- so patches from an
+    # earlier run that were never `gerbil commit`ed are invisible to it, and
+    # the run would start over from nothing. Warn, don't stop: the user may
+    # be abandoning that earlier attempt on purpose.
+    pending = [
+        p.name for p in sorted((project_dir / ".gerbil").glob("gerbil-*.patch"))
+        if (pid := _patch_id(repo_root, p.read_text())) is not None
+        and pid not in _committed_patch_ids(repo_root)
+    ] if (project_dir / ".gerbil").is_dir() else []
+    if pending:
+        print(style(
+            f"[fill-sorry: {len(pending)} uncommitted patch(es) in .gerbil/ "
+            "-- this run builds on HEAD, so any plan-file memory or proofs "
+            "in them are invisible to it. `gerbil commit` first to build on "
+            "them.]", "yellow"), flush=True)
     return spec, excerpts
 
 
-def _upload_plan_file(sandbox, project_dir, plan_rel: str, spec, plan: str) -> None:
-    """Seed the container's plan file for a --fill-sorry run: the host copy
-    left by a previous run of this same task (deterministic name, so the task
-    finds its own memory), or the fresh header. The plan file is untracked on
-    both sides on purpose -- it rides neither the upload tar nor any patch
-    (sandbox._reset_internal_paths guarantees the latter); gerbil carries it
-    itself. The .git/info/exclude entry just keeps it out of the agent's
-    `git status`; the index reset is the real containment."""
-    host = project_dir / ".gerbil" / "plans" / plan
-    content = (host.read_text() if host.is_file()
-               else fill_sorry.seed_plan(spec, plan))
-    sandbox.write_file(plan_rel, content)
-    sandbox.run(
-        'g="$(git rev-parse --absolute-git-dir)" && mkdir -p "$g/info" '
-        '&& echo ".gerbil/" >> "$g/info/exclude"'
-    )
-
-
-def _download_plan_file(sandbox, project_dir, plan_rel: str, plan: str,
-                        view: SessionView) -> None:
-    """Bring the plan file home after a --fill-sorry session, so the next
-    invocation of the same task (in a fresh container) inherits it. Called
-    after every session of a ralph chain: the chain shares one container, but
-    a crash mid-chain must not lose the finished sessions' notes."""
-    try:
-        content = sandbox.read_file(plan_rel)
-    except FileNotFoundError:
-        view.notice(style(
-            f"[fill-sorry: plan file {plan_rel} is gone from the container "
-            "-- nothing saved for the next run]", "yellow"),
-            newline_before=False)
+def _seed_plan_file(sandbox, spec, plan: str) -> None:
+    """Make sure the --fill-sorry plan file exists in the container at the
+    exact path the generated prompt names, so the agent only ever reads and
+    appends -- it never decides where the plan lives. A fresh task gets the
+    seed header; a continuing one (a tracked copy, an ancestor patch, or the
+    crashed session's wip snapshot -- hence the existence guard, and hence
+    resume seeding only AFTER the wip patch is reapplied) keeps what it has.
+    The seed is ordinary working-tree content: the session squash folds it
+    into the patch, so it reaches the host only through `gerbil commit`."""
+    if sandbox.run(f"test -f {shlex.quote(plan)}").exit_code == 0:
         return
-    plans = project_dir / ".gerbil" / "plans"
-    plans.mkdir(parents=True, exist_ok=True)
-    (plans / plan).write_text(content)
+    sandbox.write_file(plan, fill_sorry.seed_plan(spec))
 
 
 def _enforce_off_limits(sandbox, off_limits: list[str], subdir: str,

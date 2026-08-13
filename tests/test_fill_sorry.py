@@ -216,8 +216,14 @@ def test_spec() -> None:
     bad("both approach forms",
         'sorries = ["A.lean:1"]\napproach = "x"\napproach_file = "y"\n',
         "not both")
-    bad("plan with a slash",
-        'sorries = ["A.lean:1"]\nplan = "a/b.md"\n', "plan")
+    check("plan accepts its own qualified form",
+          load_spec(spec_file(
+              'sorries = ["A.lean:1"]\nplan = ".gerbil/plans/b.md"\n')).plan
+          == "b.md")
+    bad("plan with a directory",
+        'sorries = ["A.lean:1"]\nplan = "docs/notes.md"\n', "bare")
+    bad("plan escaping the project",
+        'sorries = ["A.lean:1"]\nplan = "../b.md"\n', "bare")
     bad("bad check_timeout",
         'sorries = ["A.lean:1"]\ncheck_timeout = 0\n', "check_timeout")
     bad("bad ralph", 'sorries = ["A.lean:1"]\nralph = 0\n', "ralph")
@@ -239,10 +245,15 @@ def test_plan_name() -> None:
     check("hash ignores listing order (same task)",
           plan_name(a).split("-")[-1] == plan_name(b).split("-")[-1])
     check("different task, different name", plan_name(a) != plan_name(c))
-    check("slug from first file", plan_name(a).startswith("fill-bar-"))
-    check("override wins",
+    check("always under .gerbil/plans/, slug from first file",
+          plan_name(a).startswith(".gerbil/plans/fill-bar-"))
+    check("override wins (qualified)",
           plan_name(fill_sorry.FillSorrySpec(
-              sorries=a.sorries, plan="my.md")) == "my.md")
+              sorries=a.sorries, plan="my.md")) == ".gerbil/plans/my.md")
+    check("already-qualified override is not double-prefixed",
+          plan_name(fill_sorry.FillSorrySpec(
+              sorries=a.sorries, plan=".gerbil/plans/my.md"))
+          == ".gerbil/plans/my.md")
 
 
 def test_validate() -> None:
@@ -313,14 +324,31 @@ def test_validate() -> None:
           any("duplicate" in w for w in warnings)
           and spec.sorries == [SorryPos("A/B.lean", 2), SorryPos("A/B.lean", 4)])
 
-    # A tracked plan file would be reverted out of every patch.
+    # The plan file is ordinary tracked work product: a committed copy is a
+    # continuing task, while the states that would silently break the memory
+    # chain are errors.
     spec = spec_from_positions(parse_positions("A/B.lean:2"))
     name = plan_name(spec)
-    tracked = git_project({
-        "A/B.lean": LEAN, f".gerbil/plans/{name}": "old plan\n"})
-    errors, _, _ = validate(spec, project_dir=tracked, repo_root=tracked)
-    check("tracked plan file is an error",
-          any("tracked" in e for e in errors))
+    cont = git_project({"A/B.lean": LEAN, name: "# earlier sessions\n"})
+    errors, _, _ = validate(spec, project_dir=cont, repo_root=cont)
+    check("tracked plan file is fine (continuing task)",
+          errors == [], "\n".join(errors))
+
+    spec = spec_from_positions(parse_positions("A/B.lean:2"))
+    stray = git_project({"A/B.lean": LEAN})
+    stray_plan = stray / plan_name(spec)
+    stray_plan.parent.mkdir(parents=True)
+    stray_plan.write_text("stray\n")
+    errors, _, _ = validate(spec, project_dir=stray, repo_root=stray)
+    check("untracked existing plan file is an error",
+          any("not tracked" in e for e in errors))
+
+    # .gerbil/ is conventionally gitignored; the plan is force-included past
+    # that, so an ignoring repo must validate cleanly.
+    spec = spec_from_positions(parse_positions("A/B.lean:2"))
+    ignoring = git_project({"A/B.lean": LEAN, ".gitignore": ".gerbil/\n"})
+    errors, _, _ = validate(spec, project_dir=ignoring, repo_root=ignoring)
+    check("gitignored .gerbil/ is fine", errors == [], "\n".join(errors))
 
     # Project nested inside the repo: repo-relative tracking still resolves.
     root = git_project({"sub/A/B.lean": LEAN, "top.txt": "x\n"})
@@ -328,6 +356,20 @@ def test_validate() -> None:
     errors, _, _ = validate(spec, project_dir=root / "sub", repo_root=root)
     check("nested project dir resolves tracked files",
           errors == [], "\n".join(errors))
+
+
+def test_seed_plan() -> None:
+    print("\n=== plan seed ===")
+
+    spec = spec_from_positions(parse_positions("Foo/Bar.lean:42,Baz.lean:7"))
+    spec.decls = {"Foo/Bar.lean:42": "Ns.foo", "Baz.lean:7": "baz"}
+    seed = fill_sorry.seed_plan(spec)
+    check("seed lists the designated sorries with declarations",
+          "`Foo/Bar.lean:42` (in `Ns.foo`)" in seed
+          and "`Baz.lean:7` (in `baz`)" in seed)
+    check("seed states the append protocol",
+          "Append a session entry" in seed
+          and "no session has run yet" in seed)
 
 
 def test_off_limits() -> None:
@@ -452,7 +494,7 @@ def test_session_round_trip() -> None:
     spec = spec_from_positions(parse_positions("A.lean:1"))
     spec.off_limits = ["Spec.lean"]
     spec.decls = {"A.lean:1": "Ns.a"}
-    meta = fill_sorry.session_meta(spec, "fill-a-12345678.md")
+    meta = fill_sorry.session_meta(spec, ".gerbil/plans/fill-a-12345678.md")
     check("meta carries positions with declarations",
           meta["sorries"] == [{"pos": "A.lean:1", "decl": "Ns.a"}])
 
@@ -476,7 +518,8 @@ def test_session_round_trip() -> None:
           and rebuilt.axioms == spec.axioms
           and rebuilt.check_timeout == spec.check_timeout
           and rebuilt.decls == spec.decls
-          and fill_sorry.plan_name(rebuilt) == "fill-a-12345678.md")
+          and fill_sorry.plan_name(rebuilt)
+          == ".gerbil/plans/fill-a-12345678.md")
     check("check script rides along untouched",
           parsed.ralph_done_script == "#!/bin/sh\nexit 1\n")
     check("ordinary sessions parse to None",
@@ -500,6 +543,7 @@ def main() -> None:
     test_spec()
     test_plan_name()
     test_validate()
+    test_seed_plan()
     test_off_limits()
     test_prompt()
     test_check_script()

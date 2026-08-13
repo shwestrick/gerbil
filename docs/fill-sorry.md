@@ -39,13 +39,25 @@ the question. With
 same thing).
 
 **The plan file.** Cross-session memory, at
-`<project>/.gerbil/plans/<name>.md` -- the generated name is deterministic
-from the sorry list, so re-running the same task later finds its own
-notes. The agent is required to read it at session start and append what
-it did, what failed, and what to try next at session end. gerbil itself
-carries the file into and out of the container: it is untracked on both
-sides and can never appear in a patch (see enforcement below). A
-mid-session crash loses only that session's plan edits.
+`.gerbil/plans/<name>.md` -- gerbil's namespace in the repo, next to where
+the folded session logs land. The name is deterministic from the sorry
+list (`fill-<slug>-<hash>.md`; `plan` in the spec picks another bare
+filename). gerbil seeds it into the container at exactly that path before
+the first session, so the agent never decides where the plan lives -- it
+only reads it at session start and appends what it did, what failed, and
+what to try next at session end. (A continuing task keeps its existing
+copy; the seed is written only when the file is absent.) Although
+`.gerbil/` is conventionally gitignored, the plan still ships in every
+patch: each session's commit force-includes it, exactly the way the
+session log is force-added. Its updates are work product like the proofs themselves:
+they **ship inside each patch** and reach your repo only when you
+`gerbil commit` -- skip a patch and you skip its plan updates too. Within a ralph chain the memory carries forward
+automatically (each session builds on the last commit); across separate
+`gerbil run` invocations it carries through the patch chain, so commit the
+earlier patches first -- preflight warns when uncommitted `.gerbil/`
+patches would leave the task blind to its own history. The wip snapshot
+covers the plan too, so even a mid-session crash keeps its notes. Delete
+the file when the task is done.
 
 **The goal check.** A `--ralph_done`-style script (so `--ralph_done` is
 rejected alongside `--fill-sorry`) that exits 0 only when:
@@ -118,7 +130,7 @@ forbid = ["noncomputable", "partial"]
 approach = "Try induction on the program; Wf carries the bound."
 # approach_file = "notes/approach.md"
 
-# plan = "my-task.md"     # plan-file name override (bare *.md filename)
+# plan = "my-task.md"     # plan-file name override (lives in .gerbil/plans/)
 # check_timeout = 1800    # seconds the goal check may run (default 1800)
 # ralph = 10              # default session budget (CLI --ralph overrides)
 ```
@@ -146,14 +158,15 @@ Three layers, each catching what the previous one misses:
    The patch is gerbil's output contract, so this is the actual
    guarantee.
 
-The plan file gets the same enforcement treatment in reverse: it is reset
-out of the commit index before every patch and snapshot (exactly like
-submodule state), so no patch can ever carry it, even if the agent
-`git add -f`s it.
+Preflight also rules out the one plan-file state that would silently
+break the memory chain: an existing-but-untracked host copy (invisible to
+the upload, and colliding with `git am` later). A tracked plan file is
+simply a continuing task.
 
 ## Resuming
 
 A crashed `--fill-sorry` run resumes like any other: `gerbil resume LOG`.
 The spec's enforcement data and the generated check ride in the session
-log, the plan file is re-seeded from the host copy, and the patch gate
-stays armed. No flags needed.
+log, the plan file is rebuilt with the rest of the tree (ancestor patches
+plus the crashed session's wip snapshot), and the patch gate stays armed.
+No flags needed.

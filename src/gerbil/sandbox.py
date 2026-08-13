@@ -327,11 +327,12 @@ class LeanSandbox:
         # Submodule paths (relative to repo_root), filled in by _upload_project.
         # Empty for the common no-submodule repo.
         self.submodule_paths: list[str] = []
-        # Repo-relative paths gerbil itself owns inside the container (today:
-        # the --fill-sorry plan file under .gerbil/plans/). Reset out of the
-        # index before every squash/wip snapshot, exactly like submodule
-        # state, so they can never reach a patch. Set by cli.py.
-        self.internal_paths: list[str] = []
+        # Repo-relative files force-added (git add -f) into every squash and
+        # wip snapshot, past any .gitignore -- today the --fill-sorry plan
+        # file at .gerbil/plans/, which must ship in the patch even though
+        # .gerbil/ is conventionally gitignored, exactly like the folded
+        # session log that amend_with_file force-adds. Set by cli.py.
+        self.force_include: list[str] = []
 
     @property
     def project_path(self) -> str:
@@ -778,27 +779,15 @@ class LeanSandbox:
         spec = " ".join(_quote(p) for p in paths)
         self._git(f"reset -q {_quote(base)} -- {spec}")
 
-    def _reset_internal_paths(self, base: str) -> None:
-        """Undo, in the index only, anything staged under `internal_paths` --
-        the files gerbil itself maintains in the container (the --fill-sorry
-        plan file). Like _reset_submodule_state, this is enforcement rather
-        than a request: the plan file is gerbil's cross-session bookkeeping,
-        carried between sessions by gerbil itself, and a patch that added it
-        would commit gerbil's scratch state into the user's repository (and,
-        because the host copy is untracked, immediately conflict with it).
-        Restoring to `base` also covers the pathological cases -- an agent
-        that `git add -f`s the plan, or a repo whose .gitignore does not
-        cover .gerbil/ -- because the squash/wip index is built purely from
-        `add -A` plus these resets. Index-only: the working-tree copy stays
-        for the rest of the session (and for gerbil to download at the end).
-
-        A no-op when nothing under the paths is staged."""
-        if not self.internal_paths:
-            return
-        spec = " ".join(_quote(p) for p in self.internal_paths)
-        if not self._git(f"ls-files -z -- {spec}").stdout.strip("\0"):
-            return
-        self._git(f"reset -q {_quote(base)} -- {spec}")
+    def _add_force_included(self) -> None:
+        """Stage the force_include files past any .gitignore, right after the
+        squash/wip `git add -A` (which skips ignored paths). Only files that
+        actually exist: `git add -f` on a missing pathspec is an error, and a
+        force-include the agent never wrote (or deleted) is simply absent
+        from the snapshot rather than fatal to it."""
+        for path in self.force_include:
+            if self.run(f"test -f {_quote(path)}").exit_code == 0:
+                self._git(f"add -f -- {_quote(path)}")
 
     def changed_paths(self, base: str) -> list[str]:
         """Repo-root-relative paths differing between `base` and HEAD. Called
@@ -818,12 +807,11 @@ class LeanSandbox:
         Stages the full working tree, soft-resets HEAD back to base (which keeps
         that staged state), and commits once."""
         self._git("add -A")
+        self._add_force_included()
         # Before the emptiness check, not after: a session whose only change was
-        # to a submodule (or to gerbil's own plan file) has, after this, changed
-        # nothing at all, and must be reported as such rather than producing an
-        # empty patch.
+        # to a submodule has, after this, changed nothing at all, and must be
+        # reported as such rather than producing an empty patch.
         self._reset_submodule_state(base)
-        self._reset_internal_paths(base)
         if self._git(f"diff --cached --quiet {_quote(base)}").exit_code == 0:
             return False  # working tree identical to base -> nothing to commit
         reset = self._git(f"reset --soft {_quote(base)}")
@@ -851,8 +839,8 @@ class LeanSandbox:
         the result onto a clean `base` (git apply / git am) reproduces the full
         tree. Returns "" when nothing differs from base."""
         self._git("add -A")
+        self._add_force_included()
         self._reset_submodule_state(base)
-        self._reset_internal_paths(base)
         tree = self._git("write-tree").stdout.strip()
         if not tree:
             return ""

@@ -197,19 +197,27 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   It is append-only (last line wins) like a session log, and every read is
   failure-tolerant — a corrupt line is skipped and an unwritable home costs the
   observation, never the session.
-- **gerbil's in-container bookkeeping never reaches a patch.** The
-  --fill-sorry plan file lives untracked at `.gerbil/plans/` in the container;
-  `sandbox._reset_internal_paths` resets `sandbox.internal_paths` out of the
-  index right after `_reset_submodule_state` in both `squash_commit` and
-  `wip_patch`, so the squash/wip index is built purely from `add -A` plus
-  these resets -- airtight even against an agent's `git add -f`, exactly like
-  the submodule invariant above. The host copy in `<project>/.gerbil/plans/`
-  is what persists across runs; gerbil uploads/downloads it itself
-  (`cli._upload_plan_file`/`_download_plan_file`). The off-limits *patch gate*
-  (`cli._enforce_off_limits` over `sandbox.changed_paths`) is the mode's real
-  output guarantee -- prompt prose and the generated check are the earlier,
-  softer layers. Host gate and in-container check share one glob semantics
-  (fnmatch, `*` crosses `/`; bash `[[ == ]]` agrees) via
+- **The --fill-sorry plan file is patch-native, not a side channel.** It lives
+  at `.gerbil/plans/<name>.md` -- gerbil's namespace in the repo, beside the
+  folded session logs -- and `.gerbil/` being conventionally gitignored is
+  why `squash_commit`/`wip_patch` run `_add_force_included` over
+  `sandbox.force_include` right after `git add -A`: the plan is force-staged
+  into every snapshot exactly the way `amend_with_file` force-adds the log.
+  gerbil seeds it *in the container* at exactly the path the prompt names --
+  so the agent never picks a location -- but only when absent
+  (`cli._seed_plan_file`; a tracked copy, an ancestor patch, or a resumed wip
+  snapshot wins, which is why resume seeds only after the wip is reapplied).
+  Its updates ship inside each patch and reach the host only through `gerbil
+  commit`; gerbil never copies plan content to the host directly -- that
+  would change the host repo outside `git am`, the one thing gerbil promises
+  never to do. The states that would silently break the memory
+  chain are preflight errors instead (plan path off-limits / existing-but-
+  untracked / gitignored -- see `fill_sorry.validate`), and an uncommitted
+  earlier patch triggers a "gerbil commit first" warning. The off-limits
+  *patch gate* (`cli._enforce_off_limits` over `sandbox.changed_paths`) is the
+  mode's real output guarantee -- prompt prose and the generated check are the
+  earlier, softer layers. Host gate and in-container check share one glob
+  semantics (fnmatch, `*` crosses `/`; bash `[[ == ]]` agrees) via
   `fill_sorry.normalize_off_limits` -- don't let them drift apart.
 - **Built-in tool names win** over colliding MCP tool names (today none collide).
 - **Tool output is truncated once** (`tools.truncate_tool_output`, 10k chars,
@@ -346,13 +354,14 @@ Optional noncomputable/partial bans walk the designated declarations'
 dependency closure within the target modules; off-limits paths are pinned to
 the chain base. Defaults to `--ralph 10`. Everything lives in `fill_sorry.py`;
 cli.py wires it at preflight (parse/validate, `--prompt` becomes approach
-notes, `--ralph_done` is rejected) and around each session (plan upload via
-`sandbox.write_file` / download via `read_file`, the off-limits patch gate on
-`sandbox.changed_paths`). The plan file at `<project>/.gerbil/plans/<name>.md`
-(name deterministic from the sorry list) is untracked on both sides and is
-carried by gerbil itself; `session_start` records a `fill_sorry` dict (like
-`ralph`) so `gerbil resume` rehydrates the mode with no flags. See
-docs/fill-sorry.md.
+notes, `--ralph_done` is rejected, uncommitted earlier patches warn) and after
+each session (the off-limits patch gate on `sandbox.changed_paths`). The plan
+file -- cross-session memory at `.gerbil/plans/fill-<slug>-<hash>.md`,
+deterministic from the sorry list -- is seeded by gerbil in-container and
+maintained by the agent; it ships in the patches via the force-include
+mechanism (see the invariant above).
+`session_start` records a `fill_sorry` dict (like `ralph`) so `gerbil resume`
+rehydrates the mode with no flags. See docs/fill-sorry.md.
 
 **Resume** (`gerbil resume LOG`): recreate the session's git starting point (for
 a ralph chain, `git am` the recorded ancestor patches), reapply the `.wip.patch`,
