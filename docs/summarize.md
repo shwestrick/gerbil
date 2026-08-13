@@ -1,6 +1,7 @@
 # Usage and cost
 
-`gerbil summarize` scans a project's `.gerbil/*.jsonl` session logs and reports
+`gerbil summarize` scans a project's `.gerbil/sessions/*.jsonl` session logs
+(plus any in the flat `.gerbil/` of older gerbils) and reports
 total token usage, an estimated cost, and breakdowns by session status, tool
 call, and model:
 
@@ -54,7 +55,7 @@ me".
 
 ## Where the logs come from
 
-Session logs reach the project's `.gerbil/` by default, carried in the
-committed patch. Runs made with `gerbil run --omit-session-log` keep them only
+Session logs reach the project's `.gerbil/sessions/` by default, carried in
+the committed patch. Runs made with `gerbil run --omit-session-log` keep them only
 in `~/.gerbil/sessions/`; if the project has no logs, `summarize` points you
 there.

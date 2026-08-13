@@ -84,7 +84,7 @@ def main() -> None:
         finally:
             archived.unlink(missing_ok=True)  # don't litter the real home dir
 
-        patch_path = root / ".gerbil" / "gerbil-test-01.patch"
+        patch_path = root / ".gerbil" / "patches" / "gerbil-test-01.patch"
         check("patch file written", patch_path.is_file())
         patch = patch_path.read_text()
         check("patch is non-empty", patch.strip() != "")

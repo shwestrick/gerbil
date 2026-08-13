@@ -16,14 +16,17 @@ git format-patch: a single .patch file holding the commit title, message, and
 diff, committed on the host with `gerbil commit` (git am).
 
 Outputs:
-    ~/.gerbil/sessions/gerbil-TIMESTAMP.jsonl  the live session log (the true
-                                         session file, written as the run proceeds)
-    <project>/.gerbil/gerbil-TIMESTAMP.patch   git format-patch of the session's
-                                         commit(s); apply with `git am`
+    ~/.gerbil/sessions/gerbil-TIMESTAMP.jsonl        the live session log (the
+                                         true session file, written as the run
+                                         proceeds)
+    <project>/.gerbil/patches/gerbil-TIMESTAMP.patch git format-patch of the
+                                         session's commit(s); apply with `git am`
 The patch is also copied to ~/.gerbil/sessions/, so the archive holds all gerbil
 data. The session log is also folded into the commit (and thus the patch) by
-default; pass --omit-session-log to keep it out of the commit. Either way the
-~/.gerbil/sessions/ archive keeps the log.
+default, at .gerbil/sessions/<name>.jsonl inside the repo; pass
+--omit-session-log to keep it out of the commit. Either way the
+~/.gerbil/sessions/ archive keeps the log. (Readers of both locations also
+accept the pre-subdirectory flat .gerbil/ layout from older gerbils.)
 
 One more user-level file, not per-session: ~/.gerbil/context-windows.jsonl, an
 append-only record of every context window a provider has reported (see
@@ -671,12 +674,50 @@ def _patch_applies(repo_dir: Path, patch: Path) -> bool:
     ).returncode == 0
 
 
-def cmd_commit(args) -> None:
-    """Commit each .gerbil/gerbil-*.patch (a git format-patch) in order via git am.
+# The project-local .gerbil/ layout: artifacts live in per-kind
+# subdirectories -- patches/ for the session patches, sessions/ for the
+# folded session logs, beside the existing plans/ (--fill-sorry) and
+# config.toml. Writers always target the subdirectories; every reader below
+# also accepts the pre-subdirectory flat layout (.gerbil/*.patch,
+# .gerbil/*.jsonl), so repositories with history from older gerbils keep
+# working without a migration.
 
-    The .gerbil/ directory may hold stale patches. Each is classified first:
-    already-committed (its patch-id is in history) => skip; applies cleanly =>
-    new (git am); otherwise out of date => skip with a warning."""
+
+def _patches_dir(project_dir: Path) -> Path:
+    return project_dir / ".gerbil" / "patches"
+
+
+def _project_patches(project_dir: Path) -> list[Path]:
+    """The project's gerbil-*.patch files, from .gerbil/patches/ plus the
+    legacy flat .gerbil/, sorted by file name (the timestamped names give the
+    chain order). A name present in both places resolves to the patches/
+    copy."""
+    seen: dict[str, Path] = {}
+    for d in (project_dir / ".gerbil", _patches_dir(project_dir)):
+        if d.is_dir():
+            for p in d.glob("gerbil-*.patch"):
+                seen[p.name] = p
+    return [seen[name] for name in sorted(seen)]
+
+
+def _project_session_logs(project_dir: Path) -> list[Path]:
+    """The project's folded session logs, from .gerbil/sessions/ plus the
+    legacy flat .gerbil/, sorted by file name; sessions/ wins a name clash."""
+    seen: dict[str, Path] = {}
+    for d in (project_dir / ".gerbil", project_dir / ".gerbil" / "sessions"):
+        if d.is_dir():
+            for p in d.glob("*.jsonl"):
+                seen[p.name] = p
+    return [seen[name] for name in sorted(seen)]
+
+
+def cmd_commit(args) -> None:
+    """Commit each gerbil-*.patch (a git format-patch) in order via git am.
+
+    .gerbil/patches/ (and the legacy flat .gerbil/) may hold stale patches.
+    Each is classified first: already-committed (its patch-id is in history)
+    => skip; applies cleanly => new (git am); otherwise out of date => skip
+    with a warning."""
     project_dir = _resolve_at(args.at)
     if not project_dir.is_dir():
         sys.exit(f"error: {project_dir} is not a directory")
@@ -685,10 +726,9 @@ def cmd_commit(args) -> None:
 
     # Patches are stored next to the Lake project, but their paths are relative to
     # the repo root, so all git operations run from there.
-    out_dir = project_dir / ".gerbil"
-    patches = sorted(out_dir.glob("gerbil-*.patch"))
+    patches = _project_patches(project_dir)
     if not patches:
-        sys.exit(f"no patches found in {out_dir}")
+        sys.exit(f"no patches found in {_patches_dir(project_dir)}")
 
     committed = _committed_patch_ids(repo_root)
     applied = already = stale = 0
@@ -724,7 +764,7 @@ def cmd_commit(args) -> None:
 
 
 def cmd_cleanup(args) -> None:
-    """Delete each .gerbil/gerbil-*.patch whose changes are already in the
+    """Delete each project gerbil-*.patch whose changes are already in the
     repo's history -- the exact patches `gerbil commit` would skip as "already
     committed" (matched by stable patch-id against every commit reachable from
     HEAD).
@@ -739,10 +779,9 @@ def cmd_cleanup(args) -> None:
     repo_root = _require_git_repo(project_dir)
     _require_lake_project(project_dir)
 
-    out_dir = project_dir / ".gerbil"
-    patches = sorted(out_dir.glob("gerbil-*.patch"))
+    patches = _project_patches(project_dir)
     if not patches:
-        sys.exit(f"no patches found in {out_dir}")
+        sys.exit(f"no patches found in {_patches_dir(project_dir)}")
 
     committed = _committed_patch_ids(repo_root)
     removed = kept = 0
@@ -984,7 +1023,8 @@ def _log_commit(project_dir: Path, log_name: str) -> str | None:
     record of the diff. (Normally, not always: see _committed_lean_delta.)"""
     result = subprocess.run(
         ["git", "-C", str(project_dir), "log", "--diff-filter=A",
-         "--format=%H", "--", f".gerbil/{log_name}"],
+         "--format=%H", "--",
+         f".gerbil/sessions/{log_name}", f".gerbil/{log_name}"],
         capture_output=True,
         text=True,
     )
@@ -1065,7 +1105,7 @@ def cmd_summarize(args) -> None:
         sys.exit(f"error: {project_dir} is not a directory")
 
     out_dir = project_dir / ".gerbil"
-    logs = sorted(out_dir.glob("*.jsonl"))
+    logs = _project_session_logs(project_dir)
     if not logs:
         # The live session log always lands in ~/.gerbil/sessions/; it also
         # reaches the project's .gerbil/ (via the committed patch) unless the
@@ -1236,9 +1276,16 @@ def cmd_summarize(args) -> None:
         if delta is not None:
             deltas.append((delta, commit))
         else:
-            patch = path.with_suffix(".patch")
+            # The sibling patch: same directory (legacy layout, or an archive
+            # copy next to a hand-copied log), else the patches/ directory.
+            patch = next(
+                (c for c in (path.with_suffix(".patch"),
+                             _patches_dir(project_dir)
+                             / (path.stem + ".patch"))
+                 if c.is_file()), None)
             deltas.append(
-                (_patch_lean_delta(patch) if patch.is_file() else None, None))
+                (_patch_lean_delta(patch) if patch is not None else None,
+                 None))
 
     # Anchor the running total at the first session's recorded base commit
     # when that commit is still inspectable. A history rewrite (rebase,
@@ -1349,7 +1396,7 @@ def _finalize_session(
     # Optionally fold the session log into the (single) commit, and thus the patch.
     if include_session:
         sandbox.amend_with_file(
-            f".gerbil/{session_path.name}", session_path.read_text()
+            f".gerbil/sessions/{session_path.name}", session_path.read_text()
         )
     patch_text = sandbox.format_patch(base)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1527,7 +1574,7 @@ def cmd_run(args) -> None:
     # the project's .gerbil/ (for applying) and also copied to the archive.
     archive_dir = Path.home() / ".gerbil" / "sessions"
     archive_dir.mkdir(parents=True, exist_ok=True)
-    out_dir = project_dir / ".gerbil"  # created lazily, only when a patch is written
+    out_dir = _patches_dir(project_dir)  # created lazily, when a patch is written
 
     # The running gerbil version (commit hash), supplied by the launcher.
     version = os.environ.get("GERBIL_VERSION", "unknown")
@@ -1816,10 +1863,12 @@ def cmd_resume(args) -> None:
 
     archive_dir = Path.home() / ".gerbil" / "sessions"
     archive_dir.mkdir(parents=True, exist_ok=True)
-    out_dir = project_dir / ".gerbil"
+    out_dir = _patches_dir(project_dir)
     version = os.environ.get("GERBIL_VERSION", "unknown")
     image = _resolve_image(args, project_dir)
-    patch_dirs = [resume_file.parent, out_dir]  # where ancestor patches may live
+    # Where ancestor patches may live: the session archive, the patches dir,
+    # and the legacy flat .gerbil/ of older runs.
+    patch_dirs = [resume_file.parent, out_dir, project_dir / ".gerbil"]
 
     # Resolve the reconstruction plan. For a ralph session, the chain layers on a
     # host-reachable `chain_base` and `ancestors` rebuild this session's base; for
@@ -2231,9 +2280,9 @@ def cmd_reconstruct_patch(args) -> None:
 
     archive_dir = Path.home() / ".gerbil" / "sessions"
     archive_dir.mkdir(parents=True, exist_ok=True)
-    out_dir = project_dir / ".gerbil"
+    out_dir = _patches_dir(project_dir)
     image = _resolve_image(args, project_dir)
-    patch_dirs = [session_file.parent, out_dir]
+    patch_dirs = [session_file.parent, out_dir, project_dir / ".gerbil"]
 
     anchor, ancestor_patches = _reconstruct_anchor(
         parsed, session_file, repo_root, patch_dirs
@@ -2408,8 +2457,8 @@ def cmd_new_fill(args) -> None:
     delegates to cmd_run exactly as `gerbil run --fill-sorry <spec>` would.
     Validation problems loop back into the editor rather than dying: the
     half-written spec is the user's work, not a crash. The spec file lives
-    in the project's .gerbil/ and is kept whatever happens, so a declined
-    task can be started later (or edited and re-run) by path."""
+    in the project's .gerbil/tasks/ and is kept whatever happens, so a
+    declined task can be started later (or edited and re-run) by path."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         sys.exit("error: new-fill is interactive; run it from a terminal "
                  "(or write a spec file and use `gerbil run --fill-sorry`).")
@@ -2425,7 +2474,7 @@ def cmd_new_fill(args) -> None:
     repo_root = _require_git_repo(project_dir)
     _require_lake_project(project_dir)
 
-    spec_dir = project_dir / ".gerbil"
+    spec_dir = project_dir / ".gerbil" / "tasks"
     spec_dir.mkdir(parents=True, exist_ok=True)
     spec_path = spec_dir / (
         "fill-task-" + datetime.now().strftime("%y%m%d-%H%M%S") + ".toml")
@@ -2553,10 +2602,10 @@ def _load_fill_sorry_spec(args, project_dir, repo_root):
     # the run would start over from nothing. Warn, don't stop: the user may
     # be abandoning that earlier attempt on purpose.
     pending = [
-        p.name for p in sorted((project_dir / ".gerbil").glob("gerbil-*.patch"))
+        p.name for p in _project_patches(project_dir)
         if (pid := _patch_id(repo_root, p.read_text())) is not None
         and pid not in _committed_patch_ids(repo_root)
-    ] if (project_dir / ".gerbil").is_dir() else []
+    ]
     if pending:
         print(style(
             f"[fill-sorry: {len(pending)} uncommitted patch(es) in .gerbil/ "

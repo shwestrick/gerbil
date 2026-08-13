@@ -69,7 +69,9 @@ This directory is safe to delete at any time; the next `gerbil` invocation
 rebuilds what it needs. Deleting it does discard the archived session data.
 
 Separately, gerbil maintains a per-project `.gerbil/` directory inside each
-project it runs on, holding that project's session logs, patches, and optional
+project it runs on: `patches/` (session patches), `sessions/` (committed
+session logs), `plans/` (fill-sorry plan files), `tasks/` (`gerbil new-fill`
+task specs), and an optional
 [`config.toml`](sandbox.md#per-project-configuration).
 
 ## Environment variables

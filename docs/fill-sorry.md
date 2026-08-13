@@ -30,11 +30,13 @@ problems, then shows a summary of the task -- resolved declarations,
 off-limits paths, axiom policy, session budget -- and starts the run on
 your confirmation, exactly as `gerbil run --fill-sorry <spec>` would. It
 accepts all of `gerbil run`'s options, and the spec file is kept in
-`.gerbil/` either way, so a declined task can be started later by path.
+`.gerbil/tasks/` either way, so a declined task can be started later by
+path.
 
 The mode runs directly on the current repo, like any other gerbil session:
 preflight requires a clean tree, the session starts from `HEAD`, and the
-output is an ordinary patch in `.gerbil/` that `gerbil commit` applies.
+output is an ordinary patch in `.gerbil/patches/` that `gerbil commit`
+applies.
 
 Defaults with a bare position list: the whole repository is editable, the
 finished proofs may use Lean's standard axioms (`propext`,
@@ -192,7 +194,8 @@ Three layers, each catching what the previous one misses:
 3. **The patch gate**: after every session, gerbil checks the session's
    patch against the off-limits list and refuses to continue if it
    touches one -- the run stops with an error, and the offending patch is
-   kept in `.gerbil/` for inspection (do not `gerbil commit` it as-is).
+   kept in `.gerbil/patches/` for inspection (do not `gerbil commit` it
+   as-is).
    The patch is gerbil's output contract, so this is the actual
    guarantee.
 

@@ -136,7 +136,9 @@ pyproject.toml          packaging; entry point is gerbil.cli:main
    changes) into one commit, then `format_patch(base)` writes the `.patch`.
 
 Outputs: the live `.jsonl` log lands in `~/.gerbil/sessions/`; the `.patch` lands
-in the project's `.gerbil/` (and is copied to the archive). The log is folded
+in the project's `.gerbil/patches/` (and is copied to the archive; committed
+session logs land at `.gerbil/sessions/`, and every reader of either also
+accepts the older flat `.gerbil/` layout). The log is folded
 into the project commit by default; `--omit-session-log` keeps it out (the
 archive copy in `~/.gerbil/sessions/` is kept regardless).
 
@@ -264,7 +266,7 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   [--omit-session-log] [--plain]`
 - `gerbil new-fill [same options as run]` — author a `--fill-sorry` task spec
   interactively: opens `$VISUAL`/`$EDITOR`/`vi` on `fill_sorry.SPEC_TEMPLATE`
-  (written to `<project>/.gerbil/fill-task-<ts>.toml`, kept regardless),
+  (written to `<project>/.gerbil/tasks/fill-task-<ts>.toml`, kept regardless),
   re-edits on validation problems, shows a task summary, and on confirmation
   delegates to `cmd_run` — rewriting `sys.argv` from `new-fill` to
   `run --fill-sorry <spec>` first, so the TUI's detached runner re-enters
@@ -273,9 +275,10 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   IMAGE] [--skip-cache] [--no-mcp] [--ralph_done SCRIPT] [--omit-session-log]
   [--plain]` —
   continue a crashed/interrupted session (model and prompt come from the log).
-- `gerbil commit` — `git am` the project's `.gerbil/*.patch` in order, skipping
+- `gerbil commit` — `git am` the project's `.gerbil/patches/*.patch` (legacy
+  flat `.gerbil/` included) in order, skipping
   already-applied (by stable patch-id) and stale (non-applying) patches.
-- `gerbil cleanup` — delete the project's `.gerbil/*.patch` files whose changes
+- `gerbil cleanup` — delete the project's patch files whose changes
   are already committed (same stable patch-id test as `gerbil commit`); patches
   not yet committed are never touched, and the `~/.gerbil/sessions/` archive
   copies are kept.
@@ -287,7 +290,8 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   confirming the exit there is the one and only thing that removes a run's
   registry entry. Bare `grab` resolves a single live run (or, with none live,
   a single finished run awaiting dismissal).
-- `gerbil summarize` — token/cost/tool/status stats across `.gerbil/*.jsonl`,
+- `gerbil summarize` — token/cost/tool/status stats across the project's
+  session logs (`.gerbil/sessions/*.jsonl`, legacy flat included),
   plus a per-session table (cost, `.lean` lines +/- from the commit each log
   was folded into or its uncommitted `.patch`, running lean-code total
   excluding `.lake`).

@@ -15,12 +15,9 @@ session is committed inside the container, so the next one builds on it.
 Every session produces its own log and patch, numbered:
 
 ```console
-$ ls .gerbil
-gerbil-260623-235900-01.jsonl
+$ ls .gerbil/patches
 gerbil-260623-235900-01.patch
-gerbil-260623-235900-02.jsonl
 gerbil-260623-235900-02.patch
-gerbil-260623-235900-03.jsonl
 gerbil-260623-235900-03.patch
 
 $ gerbil commit     # applies all three, in order

@@ -25,6 +25,8 @@ from gerbil.cli import (
     _committed_lean_delta,
     _lean_line_count,
     _log_commit,
+    _project_patches,
+    _project_session_logs,
     cmd_summarize,
 )
 
@@ -127,6 +129,31 @@ def test_helpers() -> None:
           str(_lean_line_count(repo, rev2)))
     check("dangling commit not countable",
           _lean_line_count(repo, DANGLING) is None)
+
+    # The subdirectory layout: logs folded at .gerbil/sessions/, patches at
+    # .gerbil/patches/, with the flat legacy paths still readable.
+    rev3 = commit(repo, "session 4", {
+        ".gerbil/sessions/s4.jsonl": session_log(rev1),
+        "A.lean": lean(10) + lean(5, "new") + lean(1, "more"),
+    })
+    check("log commit found under .gerbil/sessions/",
+          _log_commit(repo, "s4.jsonl") == rev3)
+    (repo / ".gerbil" / "patches").mkdir(parents=True, exist_ok=True)
+    (repo / ".gerbil" / "patches" / "gerbil-02.patch").write_text("x")
+    (repo / ".gerbil" / "gerbil-01.patch").write_text("y")
+    (repo / ".gerbil" / "gerbil-02.patch").write_text("legacy dup")
+    check("patches merged across layouts, patches/ wins a name clash",
+          [(p.name, p.parent.name) for p in _project_patches(repo)]
+          == [("gerbil-01.patch", ".gerbil"),
+              ("gerbil-02.patch", "patches")],
+          str(_project_patches(repo)))
+    check("session logs merged across layouts",
+          [p.name for p in _project_session_logs(repo)]
+          == ["s1.jsonl", "s2.jsonl", "s3.jsonl", "s4.jsonl"],
+          str(_project_session_logs(repo)))
+    (repo / ".gerbil" / "patches" / "gerbil-02.patch").unlink()
+    (repo / ".gerbil" / "gerbil-01.patch").unlink()
+    (repo / ".gerbil" / "gerbil-02.patch").unlink()
 
 
 def test_recorded_base_anchor() -> None:

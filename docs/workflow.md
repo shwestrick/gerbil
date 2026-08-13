@@ -9,7 +9,7 @@ it.
             |                                          ^
             | upload tracked files + sanitized .git    | gerbil commit  (git am)
             v                                          |
-     +--------------+   agent loop    +----------+   .gerbil/*.patch
+     +--------------+   agent loop    +----------+  .gerbil/patches/*.patch
      |  container   | --------------> | squash + | ------+
      +--------------+                 |format-   |
                                       | patch    |
@@ -87,11 +87,12 @@ Outputs:
 | File | Location |
 | --- | --- |
 | `gerbil-<ts>.jsonl` | live in `~/.gerbil/sessions/`, archived there permanently |
-| `gerbil-<ts>.patch` | the project's `.gerbil/`, plus an archive copy |
+| `gerbil-<ts>.patch` | the project's `.gerbil/patches/`, plus an archive copy |
 | `gerbil-<ts>.wip.patch` | next to the log, only while the session is unfinished |
 
 By default the session log is folded into the commit the patch carries, so the
-transcript lands in the repository alongside the proof. `--omit-session-log`
+transcript lands in the repository alongside the proof (at
+`.gerbil/sessions/<name>.jsonl`). `--omit-session-log`
 keeps it out; the archive copy in `~/.gerbil/sessions/` is kept either way.
 
 ## Applying the work
@@ -101,12 +102,13 @@ $ gerbil commit
 $ git push
 ```
 
-`gerbil commit` runs `git am` over the project's `.gerbil/*.patch` files in
-order. It skips patches that are already committed (identified by stable
+`gerbil commit` runs `git am` over the project's `.gerbil/patches/*.patch`
+files in order (patches in the flat `.gerbil/` of older gerbils are picked up
+too). It skips patches that are already committed (identified by stable
 patch-id, so a rebase doesn't confuse it) and patches that no longer apply.
 Leftover patch files are harmless.
 
-`gerbil cleanup` deletes the `.gerbil/*.patch` files whose changes are already
+`gerbil cleanup` deletes the patch files whose changes are already
 committed, using that same patch-id test. Patches that have not been committed
 yet are never touched, and the `~/.gerbil/sessions/` archive copies are kept.
 
@@ -116,7 +118,7 @@ The `.patch` is an ordinary `git format-patch` file. You do not have to use
 `gerbil commit` at all:
 
 ```console
-$ git apply --stat .gerbil/gerbil-260623-235800.patch   # what changed
-$ git apply --check .gerbil/gerbil-260623-235800.patch  # would it apply?
-$ git am .gerbil/gerbil-260623-235800.patch             # apply it yourself
+$ git apply --stat .gerbil/patches/gerbil-260623-235800.patch   # what changed
+$ git apply --check .gerbil/patches/gerbil-260623-235800.patch  # would it apply?
+$ git am .gerbil/patches/gerbil-260623-235800.patch             # apply it yourself
 ```
