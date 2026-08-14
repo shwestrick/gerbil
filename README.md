@@ -9,7 +9,7 @@ container (Docker or podman) and produce git patches.
 
 ```console
 $ gerbil run --model claude-opus-4-8 \
-             --fill-sorry MyProject.lemma1
+             --fill-sorry Hello.Basic.myLemma
 ...
 $ gerbil commit
 $ git push
