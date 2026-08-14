@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from gerbil import prompts  # noqa: E402
 from gerbil.agent import (  # noqa: E402
     _append_user_text,
-    _commit_diff,
     _context_level,
 )
 from gerbil.prompts import (  # noqa: E402
@@ -216,23 +215,15 @@ def test_providers_transmit_the_note():
           content[0]["type"] == "tool_result", str(content))
 
 
-def test_commit_diff_budget():
-    print("\n-- the forced ending still fits a commit message --")
-    diff = "\n".join(f"+line {i}" for i in range(20_000))  # ~200k chars
-    check("plenty of room -> untouched",
-          _commit_diff(diff, 1_000_000, usage_at(0.10, 1_000_000)) == diff)
-    check("unknown window -> untouched", _commit_diff(diff, None, usage_at(0.99)) == diff)
-
-    # At the terminal threshold there are ~5,000 tokens left of a 100k window.
-    tight = _commit_diff(diff, 100_000, usage_at(0.95))
-    check("tight room -> shortened", len(tight) < len(diff), f"{len(tight)} vs {len(diff)}")
-    check("...to something that fits", len(tight) < 5_000 * 3.1, str(len(tight)))
-    check("...keeping head and tail",
-          "+line 0" in tight and "+line 19999" in tight)
-
-    # Past the threshold entirely (the window overshot): still asks, minimally.
-    over = _commit_diff(diff, 100_000, usage_at(1.10))
-    check("no room left -> minimal diff, not empty", 0 < len(over) <= 2_200, str(len(over)))
+def test_commit_request_carries_no_diff():
+    print("\n-- the commit request repeats no diff --")
+    # The session's changes are already in the model's context; the request
+    # is a fixed, small message, so even a CONTEXT_TERMINAL ending has room
+    # for it without any diff-shortening machinery.
+    request = prompts.commit_request()
+    check("asks for the message", "Write a git commit message" in request)
+    check("small and diff-free", len(request) < 1000 and "diff --git" not in request,
+          str(len(request)))
 
 
 class FakeSandbox:
@@ -330,11 +321,118 @@ def test_session_escalates_and_stops():
               for e in events))
 
 
+def test_keep_going():
+    """Ralph keep-going: a natural stop below CONTEXT_KEEP_GOING runs the
+    termination check in-session; unmet sends the model back to work in the
+    same conversation, met ends the session with goal_met for the caller."""
+    print("\n-- keep-going below 50% context --")
+    import json
+    import tempfile
+
+    import gerbil.agent as agent
+    from gerbil.session import Session
+    from gerbil.tools import Toolset
+
+    class FakeToolset(Toolset):
+        def __init__(self):
+            super().__init__(FakeSandbox())
+
+        def dispatch(self, name, args):
+            from gerbil.tools import ToolResult
+            return ToolResult(content="ok", is_error=False)
+
+    def run(plan, pcts, verdicts, window=100_000):
+        """Drive run_session with a scripted model: `plan` is one action per
+        task turn ("tool" or "stop"); `verdicts` are what successive
+        goal_check calls report. Returns (result, checks_ran, events)."""
+        state = {"n": 0}
+        checks = {"n": 0}
+        real_turn = agent._run_turn_with_retry
+        real_window = agent.get_context_window
+
+        def stub(model, system, messages, tools, provider, read_file=None,
+                 session=None, view=None):
+            if not tools:  # the commit-message turn
+                return ([{"type": "text", "text": "Fix foo\n\nBody."}], [],
+                        "Fix foo\n\nBody.", usage_at(0.4))
+            i = min(state["n"], len(plan) - 1)
+            state["n"] += 1
+            usage = usage_at(pcts[i])
+            if plan[i] == "stop":
+                return [{"type": "text", "text": "done!"}], [], "done!", usage
+            call = {"name": "bash", "args": {"command": "ls"}, "id": f"t{i}",
+                    "raw_part": None}
+            parts = [{"type": "tool_call", "name": "bash",
+                      "args": {"command": "ls"}, "id": f"t{i}",
+                      "raw_part": None}]
+            return parts, [call], "", usage
+
+        def goal_check():
+            v = verdicts[min(checks["n"], len(verdicts) - 1)]
+            checks["n"] += 1
+            return v
+
+        tmp = Path(tempfile.mkdtemp())
+        session = Session(path=tmp / "s.jsonl", model="claude-opus-4-8",
+                          project_dir=Path("/repo"), prompt_file=Path("/p.md"))
+        agent._run_turn_with_retry = stub
+        agent.get_context_window = lambda *a, **k: window
+        try:
+            result = agent.run_session(
+                FakeSandbox(), session, "do the task", "claude-opus-4-8",
+                FakeToolset(), provider="anthropic", max_turns=50,
+                goal_check=goal_check,
+            )
+        finally:
+            agent._run_turn_with_retry = real_turn
+            agent.get_context_window = real_window
+        events = [json.loads(l) for l in session.path.read_text().splitlines()]
+        return result, checks["n"], events
+
+    # Unmet at the first stop -> keep going in the same conversation; met at
+    # the second -> wrap up, goal_met reported so the caller skips a re-run.
+    result, checks, events = run(
+        plan=["tool", "stop", "tool", "stop"],
+        pcts=[0.20, 0.30, 0.35, 0.40], verdicts=[False, True])
+    check("check ran at both stops", checks == 2, str(checks))
+    check("keep-going note entered the conversation as a user turn",
+          any(e.get("event") == "turn" and e.get("role") == "user"
+              and prompts.KEEP_GOING_NOTE == e.get("content")
+              for e in events), str(events))
+    check("goal_met reported", result.goal_met is True, str(result.goal_met))
+    check("commit message still produced",
+          result.commit_message == "Fix foo\n\nBody.",
+          repr(result.commit_message))
+
+    # A model that stops again WITHOUT doing any work cannot have changed the
+    # verdict: no second check (a full build), no ping-pong -- fall through.
+    result, checks, _ = run(
+        plan=["tool", "stop", "stop"],
+        pcts=[0.20, 0.30, 0.31], verdicts=[False])
+    check("no re-check without work in between", checks == 1, str(checks))
+    check("last verdict carried on the result", result.goal_met is False,
+          str(result.goal_met))
+
+    # At or above the threshold the session ends exactly as before.
+    result, checks, _ = run(
+        plan=["tool", "stop"], pcts=[0.30, 0.60], verdicts=[False])
+    check("no check at >= 50% context", checks == 0, str(checks))
+    check("goal unknown without a check", result.goal_met is None,
+          str(result.goal_met))
+
+    # Unknown window: the guard is inert, like the pressure thresholds.
+    result, checks, _ = run(
+        plan=["tool", "stop"], pcts=[0.10, 0.10], verdicts=[False],
+        window=None)
+    check("no check when the window is unknown", checks == 0, str(checks))
+
+
 def test_prompt_constants_are_the_spec():
     print("\n-- the documented percentages --")
     check("75%", prompts.CONTEXT_WIND_DOWN == 0.75)
     check("85%", prompts.CONTEXT_URGENT == 0.85)
     check("95%", prompts.CONTEXT_TERMINAL == 0.95)
+    check("50%", prompts.CONTEXT_KEEP_GOING == 0.50)
 
 
 if __name__ == "__main__":
@@ -342,8 +440,9 @@ if __name__ == "__main__":
     test_notes()
     test_message_shape()
     test_providers_transmit_the_note()
-    test_commit_diff_budget()
+    test_commit_request_carries_no_diff()
     test_session_escalates_and_stops()
+    test_keep_going()
     test_prompt_constants_are_the_spec()
     print()
     if failures:

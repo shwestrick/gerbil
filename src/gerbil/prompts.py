@@ -181,6 +181,22 @@ CONTEXT_WIND_DOWN = 0.75    # advise wrapping up
 CONTEXT_URGENT = 0.85       # order it
 CONTEXT_TERMINAL = 0.95     # take over: commit message, then end the session
 
+# The opposite end of the scale, for ralph chains: a session that stops with
+# less than this fraction of its window used is leaving the chain's most
+# expensive resource on the table -- a fresh session pays the whole prompt
+# and exploration cost again. Below it, a natural stop first runs the
+# termination check, and an unmet goal sends the model back to work in the
+# SAME conversation (see agent.run_session's goal_check). Like the pressure
+# thresholds, inert when the window size is unknown.
+CONTEXT_KEEP_GOING = 0.50
+
+# The message that sends the model back to work. Delivered as its own user
+# message -- the model just stopped, so no tool results are pending.
+KEEP_GOING_NOTE = (
+    "The task's termination check has not passed yet. Your context window "
+    "still has ample room. Keep going."
+)
+
 
 def context_pressure_note(level: float, used: int, limit: int) -> str:
     """The message appended to a tool-result turn when the conversation crosses
@@ -239,12 +255,19 @@ def build_system_prompt(
     return prompt
 
 
-def commit_request(diff: str) -> str:
-    """The user message that asks the model to write the commit message."""
+def commit_request() -> str:
+    """The user message that asks the model to write the commit message.
+
+    The session's diff is deliberately NOT included: every change the model
+    made is already in its context (in big-small mode, as the zoom
+    summaries it was handed), and re-sending the whole diff on the very
+    turn that must fit into whatever window remains was pure waste --
+    worst exactly when the session ended at CONTEXT_TERMINAL, where this
+    turn's entire purpose is to land the work explained."""
     return (
-        "The task is complete. Here is the final git diff of all your changes:\n\n"
-        f"{diff}\n\n"
-        "Write a git commit message for these changes. Output ONLY the commit "
+        "The task is complete. Write a git commit message covering ALL the "
+        "changes you made this session -- you already know them from this "
+        "conversation, so no diff is repeated here. Output ONLY the commit "
         "message, with no code fences or preamble:\n"
         "  - First line: a concise imperative title, at most ~72 characters.\n"
         "  - Then one blank line.\n"

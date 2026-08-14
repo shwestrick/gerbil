@@ -1721,6 +1721,15 @@ def cmd_run(args) -> None:
                                 fill_sorry.off_limits_monitor(
                                     spec.off_limits, fs_subdir)
                                 if spec is not None else None),
+                            # An early natural stop runs the termination
+                            # check in-session and, unmet, keeps the model
+                            # going in the same conversation.
+                            goal_check=(
+                                (lambda: _ralph_done(
+                                    sandbox, ralph_done_script, view,
+                                    timeout=(spec.check_timeout
+                                             if spec is not None else 300.0)))
+                                if ralph_done_script else None),
                         )
                         session.close()
                         session = None
@@ -1751,9 +1760,16 @@ def cmd_run(args) -> None:
 
                         # Optionally run the user's termination check on this session's
                         # committed tree. Skip it on the final iteration (nothing left
-                        # to skip) -- the loop ends anyway.
+                        # to skip) -- the loop ends anyway. A check the session already
+                        # passed in-flight (goal_met) is not re-run: no work happened
+                        # since, so the verdict could not have changed.
                         if ralph_done_script and i < iterations:
-                            view.notice("", newline_before=False)
+                            if result.goal_met:
+                                view.notice(style(
+                                    "[ralph_done: check passed during the "
+                                    "session -- stopping loop]",
+                                    "bold", "magenta"))
+                                break
                             if _ralph_done(
                                 sandbox, ralph_done_script, view,
                                 timeout=(spec.check_timeout if spec is not None
@@ -2111,6 +2127,12 @@ def cmd_resume(args) -> None:
                                 fill_sorry.off_limits_monitor(
                                     fs_spec.off_limits, fs_subdir)
                                 if fs_spec is not None else None),
+                            goal_check=(
+                                (lambda: _ralph_done(
+                                    sandbox, ralph_done_script, view,
+                                    timeout=(fs_spec.check_timeout
+                                             if fs_spec is not None else 300.0)))
+                                if ralph_done_script else None),
                         )
                         session.close()
                         session = None
@@ -2141,9 +2163,15 @@ def cmd_resume(args) -> None:
                                 sandbox, fs_spec.off_limits, fs_subdir,
                                 iter_base, patch_path, view)
 
-                        # Same termination check as a fresh run; skip on the last iter.
+                        # Same termination check as a fresh run; skip on the last iter,
+                        # and skip re-running a check the session already passed.
                         if ralph_done_script and i < total_iters:
-                            view.notice("", newline_before=False)
+                            if result.goal_met:
+                                view.notice(style(
+                                    "[ralph_done: check passed during the "
+                                    "session -- stopping loop]",
+                                    "bold", "magenta"))
+                                break
                             if _ralph_done(
                                 sandbox, ralph_done_script, view,
                                 timeout=(fs_spec.check_timeout
@@ -2689,9 +2717,11 @@ def _ralph_done(sandbox, script: str, view: SessionView,
                 timeout: float = 300.0) -> bool:
     """Run the --ralph_done check inside the container on the session's committed
     tree. Exit code 0 means the loop is finished (return True to stop); any other
-    code means keep going. The script's output is shown either way."""
-    view.notice(style("running --ralph_done check...", "bold", "magenta"),
-                newline_before=False)
+    code means keep going. The script's output is shown either way. The header
+    carries its own leading blank lines (two, for a clearly separated
+    paragraph), so every caller -- between sessions, or mid-session via
+    run_session's goal_check -- gets the spacing without arranging it."""
+    view.notice("\n" + style("running --ralph_done check...", "bold", "magenta"))
     result = sandbox.run_script(script, timeout=timeout)
     out = (result.stdout + result.stderr).strip()
     if out:

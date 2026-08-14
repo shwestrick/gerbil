@@ -74,8 +74,11 @@ class ParsedSession:
 
 
 # Prefix of the message gerbil sends to request a commit message (see
-# prompts.commit_request). Used to locate the generated commit message in a log.
-_COMMIT_REQUEST_PREFIX = "The task is complete. Here is the final git diff"
+# prompts.commit_request). Used to locate the generated commit message in a
+# log. Deliberately just the first sentence: it matches both the current
+# request and the older wording that embedded the session diff, so logs from
+# either generation resume correctly.
+_COMMIT_REQUEST_PREFIX = "The task is complete."
 
 
 def _load_events(path: Path) -> list[dict]:

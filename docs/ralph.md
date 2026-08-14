@@ -51,6 +51,18 @@ tool that runs the same script and shows it the verdict and output -- so a
 session that believes it is done can verify against the actual stop
 condition (and see exactly which part fails) instead of guessing.
 
+The check also improves how the chain spends its context windows. A session
+that stops with **less than half its window used** doesn't go straight to
+the commit message: gerbil runs the termination check right then. If the
+goal is met, the session wraps up and the loop stops (without re-running
+the check between sessions). If not, the model is told "Your context window
+still has ample room. Keep going." and the *same conversation* continues --
+all the exploration it already paid for stays available, instead of a fresh
+session re-reading the project from scratch. A model that stops again
+without doing any work in between is let through (its verdict can't have
+changed, and re-running a full build to repeat it would loop); the guard is
+inert when the provider doesn't report a context window.
+
 For the common "prove these specific `sorry`s" task, you don't have to write
 the prompt or the check yourself: [`--fill-sorry`](fill-sorry.md) generates
 both (and a cross-session plan file) and defaults to a ralph loop.

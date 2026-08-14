@@ -13,9 +13,11 @@ from pathlib import Path
 
 from .pricing import estimate_cost
 from .prompts import (
+    CONTEXT_KEEP_GOING,
     CONTEXT_TERMINAL,
     CONTEXT_URGENT,
     CONTEXT_WIND_DOWN,
+    KEEP_GOING_NOTE,
     build_system_prompt,
     commit_request,
     context_pressure_note,
@@ -43,6 +45,10 @@ class SessionResult:
     final_text: str       # the model's last task-phase message
     diff: str             # git patch of all changes made during the session
     commit_message: str   # generated commit title + body ("" if no changes)
+    # What the in-session goal_check last reported, with no work after it:
+    # True = the termination check passed (the caller may stop the ralph loop
+    # without re-running it), False/None = unknown or unmet -- re-check.
+    goal_met: bool | None = None
 
 
 # Turn cap for each zoomed-in sub-session in big-small mode (--zoom-max-turns
@@ -90,40 +96,6 @@ def _append_user_text(messages: list, text: str) -> None:
         last["content"] = last["content"] + [{"type": "text", "text": text}]
     else:
         last["content"] = f"{last['content']}\n\n{text}"
-
-
-# Rough bytes-per-token for English text and diffs. Only ever used to decide how
-# much of a diff can still fit, where the cost of being wrong one way is a
-# slightly shorter diff and the other way is a failed final turn -- so it is
-# deliberately pessimistic (real ratios run nearer 3.5-4).
-CHARS_PER_TOKEN = 3.0
-# Tokens to leave free for the commit message itself plus the request's own
-# boilerplate. A commit message is a few hundred tokens; this is generous.
-COMMIT_TURN_RESERVE = 2000
-
-
-def _commit_diff(diff: str, max_context: int | None, usage: Usage | None) -> str:
-    """The diff to show in the commit-message request, shortened if it would not
-    fit in what's left of the context window.
-
-    The final turn re-sends the whole conversation plus this diff. Normally
-    there is room to spare, but a session that ran to CONTEXT_TERMINAL has only
-    the last few percent left -- and a big diff there would blow the window on
-    the one turn whose entire purpose is to explain the session's work before it
-    is lost. Truncation is head+tail (tools.truncate_tool_output), which suits a
-    diff: the first and last hunks are the most identifiable.
-
-    Returns the diff untouched when the window is unknown or the room is ample,
-    so the normal path is exactly as it was."""
-    if not max_context or usage is None:
-        return diff
-    room = max_context - usage.context_tokens - COMMIT_TURN_RESERVE
-    if room <= 0:
-        # Nothing to spend. Ask for the message with the barest possible diff;
-        # the model still has the whole session in view to describe.
-        return truncate_tool_output(diff, 2000)
-    budget = int(room * CHARS_PER_TOKEN)
-    return truncate_tool_output(diff, budget)
 
 
 def _usage_any(u: Usage) -> bool:
@@ -593,6 +565,7 @@ def run_session(
     pending_zoom: dict | None = None,
     view: SessionView | None = None,
     off_limits_check=None,
+    goal_check=None,
 ) -> SessionResult:
     """Run the agent loop until the model stops calling tools (or max_turns).
 
@@ -623,6 +596,14 @@ def run_session(
     fill_sorry.off_limits_monitor), is fed each turn's wip-patch text; a
     warning it returns is delivered into the conversation immediately, so
     the model learns it strayed onto a frozen path the turn it happens.
+
+    `goal_check`, when given (a ralph chain with a termination check), runs
+    that check and returns whether it passed. It is consulted when the model
+    stops calling tools with less than CONTEXT_KEEP_GOING of the window used:
+    an unmet goal sends the model back to work in the same conversation
+    (KEEP_GOING_NOTE) instead of ending the session early, and a met goal is
+    reported as SessionResult.goal_met so the caller can stop the loop
+    without re-running the check.
     """
     view = view if view is not None else PrintView()
     if messages is None:
@@ -670,6 +651,15 @@ def run_session(
     # The most recent turn's usage, shown in the next turn's header so it reflects
     # how full the context is *entering* the turn. None until the first turn lands.
     last_usage: Usage | None = None
+    # Keep-going state (ralph chains with a termination check). goal_met is
+    # what the in-session check last said; worked_since_check gates re-runs:
+    # a model that stops again WITHOUT running a single tool cannot have
+    # changed the check's answer, and re-running a full build to hear the
+    # same verdict -- then pushing the model again -- would ping-pong until
+    # the window filled. Such a session falls through to the commit turn and
+    # lets the outer ralph loop decide.
+    goal_met: bool | None = None
+    worked_since_check = True
 
     # In a ralph loop, tag every turn header with the session counter so it stays
     # visible while scrolling, not just in the once-per-session banner.
@@ -753,12 +743,35 @@ def run_session(
             usage.cache_write_tokens,
         )
 
-        # No tool calls => the model is done with the task.
+        # No tool calls => the model is done with the task. In a ralph chain
+        # with a termination check, a stop this early wastes the window -- a
+        # fresh session re-pays the whole prompt and exploration cost -- so
+        # below CONTEXT_KEEP_GOING run the check right now: goal met, wrap
+        # up; goal unmet, send the model back to work in the SAME
+        # conversation. Inert when the window size is unknown, like the
+        # pressure guards.
         if not tool_calls:
+            if (goal_check is not None and worked_since_check
+                    and max_context and last_usage is not None
+                    and last_usage.context_tokens / max_context
+                    < CONTEXT_KEEP_GOING):
+                worked_since_check = False
+                goal_met = goal_check()
+                if not goal_met:
+                    view.turn_end()
+                    _append_user_text(messages, KEEP_GOING_NOTE)
+                    session.record_turn("user", KEEP_GOING_NOTE)
+                    view.notice(style(
+                        "[goal not met at "
+                        f"{last_usage.context_tokens / max_context:.0%} "
+                        "context: told the model to keep going]",
+                        "bold", "yellow"), newline_before=False)
+                    continue
             view.turn_end()
             break
 
         # Execute tool calls and feed results back.
+        worked_since_check = True
         tool_results = []
         for tc in tool_calls:
             session.record_tool_call(
@@ -853,15 +866,16 @@ def run_session(
 
     # Final turn: ask for a commit message as a true continuation of the
     # conversation. Skipped if nothing changed, or if we bailed on max_turns
-    # (the work is incomplete and the history ends on a tool result). The diff is
-    # taken from the session base, so the message describes the whole session even
-    # when the agent committed some of it internally.
+    # (the work is incomplete and the history ends on a tool result). The diff
+    # is taken from the session base only to decide whether anything changed
+    # (and to report it on SessionResult) -- the request itself repeats none
+    # of it, since every change is already in the model's context.
     #
-    # A context-exhausted session is the opposite case: it is cut short too, but
-    # the whole point of stopping at CONTEXT_TERMINAL rather than at the API's
-    # hard limit is to keep enough room for this turn -- otherwise the session's
-    # work lands as an unexplained patch. The request merges into the pending
-    # tool-result message (see _append_user_text), since the history ends on one.
+    # A context-exhausted session is cut short too, but the whole point of
+    # stopping at CONTEXT_TERMINAL rather than at the API's hard limit is to
+    # keep enough room for this turn -- otherwise the session's work lands as
+    # an unexplained patch. The request merges into the pending tool-result
+    # message (see _append_user_text), since the history ends on one.
     diff = (
         sandbox.diff_since(session.base_commit)
         if session.base_commit else sandbox.get_diff()
@@ -874,7 +888,7 @@ def run_session(
             "bold", "dark_red", max_context=max_context, usage=last_usage,
         )
 
-        request = commit_request(_commit_diff(diff, max_context, last_usage))
+        request = commit_request()
         _append_user_text(messages, request)
         session.record_turn("user", request)
 
@@ -929,5 +943,6 @@ def run_session(
         )
     view.usage_summary(turn + turn_offset, total, cost)
     return SessionResult(
-        final_text=final_text, diff=diff, commit_message=commit_message
+        final_text=final_text, diff=diff, commit_message=commit_message,
+        goal_met=goal_met,
     )

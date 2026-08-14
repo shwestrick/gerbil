@@ -173,7 +173,8 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   land.** When the window size is known, `agent.run_session` advises the model to
   wrap up at `CONTEXT_WIND_DOWN` (75%), orders it at `CONTEXT_URGENT` (85%), and
   at `CONTEXT_TERMINAL` (95%) stops the loop itself — but still runs the
-  commit-message turn, shortening the diff to fit (`_commit_diff`) so the
+  commit-message turn (a small fixed request -- the session's changes are
+  already in the model's context, so no diff is repeated) so the
   session's work lands explained rather than as a bare patch. Each note is
   delivered once, on the turn that crosses its threshold; repeating it would
   spend the very room it warns about. Every check is measured on
@@ -360,7 +361,15 @@ session; exit 0 stops the loop. Whenever a termination check is installed
 (user-supplied or fill-sorry-generated), the model also gets a `check_goal`
 tool (tools.py) that runs the same script and returns its verdict + output,
 with a system-prompt note (`prompts.CHECK_GOAL_NOTE`) telling it the check is
-the definition of done.
+the definition of done. And the check gates early stops: below
+`prompts.CONTEXT_KEEP_GOING` (50%) of a known window, a session that stops
+calling tools runs the check in-session (`run_session`'s `goal_check`
+callback) -- unmet sends `KEEP_GOING_NOTE` and the SAME conversation
+continues (no re-check unless tools ran since the last one, so a refusing
+model can't ping-pong full builds); met is carried as
+`SessionResult.goal_met`, and the between-sessions re-run is skipped since no
+work happened after the verdict. Measured on `Usage.context_tokens` like the
+pressure thresholds, and equally inert when the window is unknown.
 
 **Fill-sorry mode** (`--fill-sorry FILE:LINE[:COL],...`, `--fill-sorry
 Ns.decl,...` (positions and declaration names mix freely; names are located
