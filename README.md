@@ -2,18 +2,21 @@
 
 :warning: work-in-progress, but fairly stable :warning:
 
-<img src="assets/gerbil.png" align="right" width="220" hspace="20" alt="gerbil sitting in its sandbox">
+<img src="assets/gerbil.png" align="right" width="180" hspace="20" alt="gerbil sitting in its sandbox">
 
 A sandboxed agent for Lean projects. gerbil sessions run in a
 container (Docker or podman) and produce git patches.
 
 ```console
 $ gerbil run --model claude-opus-4-8 \
-             --prompt tell-gerbil-what-to-do.md
+             --fill-sorry MyProject.lemma1
 ...
 $ gerbil commit
 $ git push
 ```
+
+![the gerbil live viewer: session stats and per-file diff on the left, the
+scrolling turn-by-turn stream on the right](assets/screenshot.png)
 
 ## Install
 
@@ -63,6 +66,24 @@ already-committed patches), `gerbil reconstruct-patch`. Every command takes
 
 More: [Workflow](docs/workflow.md)
 
+## Filling in `sorry`s
+
+For the most common task -- "prove these `sorry`s" -- you don't have to write
+a prompt at all. Point gerbil at the sorries, by position or by declaration
+name, and it generates the prompt, a cross-session plan file, and a goal check
+scoped to exactly those sorries, then loops until the check passes:
+
+```console
+$ gerbil run --fill-sorry MyProj/Basic.lean:42
+$ gerbil run --fill-sorry MyNs.foo,MyProj/B.lean:107
+```
+
+A task spec (`--fill-sorry task.toml`) adds off-limits paths, an axiom policy,
+approach notes, and more; `gerbil new-fill` opens your editor on a template of
+every key and starts the run once you confirm.
+
+More: [Filling sorries](docs/fill-sorry.md)
+
 ## Documentation
 
 - [Installation](docs/install.md) -- installing and updating, Docker vs. podman,
@@ -72,6 +93,8 @@ More: [Workflow](docs/workflow.md)
 - [Workflow](docs/workflow.md) -- prompt, patch, commit, etc.
 - [Ralph loops](docs/ralph.md) -- `--ralph N`, and stopping when the work is
   actually done
+- [Filling sorries](docs/fill-sorry.md) -- `--fill-sorry` and `gerbil
+  new-fill`: designate `sorry`s and let gerbil write the task
 - [Big-small mode](docs/big-small.md) -- a big model delegating individual
   `sorry`s to a cheaper one
 - [Resuming and reconstructing](docs/resume.md) -- recovering a crashed session
