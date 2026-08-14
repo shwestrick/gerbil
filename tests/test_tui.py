@@ -294,7 +294,7 @@ def test_file_summary() -> None:
     from gerbil.view import file_summary, merge_file_stats
 
     tee, corner = render.GLYPHS["tee"], render.GLYPHS["corner"]
-    pipe, blank = render.GLYPHS["pipe"], render.GLYPHS["blank"]
+    pipe = render.GLYPHS["pipe"]
 
     stats = SessionStats()
     stats.on_session_begin(name="s", model="m", small_model=None, ralph=None,
@@ -311,13 +311,13 @@ def test_file_summary() -> None:
     }
     out = file_summary(stats, 40)
     lines = out.splitlines()
-    check("directories first, tree connectors drawn",
-          any(l.startswith(f"{tee}Toy/") for l in lines)
-          and any(l.startswith(f"{corner}img.png") for l in lines), out)
+    check("directories first, top level drawn without connectors",
+          any(l.startswith("Toy/") for l in lines)
+          and any(l.startswith("img.png") for l in lines), out)
     check("single-child directory chain compressed",
-          any(l.startswith(f"{pipe}{tee}Sub/Deep/") for l in lines), out)
+          any(l.startswith(f"{tee}Sub/Deep/") for l in lines), out)
     check("nested leaf under the compressed chain",
-          any(l.startswith(f"{pipe}{pipe}{corner}X.lean") and "+1" in l
+          any(l.startswith(f"{pipe}{corner}X.lean") and "+1" in l
               for l in lines), out)
     check("per-file figures right-aligned",
           any("Basic.lean" in l and l.rstrip().endswith("-8") and "+120" in l
@@ -327,6 +327,23 @@ def test_file_summary() -> None:
           out)
     check("totals row", any("total (4 files)" in l and "+123" in l
                             and "-9" in l for l in lines), out)
+
+    # A path too long for the pane widens the tree instead of being clipped:
+    # the viewer scrolls horizontally, and every row keeps the same right edge.
+    long = SessionStats()
+    long.on_session_begin(name="s", model="m", small_model=None, ralph=None,
+                          resumed_from=None, now=0.0)
+    long.files = {"A.lean": (1, 1),
+                  "Toy/Deeply/Nested/AnAbsurdlyLongLeanFileName.lean": (2, 3)}
+    rows = [render._ANSI_RE.sub("", l)
+            for l in file_summary(long, 40).splitlines()]
+    check("long path kept whole",
+          any("AnAbsurdlyLongLeanFileName.lean" in l for l in rows)
+          and not any("…" in l for l in rows), str(rows))
+    widths = {len(l) for l in rows
+              if l.endswith(("-1", "-3")) or l.startswith("total")}
+    check("rows share one right edge past the pane width",
+          len(widths) == 1 and widths.pop() > 40, str(rows))
 
     # A ralph chain: session 1's diff folds into the chain at the next
     # session_begin, and the chain section shows the running sum.

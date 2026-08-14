@@ -506,14 +506,17 @@ def render_stats(stats: SessionStats, width: int, now: float | None = None) -> s
     return "\n".join(lines)
 
 
-def render_file_tree(
-    files: dict[str, tuple[int, int] | None], width: int
-) -> list[str]:
-    """A `tree`-style listing of a diff-stat dict, one line per directory or
-    file, +/- figures right-aligned. Chains of single-child directories are
-    compressed onto one line (A/B/C/), so depth costs width only where the
-    tree actually branches. Connector glyphs come from render.GLYPHS and
-    degrade to ASCII exactly like every other decoration."""
+def _tree_rows(
+    files: dict[str, tuple[int, int] | None]
+) -> list[tuple[str, tuple[int, int] | None, bool]]:
+    """The file tree as (label, counts, is_leaf) rows, in display order --
+    labels already carry their connector prefix and a directory's trailing
+    slash. Split out from the formatting so the pane's width can be measured
+    from the finished labels before any of them is padded (see tree_width).
+
+    Top-level entries are drawn bare: the outermost column of connectors would
+    be a single trunk with nothing to relate to, so every top-level name starts
+    at column 0 and its subtree is drawn as if that name were the root."""
     tee, corner = render.GLYPHS["tee"], render.GLYPHS["corner"]
     pipe, blank = render.GLYPHS["pipe"], render.GLYPHS["blank"]
 
@@ -526,35 +529,18 @@ def render_file_tree(
             node = node.setdefault(part, {})
         node[parts[-1]] = {None: counts}
 
-    def row(prefix: str, name: str, counts=None, leaf=False) -> str:
-        if not leaf:
-            return prefix + name
-        if counts is None:
-            figures = "bin"
-        else:
-            figures = (render.style(f"+{counts[0]}", "green") + " "
-                       + render.style(f"-{counts[1]}", "red"))
-        fig_width = render._visible_len(figures)
-        label = prefix + name
-        avail = max(2, width - fig_width - 1)
-        if len(label) > avail:
-            label = label[:avail - 1] + "…"
-        pad = max(1, width - len(label) - fig_width)
-        return f"{label}{' ' * pad}{figures}"
+    rows: list[tuple[str, tuple[int, int] | None, bool]] = []
 
-    lines: list[str] = []
-
-    def walk(node: dict, prefix: str) -> None:
+    def walk(node: dict, prefix: str, top: bool) -> None:
         dirs = sorted(k for k, v in node.items() if k and None not in v)
         leaves = sorted(k for k, v in node.items() if k and None in v)
         entries = dirs + leaves
         for i, name in enumerate(entries):
             last = i == len(entries) - 1
-            connector = corner if last else tee
+            connector = "" if top else (corner if last else tee)
             child = node[name]
             if None in child:
-                lines.append(row(prefix + connector, name,
-                                 child[None], leaf=True))
+                rows.append((prefix + connector + name, child[None], True))
             else:
                 # Compress single-child directory chains: A/B/C/ on one line.
                 label = name
@@ -562,10 +548,54 @@ def render_file_tree(
                     (only,) = child
                     label += "/" + only
                     child = child[only]
-                lines.append(row(prefix + connector, label + "/"))
-                walk(child, prefix + (blank if last else pipe))
+                rows.append((prefix + connector + label + "/", None, False))
+                below = "" if top else prefix + (blank if last else pipe)
+                walk(child, below, False)
 
-    walk(tree, "")
+    walk(tree, "", True)
+    return rows
+
+
+def _fig_width(counts: tuple[int, int] | None) -> int:
+    """Columns the right-aligned figures of a leaf occupy."""
+    if counts is None:
+        return len("bin")
+    return len(f"+{counts[0]}") + 1 + len(f"-{counts[1]}")
+
+
+def tree_width(files: dict[str, tuple[int, int] | None], width: int) -> int:
+    """The columns the file tree actually needs: `width` unless a long path
+    pushes past it, in which case the pane scrolls horizontally rather than
+    truncating names. Shared by render_file_tree and the totals row beneath it
+    so both align on the same right edge."""
+    need = 0
+    for label, counts, leaf in _tree_rows(files):
+        row = len(label) + 1 + _fig_width(counts) if leaf else len(label)
+        need = max(need, row)
+    return max(width, need)
+
+
+def render_file_tree(
+    files: dict[str, tuple[int, int] | None], width: int
+) -> list[str]:
+    """A `tree`-style listing of a diff-stat dict, one line per directory or
+    file, +/- figures right-aligned. Chains of single-child directories are
+    compressed onto one line (A/B/C/), so depth costs width only where the
+    tree actually branches. Connector glyphs come from render.GLYPHS and
+    degrade to ASCII exactly like every other decoration."""
+    width = tree_width(files, width)
+    lines: list[str] = []
+    for label, counts, leaf in _tree_rows(files):
+        if not leaf:
+            lines.append(label)
+            continue
+        if counts is None:
+            figures = "bin"
+        else:
+            figures = (render.style(f"+{counts[0]}", "green") + " "
+                       + render.style(f"-{counts[1]}", "red"))
+        pad = max(1, width - len(label) - render._visible_len(figures))
+        lines.append(f"{label}{' ' * pad}{figures}")
     return lines
 
 
@@ -587,7 +617,9 @@ def file_summary(stats: SessionStats, width: int) -> str:
                      + " "
                      + render.style(f"-{sum(r for _, r in counted)}", "red"))
             label = f"total ({len(files)} files)"
-            pad = max(1, width - len(label) - render._visible_len(total))
+            # Same right edge as the rows above, long paths and all.
+            pad = max(1, tree_width(files, width) - len(label)
+                      - render._visible_len(total))
             lines.append(render.style(f"{label}{' ' * pad}", "gray") + total)
         return lines
 

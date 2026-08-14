@@ -46,7 +46,7 @@ import time
 from rich.text import Text
 from textual.app import App
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.events import Print
 from textual.widgets import Footer, RichLog, Static
 
@@ -58,8 +58,10 @@ from .view import SessionStats, file_summary, render_stats, stats_from_wire
 LOG_MAX_LINES = 20_000
 
 # The stats pane's fixed width (columns), including 1 column of padding each
-# side. Wide enough for a 5-digit +/- file table row and the token figures.
-STATS_PANE_WIDTH = 44
+# side. Wide enough for a 5-digit +/- file table row and the token figures,
+# with room left for a few levels of tree indentation before a path has to be
+# scrolled to.
+STATS_PANE_WIDTH = 49
 
 POLL_INTERVAL = 0.25  # display/stats/liveness poll cadence (seconds)
 
@@ -76,6 +78,9 @@ class ViewerApp(App):
     }}
     #stats {{ height: auto; padding: 0 1; }}
     #filepane {{ height: 1fr; padding: 0 1; }}
+    /* Width is set per refresh from the longest row (see refresh_stats); a
+       row wider than the pane is what gives #filepane something to scroll
+       horizontally over. */
     #log {{ width: 1fr; }}
     """
     BINDINGS = [
@@ -117,7 +122,7 @@ class ViewerApp(App):
             # once the tree outgrows the pane.
             with Vertical(id="left"):
                 yield Static(id="stats")
-                with VerticalScroll(id="filepane"):
+                with ScrollableContainer(id="filepane"):
                     yield Static(id="files")
             yield RichLog(id="log", wrap=True, max_lines=LOG_MAX_LINES,
                           auto_scroll=True)
@@ -222,8 +227,18 @@ class ViewerApp(App):
         pane = self.query_one("#stats", Static)
         width = pane.content_size.width or (STATS_PANE_WIDTH - 2)
         pane.update(Text.from_ansi(render_stats(self.stats, width)))
-        self.query_one("#files", Static).update(
-            Text.from_ansi(file_summary(self.stats, width)))
+
+        files = self.query_one("#files", Static)
+        summary = Text.from_ansi(file_summary(self.stats, width))
+        files.update(summary)
+        # Give the widget the width its longest row actually needs, so a path
+        # too long for the pane scrolls sideways instead of being clipped.
+        # Set explicitly rather than left to `width: auto`, which textual caps
+        # at the container's width -- exactly the cap we want to escape. The
+        # .plain text is ANSI-free, so len() is the column count.
+        longest = max((len(line) for line in summary.plain.splitlines()),
+                      default=0)
+        files.styles.width = max(width, longest)
 
     # -- user actions ----------------------------------------------------------
 
