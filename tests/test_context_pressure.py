@@ -325,7 +325,7 @@ def test_keep_going():
     """Ralph keep-going: a natural stop below CONTEXT_KEEP_GOING runs the
     termination check in-session; unmet sends the model back to work in the
     same conversation, met ends the session with goal_met for the caller."""
-    print("\n-- keep-going below 50% context --")
+    print("\n-- keep-going below 15% context --")
     import json
     import tempfile
 
@@ -393,7 +393,7 @@ def test_keep_going():
     # the second -> wrap up, goal_met reported so the caller skips a re-run.
     result, checks, events = run(
         plan=["tool", "stop", "tool", "stop"],
-        pcts=[0.20, 0.30, 0.35, 0.40], verdicts=[False, True])
+        pcts=[0.05, 0.08, 0.10, 0.12], verdicts=[False, True])
     check("check ran at both stops", checks == 2, str(checks))
     check("keep-going note entered the conversation as a user turn",
           any(e.get("event") == "turn" and e.get("role") == "user"
@@ -408,15 +408,15 @@ def test_keep_going():
     # verdict: no second check (a full build), no ping-pong -- fall through.
     result, checks, _ = run(
         plan=["tool", "stop", "stop"],
-        pcts=[0.20, 0.30, 0.31], verdicts=[False])
+        pcts=[0.05, 0.08, 0.09], verdicts=[False])
     check("no re-check without work in between", checks == 1, str(checks))
     check("last verdict carried on the result", result.goal_met is False,
           str(result.goal_met))
 
     # At or above the threshold the session ends exactly as before.
     result, checks, _ = run(
-        plan=["tool", "stop"], pcts=[0.30, 0.60], verdicts=[False])
-    check("no check at >= 50% context", checks == 0, str(checks))
+        plan=["tool", "stop"], pcts=[0.10, 0.30], verdicts=[False])
+    check("no check at >= 15% context", checks == 0, str(checks))
     check("goal unknown without a check", result.goal_met is None,
           str(result.goal_met))
 
@@ -432,7 +432,7 @@ def test_prompt_constants_are_the_spec():
     check("75%", prompts.CONTEXT_WIND_DOWN == 0.75)
     check("85%", prompts.CONTEXT_URGENT == 0.85)
     check("95%", prompts.CONTEXT_TERMINAL == 0.95)
-    check("50%", prompts.CONTEXT_KEEP_GOING == 0.50)
+    check("15%", prompts.CONTEXT_KEEP_GOING == 0.15)
 
 
 if __name__ == "__main__":

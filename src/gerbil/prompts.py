@@ -188,7 +188,7 @@ CONTEXT_TERMINAL = 0.95     # take over: commit message, then end the session
 # termination check, and an unmet goal sends the model back to work in the
 # SAME conversation (see agent.run_session's goal_check). Like the pressure
 # thresholds, inert when the window size is unknown.
-CONTEXT_KEEP_GOING = 0.50
+CONTEXT_KEEP_GOING = 0.15
 
 # The message that sends the model back to work. Delivered as its own user
 # message -- the model just stopped, so no tool results are pending.

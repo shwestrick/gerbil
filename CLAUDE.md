@@ -362,7 +362,7 @@ session; exit 0 stops the loop. Whenever a termination check is installed
 tool (tools.py) that runs the same script and returns its verdict + output,
 with a system-prompt note (`prompts.CHECK_GOAL_NOTE`) telling it the check is
 the definition of done. And the check gates early stops: below
-`prompts.CONTEXT_KEEP_GOING` (50%) of a known window, a session that stops
+`prompts.CONTEXT_KEEP_GOING` (15%) of a known window, a session that stops
 calling tools runs the check in-session (`run_session`'s `goal_check`
 callback) -- unmet sends `KEEP_GOING_NOTE` and the SAME conversation
 continues (no re-check unless tools ran since the last one, so a refusing
