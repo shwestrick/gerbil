@@ -8,6 +8,8 @@
 #
 # Commands:
 #   gerbil run [--prompt FILE] [--at DIR] [--ralph N] ...   run a session
+#   gerbil new-fill [--at DIR] ...                          author a fill-sorry task
+#                                                           in $EDITOR, then run it
 #   gerbil resume SESSION_FILE [--at DIR] ...                continue a crashed session
 #   gerbil commit [--at DIR]                                git am the patches
 #   gerbil cleanup [--at DIR]                               delete committed patches
@@ -254,7 +256,8 @@ remove_old_images() {
 }
 
 usage() {
-    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+    # The header comment above, through the trailing requirements note.
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 cmd="${1:-}"
@@ -270,7 +273,7 @@ case "$cmd" in
         bootstrap_if_needed
         echo "gerbil $(cat "$CURRENT_FILE")"
         ;;
-    run)
+    run|new-fill)
         bootstrap_if_needed
         ensure_image
         shift
@@ -278,9 +281,11 @@ case "$cmd" in
         # project) so --at defaults to it. GERBIL_CWD carries it explicitly,
         # GERBIL_SANDBOX_IMAGE selects the version-matched image, and
         # GERBIL_VERSION records the running version in the session log.
+        # new-fill takes the same path: after its interactive spec authoring
+        # it delegates to run, sandbox and all.
         exec env GERBIL_CWD="$PWD" GERBIL_SANDBOX_IMAGE="$SANDBOX_IMAGE" \
             GERBIL_VERSION="$(cat "$CURRENT_FILE")" \
-            uv run --project "$(current_dir)" python -m gerbil run "$@"
+            uv run --project "$(current_dir)" python -m gerbil "$cmd" "$@"
         ;;
     resume)
         bootstrap_if_needed
