@@ -70,8 +70,9 @@ $ gerbil commit
 $ git push
 ```
 
-gerbil works best at filling a `sorry`, but has other functionality as well.
-See more documentation below.
+gerbil works best at filling a `sorry`. We recommend trying
+`gerbil new-fill` to specify more fine-grained control and guardrails
+for a sorry-filling task. See other documented functionality below, too.
 
 ## Documentation
 
