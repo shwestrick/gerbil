@@ -435,6 +435,30 @@ def test_validate() -> None:
     check("undesignated sorries in the file get a note",
           any("not part of the goal" in w for w in warnings))
 
+    # ...but a file whose designation list is exactly complete must not be
+    # told otherwise. The word `sorry` in a docstring is prose, and a second
+    # sorry inside a DESIGNATED declaration is part of the goal (the check is
+    # collectAxioms on that declaration, which covers both).
+    complete = git_project({"A/B.lean": (
+        "/-!\nThe proofs are intentionally left as `sorry`.\n-/\n"
+        "theorem foo : 1 = 1 := by\n"
+        "  have h : 2 = 2 := by sorry\n"
+        "  sorry\n")})
+    spec = spec_from_positions(parse_positions("A/B.lean:6"))
+    errors, warnings, _ = validate(
+        spec, project_dir=complete, repo_root=complete)
+    check("a complete designation list draws no note",
+          errors == [] and not any("not part of the goal" in w
+                                   for w in warnings),
+          "\n".join(errors + warnings))
+
+    # A designation pointing at prose is still worth warning about.
+    spec = spec_from_positions(parse_positions("A/B.lean:2"))
+    _, warnings, _ = validate(spec, project_dir=complete, repo_root=complete)
+    check("a `sorry` in a docstring does not count as one",
+          any("does not contain" in w for w in warnings),
+          "\n".join(warnings))
+
     spec = spec_from_positions(
         parse_positions("A/B.lean:2,A/B.lean:2,A/B.lean:4"))
     _, warnings, _ = validate(spec, project_dir=proj, repo_root=proj)
@@ -775,6 +799,47 @@ def parse_session_none(tmp: Path):
     return parse_session(log)
 
 
+def test_lexer() -> None:
+    """Telling a real `sorry` term from text that merely reads like one --
+    the census the undesignated-sorry note is built on."""
+    print("\n=== code_only / find_sorries ===")
+    from gerbil.fill_sorry import code_only, find_sorries
+
+    src = [
+        "/-- A docstring: the proofs are left as `sorry`. -/",   # 1
+        "theorem a : True := by sorry  -- and sorry again",      # 2
+        'def msg := "a sorry in a string"',                      # 3
+        "/- outer /- nested sorry -/ still commented -/",        # 4
+        "theorem b : True := by",                                # 5
+        "  sorry",                                               # 6
+        "def q := if c == '\"' then sorryAx else foo_sorry",     # 7
+        "def r := Foo.sorry",                                    # 8
+    ]
+    check("only real sorry terms are found",
+          find_sorries(src) == [(2, 24), (6, 3)], str(find_sorries(src)))
+    check("blanking preserves line count and every column",
+          [len(a) for a in code_only(src)] == [len(l) for l in src]
+          and code_only(src)[1].startswith("theorem a : True := by sorry"),
+          str(code_only(src)))
+    check("a char literal never opens a string",
+          "sorryAx" in code_only(src)[6], code_only(src)[6])
+
+    # A multi-line string keeps its state across lines, like a block comment.
+    multi = ['def s := "line one', 'still string: sorry"', "def t := sorry"]
+    check("multi-line string swallows its sorry",
+          find_sorries(multi) == [(3, 10)], str(find_sorries(multi)))
+
+    # A header quoted in a docstring is prose, not a declaration.
+    from gerbil.fill_sorry import resolve_decl
+    quoted = [
+        "/-- Use it as `theorem fake : P := by simp`. -/",
+        "theorem real : True := by",
+        "  sorry",
+    ]
+    check("a header inside a docstring is not scanned as one",
+          resolve_decl(quoted, 3) == ("real", ""), str(resolve_decl(quoted, 3)))
+
+
 def main() -> None:
     test_positions()
     test_resolver()
@@ -783,6 +848,7 @@ def main() -> None:
     test_modules()
     test_spec()
     test_plan_name()
+    test_lexer()
     test_validate()
     test_seed_plan()
     test_off_limits()

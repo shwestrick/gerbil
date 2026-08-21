@@ -380,6 +380,107 @@ def target_modules(spec: FillSorrySpec) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Lexing: enough of Lean's surface syntax to tell code from prose
+#
+# Both the declaration scan and the sorry census must not be fooled by text
+# that merely *reads* like Lean. A module docstring saying "the proofs are
+# intentionally left as `sorry`" is the common case -- counting it made
+# --fill-sorry warn about undesignated sorries in a file that had none, which
+# is worse than no warning: it tells the user their designation list is
+# incomplete when it is exactly right.
+# ---------------------------------------------------------------------------
+
+# A char literal, matched only to step over it: `'` is also an ordinary
+# identifier character in Lean (h', k'), so it can never be treated as the
+# start of a quoted span -- but `'"'` must not be read as opening a string.
+_CHAR_LIT_RE = re.compile(r"'(?:\\.|[^'\\])'")
+
+
+def code_only(lines: list[str]) -> list[str]:
+    """`lines` with every comment and string literal blanked to spaces.
+
+    Same number of lines, each the same length as its original, so 1-indexed
+    line and column numbers still address the same characters -- callers can
+    scan the result and report positions in the real file.
+
+    Handles what actually shows up in Lean sources: `--` line comments,
+    `/- -/` block comments (which *nest*, and cover `/-- -/` docstrings), and
+    string literals with backslash escapes. Multi-line strings keep their
+    state across lines like block comments do; the char-literal step-over
+    above is what keeps a stray `'"'` from swallowing the rest of the file."""
+    out: list[str] = []
+    depth = 0        # block-comment nesting
+    in_string = False
+    for text in lines:
+        buf = []
+        i, n = 0, len(text)
+        while i < n:
+            two = text[i:i + 2]
+            if depth:
+                if two == "/-":
+                    depth += 1
+                    buf.append("  ")
+                    i += 2
+                    continue
+                if two == "-/":
+                    depth -= 1
+                    buf.append("  ")
+                    i += 2
+                    continue
+                buf.append(" ")
+                i += 1
+                continue
+            if in_string:
+                if text[i] == "\\" and i + 1 < n:
+                    buf.append("  ")
+                    i += 2
+                    continue
+                if text[i] == '"':
+                    in_string = False
+                buf.append(" ")
+                i += 1
+                continue
+            if two == "--":
+                buf.append(" " * (n - i))
+                break
+            if two == "/-":
+                depth = 1
+                buf.append("  ")
+                i += 2
+                continue
+            if text[i] == '"':
+                in_string = True
+                buf.append(" ")
+                i += 1
+                continue
+            if text[i] == "'" and (m := _CHAR_LIT_RE.match(text, i)):
+                buf.append(m.group(0))  # code, and holds no `sorry`
+                i = m.end()
+                continue
+            buf.append(text[i])
+            i += 1
+        out.append("".join(buf))
+    return out
+
+
+# `sorry` as a term, not as part of a longer name: sorryAx, foo_sorry and
+# `Foo.sorry` (dot-notation) are all something else. Lean identifiers admit
+# unicode letters and digits plus _ ' ! ?, which is exactly what \w and the
+# extras here cover.
+_SORRY_RE = re.compile(r"(?<![\w'!?.])sorry(?![\w'!?])")
+
+
+def find_sorries(lines: list[str]) -> list[tuple[int, int]]:
+    """Every real `sorry` term in a file, as 1-indexed (line, column) --
+    comments and strings excluded (see code_only)."""
+    return [
+        (i, m.start() + 1)
+        for i, text in enumerate(code_only(lines), start=1)
+        for m in _SORRY_RE.finditer(text)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Position -> declaration resolution
 #
 # The goal check is scoped to the declaration each designated sorry lives in
@@ -407,32 +508,42 @@ def _scan_decls(lines: list[str]) -> list[tuple[int, str, str | None]]:
     scan on purpose: elaborating the project host-side just to name a
     declaration would cost a full build at preflight, and the check
     re-resolves names against the live environment anyway (suffix match
-    within the module), so a plausible mis-qualification still lands. Block
-    comments are tracked so a commented-out header is not picked up."""
+    within the module), so a plausible mis-qualification still lands. The scan
+    runs over code_only(lines), so a header quoted in a docstring or commented
+    out is not picked up."""
     out: list[tuple[int, str, str | None]] = []
     stack: list[tuple[str, str]] = []  # ("namespace", name) | ("scope", "")
-    depth = 0  # block-comment nesting
-    for i, text in enumerate(lines, start=1):
-        if depth == 0:
-            if m := _NS_RE.match(text):
-                stack.append(("namespace", m.group(1)))
-            elif _SCOPE_RE.match(text):
-                stack.append(("scope", ""))
-            elif _END_RE.match(text):
-                if stack:
-                    stack.pop()
-            elif m := _DECL_RE.match(text):
-                if m.group(3):
-                    ns = [] if m.group(2) else [
-                        n for kind, n in stack if kind == "namespace"
-                    ]
-                    fqn = ".".join(ns + [m.group(3)])
-                else:
-                    fqn = None
-                out.append((i, m.group(1), fqn))
-        depth += text.count("/-") - text.count("-/")
-        depth = max(depth, 0)
+    for i, text in enumerate(code_only(lines), start=1):
+        if m := _NS_RE.match(text):
+            stack.append(("namespace", m.group(1)))
+        elif _SCOPE_RE.match(text):
+            stack.append(("scope", ""))
+        elif _END_RE.match(text):
+            if stack:
+                stack.pop()
+        elif m := _DECL_RE.match(text):
+            if m.group(3):
+                ns = [] if m.group(2) else [
+                    n for kind, n in stack if kind == "namespace"
+                ]
+                fqn = ".".join(ns + [m.group(3)])
+            else:
+                fqn = None
+            out.append((i, m.group(1), fqn))
     return out
+
+
+def _enclosing_header(headers: list[int], line: int) -> int | None:
+    """The header line of the declaration containing 1-indexed `line` -- the
+    last header at or above it -- or None when nothing is (a sorry above the
+    file's first declaration). The same "last header wins" rule resolve_decl
+    uses, over a header list already scanned."""
+    found = None
+    for h in headers:
+        if h > line:
+            break
+        found = h
+    return found
 
 
 def resolve_decl(lines: list[str], line: int) -> tuple[str | None, str]:
@@ -688,6 +799,7 @@ def validate(
 
     seen: set[SorryPos] = set()
     deduped: list[SorryPos] = []
+    file_lines: dict[str, list[str]] = {}   # for the undesignated-sorry note
     for pos in spec.sorries:
         if pos in seen:
             warnings.append(f"duplicate sorry position {pos} (ignored)")
@@ -715,8 +827,10 @@ def validate(
         if pos.line > len(lines):
             errors.append(f"{pos}: file has only {len(lines)} lines")
             continue
+        file_lines[pos.file] = lines
         text = lines[pos.line - 1]
-        if "sorry" not in text and pos not in from_name:
+        if (pos.line not in {l for l, _ in find_sorries(lines)}
+                and pos not in from_name):
             warnings.append(f"{pos}: the line does not contain `sorry` "
                             f"(it reads: {text.strip()[:60]!r})")
         if pos.column is not None and pos.column > len(text) + 1:
@@ -745,17 +859,29 @@ def validate(
             else:
                 spec.decls[str(pos)] = decl
 
-        # Other sorries in the file are simply not part of the goal; note
-        # them so nobody expects the check to demand their removal.
-        n_listed = sum(1 for p in spec.sorries if p.file == pos.file)
-        n_present = sum(l.count("sorry") for l in lines)
-        if n_present > n_listed and not any(
-            w.startswith(f"note: {pos.file}") for w in warnings
-        ):
+    # Sorries the goal does not cover, noted so nobody expects the check to
+    # demand their removal. The scope is the *declaration*, not the file: the
+    # check runs collectAxioms per designated declaration, so a second sorry
+    # inside one of them is part of the goal after all, and only sorries
+    # elsewhere in the file are not. Counting real `sorry` terms (find_sorries,
+    # not the word anywhere in the text) is the other half of getting this
+    # right -- a docstring that merely mentions `sorry` used to make a file
+    # whose designation list was exactly complete report otherwise.
+    for f, lines in file_lines.items():
+        headers = [line for line, _kind, _fqn in _scan_decls(lines)]
+        covered = {_enclosing_header(headers, p.line)
+                   for p in spec.sorries if p.file == f}
+        extra = [line for line, _col in find_sorries(lines)
+                 if _enclosing_header(headers, line) not in covered]
+        if extra:
+            shown = ", ".join(str(line) for line in extra[:6])
+            if len(extra) > 6:
+                shown += ", ..."
             warnings.append(
-                f"note: {pos.file} contains other `sorry`s beyond the "
-                f"{n_listed} designated -- they are not part of the goal; "
-                "the agent is told to leave them alone"
+                f"note: {f} has {len(extra)} `sorry`(s) outside the "
+                f"designated declarations (line{'s' if len(extra) > 1 else ''} "
+                f"{shown}) -- they are not part of the goal; the agent is "
+                "told to leave them alone"
             )
 
     if not spec.sorries:

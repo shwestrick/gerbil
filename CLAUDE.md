@@ -55,7 +55,11 @@ src/gerbil/
                         validation, the generated task prompt + check-goal
                         script, plan-file naming, and the off-limits glob
                         matching shared by the generated check and cli.py's
-                        patch gate. Pure except validate() (host file reads)
+                        patch gate. Also the small Lean lexer both syntactic
+                        scans run on -- code_only blanks comments and string
+                        literals, so find_sorries and the declaration scan
+                        never mistake prose for code. Pure except validate()
+                        (host file reads)
   pricing.py            MODEL_PRICING table and cost estimation (N/A when unknown)
   context_windows.py    everything about a model's context window: the static
                         CONTEXT_WINDOWS table (snapshot of benchlm.ai/llm-pricing)
