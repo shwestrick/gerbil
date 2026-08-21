@@ -232,6 +232,12 @@ class SessionStats:
     # Wall clock (time.monotonic values; render_stats takes `now`)
     chain_started: float = 0.0
     session_started: float = 0.0
+    # How many sessions have begun in this run. Only on_session_begin reads
+    # it (to tell the run's first session -- whose clock the runner already
+    # anchored at the run's start, boot included -- from the ralph sessions
+    # after it, each of which starts its own session clock), so it stays off
+    # the wire like the other runner-internal bookkeeping.
+    sessions_begun: int = 0
 
     # Per-session counters
     turns: int = 0
@@ -289,7 +295,13 @@ class SessionStats:
         self.resumed_from = resumed_from
         if not self.chain_started:
             self.chain_started = now
-        self.session_started = now
+        # The first session inherits the run's own start (sandbox boot and the
+        # mathlib cache fetch happen before any session begins, and belong to
+        # its wall clock); every session after it -- ralph iteration 2+ -- gets
+        # a fresh clock, with the chain row carrying the total.
+        if self.sessions_begun or not self.session_started:
+            self.session_started = now
+        self.sessions_begun += 1
         self.turns = 0
         self.zoom_turns = 0
         self.last_context_tokens = 0
@@ -768,6 +780,20 @@ class RunnerView(PrintView):
         self._dir = run_dir
         self.stats = SessionStats(run_name=run_dir.name)
         self._tail: list[str] = []
+        # Anchor the clocks at the run's registration (meta.json's started_at)
+        # rather than at the first session_begin: preflight, sandbox boot and
+        # `lake exe cache get` all run before any session exists, and they are
+        # minutes of the run's elapsed time. Translating the recorded wall
+        # stamp -- instead of stamping monotonic() here -- is also what makes
+        # the runner and every viewer share ONE origin.
+        started = runs.monotonic_from_wall(
+            (runs.load_meta_dir(run_dir) or {}).get("started_at"))
+        self.stats.chain_started = self.stats.session_started = (
+            time.monotonic() if started is None else started)
+        # Publish it before anything else happens, so a viewer attached during
+        # the boot reads the run's real elapsed off the wire instead of
+        # seeding a stopwatch of its own.
+        self._save()
 
     def _save(self) -> None:
         try:

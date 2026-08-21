@@ -97,10 +97,16 @@ class ViewerApp(App):
         super().__init__()
         self._name = name
         self._meta = meta
-        # Seeded so the pane isn't blank while the runner is still booting its
-        # sandbox (the first stats.json arrives at the first session_begin).
+        # Seeded so the pane isn't blank before the first stats.json read.
+        # The clocks anchor at the run's registered start (meta.json's
+        # started_at, translated into this process's monotonic clock), never
+        # at this viewer's own birth: the elapsed a run shows must not depend
+        # on when someone happened to attach, so detaching mid-boot and
+        # grabbing again shows the clock still running, not zero.
         self.stats = SessionStats(run_name=name, model=meta.get("model") or "")
-        self.stats.session_started = time.monotonic()
+        started = runs.monotonic_from_wall(meta.get("started_at"))
+        self.stats.session_started = (
+            time.monotonic() if started is None else started)
         self.stats.chain_started = self.stats.session_started
         self.tail: list[str] = []       # result/usage lines, from stats.json
         self._offset = 0                # read position in display.ansi
@@ -207,7 +213,14 @@ class ViewerApp(App):
                     self._write_log(
                         "[runner died without recording an exit status]")
                 self.stats.finished = "error" if state == "died" else state
-                self.stats.finished_at = time.monotonic()
+                # Freeze the clocks at the moment the run actually ended (the
+                # stamp run_runner recorded), not at the moment this viewer
+                # noticed -- otherwise grabbing a run that finished an hour ago
+                # would show an hour of idle terminal in its elapsed. A runner
+                # that died without recording one leaves only now.
+                ended = runs.monotonic_from_wall(meta.get("finished_at"))
+                self.stats.finished_at = (
+                    time.monotonic() if ended is None else ended)
 
         self.refresh_stats()
 

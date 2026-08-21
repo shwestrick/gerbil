@@ -205,6 +205,22 @@ def test_tail_display() -> None:
           truncated and lines == ["tail-line"], f"{truncated}/{lines}")
 
 
+def test_monotonic_from_wall() -> None:
+    """meta.json's wall stamps are the only clock anchors that outlive the
+    process that wrote them: every viewer must translate them onto its own
+    monotonic clock instead of starting a stopwatch at attach time."""
+    now = time.monotonic()
+    past = runs.monotonic_from_wall(time.time() - 90)
+    check("a 90s-old stamp lands ~90s back",
+          past is not None and 88 <= now - past <= 92, str(past))
+    future = runs.monotonic_from_wall(time.time() + 3600)
+    check("a future stamp clamps to now (clock stepped back)",
+          future is not None and abs(future - now) < 1.0, str(future))
+    for bad in (None, "nope", True):
+        check(f"non-numeric stamp -> None ({bad!r})",
+              runs.monotonic_from_wall(bad) is None, repr(bad))
+
+
 def test_wire_roundtrip() -> None:
     s = SessionStats(run_name="calm-vole", model="m", small_model="sm",
                      session_name="gerbil-x-02", ralph_iteration=2,
@@ -418,6 +434,7 @@ def main() -> None:
     test_liveness()
     test_pause_resume()
     test_tail_display()
+    test_monotonic_from_wall()
     test_wire_roundtrip()
     test_run_runner()
     test_cmd_ps_and_grab()

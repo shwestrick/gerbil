@@ -129,7 +129,34 @@ def _read_json(path: Path) -> dict | None:
 
 
 def load_meta(name: str) -> dict | None:
-    return _read_json(run_dir(name) / "meta.json")
+    return load_meta_dir(run_dir(name))
+
+
+def load_meta_dir(d: Path) -> dict | None:
+    """meta.json by directory rather than by name -- the runner's view holds
+    the run dir (like write_stats_doc's caller), not the run's name."""
+    return _read_json(d / "meta.json")
+
+
+def monotonic_from_wall(wall: float | None) -> float | None:
+    """A wall-clock stamp from meta.json (time.time()) translated into THIS
+    process's monotonic clock -- the clock every elapsed display is measured
+    on (see view.render_stats).
+
+    meta.json's started_at/finished_at are the only time anchors that outlive
+    the process that wrote them, which is exactly what a run spanning several
+    viewers needs: a viewer attaching -- or reattaching after a detach --
+    minutes into a run reconstructs the run's real origin instead of starting
+    a stopwatch of its own at zero. Returns None for a missing or non-numeric
+    stamp so the caller keeps its own fallback.
+
+    A stamp in the future (the wall clock stepped backwards since the write)
+    clamps to now rather than producing an anchor ahead of this process's
+    clock; _hms clamps the other direction, so neither can render as negative.
+    """
+    if not isinstance(wall, (int, float)) or isinstance(wall, bool):
+        return None
+    return time.monotonic() - max(0.0, time.time() - wall)
 
 
 def save_meta(name: str, **updates) -> None:

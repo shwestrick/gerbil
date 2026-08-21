@@ -219,6 +219,28 @@ def test_stats_replay() -> None:
           and stats.session_started == 400.0,
           f"{stats.chain_started}/{stats.session_started}")
 
+    # A run whose clocks were already anchored at its registration (what
+    # RunnerView does, so that sandbox boot counts) keeps that anchor through
+    # its FIRST session_begin -- the elapsed row must not drop back to zero
+    # the moment the model's first turn starts -- and only a second session
+    # (ralph iteration 2+) starts a session clock of its own.
+    booted = SessionStats()
+    booted.chain_started = booted.session_started = 50.0  # run registered
+    booted.on_session_begin(name="s1", model=PRICED_MODEL, small_model=None,
+                            ralph={"iteration": 1, "total": 2,
+                                   "chain_base": "abc", "ancestors": []},
+                            resumed_from=None, now=170.0)  # 2min of boot
+    check("first session inherits the run's anchor",
+          booted.session_started == 50.0 and booted.chain_started == 50.0,
+          f"{booted.chain_started}/{booted.session_started}")
+    booted.on_session_begin(name="s2", model=PRICED_MODEL, small_model=None,
+                            ralph={"iteration": 2, "total": 2,
+                                   "chain_base": "abc", "ancestors": []},
+                            resumed_from=None, now=900.0)
+    check("the next ralph session starts its own clock",
+          booted.session_started == 900.0 and booted.chain_started == 50.0,
+          f"{booted.chain_started}/{booted.session_started}")
+
     stats.on_turn_complete(Usage(input_tokens=100, output_tokens=10), zoom=False)
     check("chain accumulation continues",
           stats.chain_outer.input_tokens == 3100,
@@ -605,6 +627,7 @@ def test_printview_byte_compat() -> None:
 def test_runner_view() -> None:
     import json
     import tempfile
+    import time
     from pathlib import Path
 
     from gerbil import view as view_mod
@@ -612,7 +635,19 @@ def test_runner_view() -> None:
 
     d = Path(tempfile.mkdtemp()) / "brave-otter"
     d.mkdir()
+    # The run was registered 5 minutes ago and has been booting its sandbox
+    # (uploading the repo, `lake exe cache get`) ever since: no session has
+    # begun, but 5 minutes of the run's wall clock have passed.
+    (d / "meta.json").write_text(json.dumps(
+        {"name": d.name, "started_at": time.time() - 300}))
     rv = RunnerView(d)
+    boot = json.loads((d / "stats.json").read_text())
+    check("clocks anchored at the run's start, not the view's birth",
+          295 <= boot["stats"]["session_elapsed"] <= 305
+          and 295 <= boot["stats"]["chain_elapsed"] <= 305,
+          str(boot["stats"]["session_elapsed"]))
+    check("the boot anchor is published before any session begins",
+          boot["stats"]["session_name"] == "", str(boot["stats"]))
     pv = PrintView()
     check("RunnerView wants the wip patch", rv.wants_wip_patch is True, "")
     check("run name seeded from the dir", rv.stats.run_name == "brave-otter",

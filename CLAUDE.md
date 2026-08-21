@@ -313,8 +313,18 @@ ANSI kept alive by `GERBIL_FORCE_STYLE`), `stats.json` (SessionStats over the
 wire; monotonic anchors ship as elapsed seconds), and `meta.json` (pid +
 status, the authority on how a run ended — written by `runs.run_runner`, the
 `main()`-level wrapper, whatever the exit path). One run name spans a whole
-ralph chain. Keys: `d` detaches (the run continues; `gerbil ps` lists it,
-`gerbil grab NAME` reattaches, bare `gerbil grab` picks the only live run);
+ralph chain. **The run's clock is anchored in meta.json**, not in whichever
+process is watching: `started_at`/`finished_at` are wall stamps, and runner
+and viewer alike translate them onto their own monotonic clock through
+`runs.monotonic_from_wall`. So elapsed counts from registration — preflight,
+sandbox boot and `lake exe cache get` included, which is time the user is
+watching pass — never restarts when a viewer detaches and grabs again, and
+freezes at the recorded ending rather than at the moment a viewer noticed it.
+The first session's `session_begin` therefore keeps the anchor it was given
+(`SessionStats.sessions_begun`); only ralph iteration 2+ starts a fresh
+session clock, with the chain row carrying the total. Keys: `d` detaches (the
+run continues; `gerbil ps` lists it, `gerbil grab NAME` reattaches, bare
+`gerbil grab` picks the only live run);
 `p`/`c` pause/continue — pause SIGSTOPs the runner in place (`runs.pause_run`;
 the sandbox container stays alive, and the status write ordering around the
 stop/continue signals is deliberate — see the docstrings) so `c`
