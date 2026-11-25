@@ -1,0 +1,101 @@
+# Runs gerbil's test scripts on every pull request (and on pushes to main, so
+# the branch protection check has a baseline). The tests are standalone
+# scripts, not a pytest suite -- each is run directly and fails the job on a
+# nonzero exit (see CLAUDE.md, "Testing").
+#
+# Two jobs:
+#   unit    -- everything that needs neither Docker nor an API key. Fast.
+#   sandbox -- the container-backed tests, against a freshly built
+#              gerbil-lean-sandbox image (GitHub's ubuntu runners ship Docker).
+#
+# Not run here: test_gemini.py (needs a real GOOGLE_API_KEY). test_ollama.py
+# and test_portkey.py run, but only their offline plumbing phases -- their live
+# smokes self-skip when no server/key is configured, which is the case on CI.
+#
+# To make this gate merges, mark the "unit" and "sandbox" checks as required
+# in the repo's branch protection rules for main.
+
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Run tests
+        env:
+          # Make sure no test can reach a container engine by accident: the
+          # Docker-backed ones belong to the sandbox job.
+          DOCKER_HOST: unix:///nonexistent.sock
+        run: |
+          set -u
+          failed=()
+          for t in \
+            test_agent_plan test_agents test_context_pressure \
+            test_context_windows test_empty_turn test_fill_sorry \
+            test_mathlib_detect test_mcp_cancel test_ollama test_portkey \
+            test_render test_reset_lean_server test_resume test_retry \
+            test_run_code_guard test_runs test_runtime test_sandbox_cleanup \
+            test_stream_timeout test_summarize_lean test_tree test_tui \
+            test_zoom test_zoom_resume
+          do
+            echo "::group::$t"
+            if ! uv run python "tests/$t.py"; then failed+=("$t"); fi
+            echo "::endgroup::"
+          done
+          if (( ${#failed[@]} )); then
+            echo "::error::failed: ${failed[*]}"
+            exit 1
+          fi
+
+  sandbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked
+      - uses: docker/setup-buildx-action@v3
+      - name: Build sandbox image
+        uses: docker/build-push-action@v6
+        with:
+          context: src/lean-sandbox
+          tags: gerbil-lean-sandbox:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run tests
+        run: |
+          set -u
+          failed=()
+          for t in \
+            smoke_test test_commit test_image_config test_reconstruct \
+            test_submodule test_mcp
+          do
+            echo "::group::$t"
+            if ! uv run python "tests/$t.py"; then failed+=("$t"); fi
+            echo "::endgroup::"
+          done
+          if (( ${#failed[@]} )); then
+            echo "::error::failed: ${failed[*]}"
+            exit 1
+          fi
