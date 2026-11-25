@@ -17,6 +17,8 @@
 #   gerbil reconstruct-patch SESSION_FILE [--at DIR]        rebuild a .patch
 #   gerbil ps                                               list background runs
 #   gerbil grab [NAME]                                      reattach a background run
+#   gerbil review [NAME] [--extend|--finish|--deny|--kill]  budget reviews (agent plans)
+#   gerbil tree [--at DIR] [--plain]                        browse/resume/name/delete session trees
 #   gerbil update                                           update to latest main (+ self)
 #   gerbil --version                                        show current version
 #
@@ -257,7 +259,7 @@ remove_old_images() {
 
 usage() {
     # The header comment above, through the trailing requirements note.
-    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 cmd="${1:-}"
@@ -326,7 +328,16 @@ case "$cmd" in
             GERBIL_VERSION="$(cat "$CURRENT_FILE")" \
             uv run --project "$(current_dir)" python -m gerbil reconstruct-patch "$@"
         ;;
-    ps|grab)
+    tree)
+        bootstrap_if_needed
+        shift
+        # Host-side browser over ~/.gerbil/sessions/. Its resume/grab actions
+        # re-exec THIS launcher (GERBIL_LAUNCHER), so a resume still gets the
+        # version-matched image built on demand -- the viewer itself needs none.
+        exec env GERBIL_CWD="$PWD" GERBIL_LAUNCHER="$(resolve_self)" \
+            uv run --project "$(current_dir)" python -m gerbil tree "$@"
+        ;;
+    ps|grab|review)
         bootstrap_if_needed
         shift
         # Host-side registry commands: ps lists ~/.gerbil/running/, grab
@@ -339,6 +350,6 @@ case "$cmd" in
         usage
         ;;
     *)
-        die "unknown command '$cmd' (try: run, resume, commit, cleanup, summarize, reconstruct-patch, ps, grab, update, --version)"
+        die "unknown command '$cmd' (try: run, resume, commit, cleanup, summarize, reconstruct-patch, ps, grab, review, tree, update, --version)"
         ;;
 esac

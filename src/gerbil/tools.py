@@ -305,10 +305,23 @@ class Toolset:
         ralph: bool = False,
         check_script: str | None = None,
         check_timeout: float = 300.0,
+        agents=None,
     ):
         self._sandbox = sandbox
         self._mcp = mcp
         self.ralph = ralph
+        # Supervisor mode (--agents, or a sub-agent allowed to spawn): an
+        # agents.AgentController whose tools (spawn_agent, wait_agents, ...)
+        # are advertised after the built-ins and routed to it by dispatch().
+        # Duck-typed so tools.py needn't import agents.py (which imports us).
+        self.agents = agents
+        # Whether this session is itself a supervised sub-agent (adds the
+        # sub-agent note to the system prompt); set by cli.py.
+        self.sub_agent = False
+        # Under a project agent plan: the agents.BudgetGuard enforcing this
+        # agent's budget (run_session consults it every turn) and backing the
+        # request_budget tool. Set by cli.py; None otherwise.
+        self.budget = None
         # The termination check's script text and timeout, when the session
         # has one (--ralph_done or --fill-sorry). Advertises and backs the
         # check_goal tool; may also be assigned after construction (cli.py
@@ -334,7 +347,10 @@ class Toolset:
         outside big-small mode -- advertises neither."""
         reset = [RESET_LEAN_SERVER_TOOL] if self._mcp is not None else []
         check = [CHECK_GOAL_TOOL] if self.check_script else []
-        base = TOOLS + check + reset + self._mcp_schemas
+        agents = self.agents.schemas() if self.agents is not None else []
+        if self.budget is not None:
+            agents = agents + self.budget.schemas()
+        base = TOOLS + check + reset + agents + self._mcp_schemas
         if zoom == "outer":
             return base + [ZOOM_IN_TOOL]
         if zoom == "inner":
@@ -350,6 +366,10 @@ class Toolset:
             return self._reset_lean_server()
         if name == "check_goal":
             return self._check_goal()
+        if self.agents is not None and name in self.agents.tool_names():
+            return self.agents.dispatch(name, args)
+        if self.budget is not None and name in self.budget.tool_names():
+            return self.budget.dispatch(name, args)
         if name in self._mcp_names:
             try:
                 return self._mcp.call_tool(name, args)

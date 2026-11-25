@@ -917,6 +917,24 @@ class LeanSandbox:
             self._git("am --abort")
             raise RuntimeError(f"git am failed:\n{result.stderr or result.stdout}")
 
+    def try_git_am_3way(self, patch_text: str) -> tuple[bool, str]:
+        """`git am -3` a patch, reporting rather than raising: (applied?, git's
+        output). Used to merge a supervised sub-agent's result patch into its
+        parent's sandbox (agents.AgentController.merge), where a conflict is an
+        ordinary outcome the parent model should see and react to, not a crash.
+        Three-way works because the child's base was built from this sandbox's
+        own snapshot (wip_patch creates its commit objects *here*), so the
+        pre-image blobs the patch's `index` lines name are present locally.
+        A failed am is aborted, leaving HEAD and the tree as they were."""
+        if not patch_text.strip():
+            return True, "(empty patch; nothing to apply)"
+        path = self._stage_patch(patch_text)
+        result = self._git(f"am -3 {_quote(path)}", timeout=180.0)
+        if result.exit_code != 0:
+            self._git("am --abort")
+            return False, result.stderr or result.stdout
+        return True, result.stdout
+
     def format_patch(self, base: str) -> str:
         """Return an mbox patch (title + message + diff) for every commit in
         base..HEAD, as produced by `git format-patch`. Apply on the host with

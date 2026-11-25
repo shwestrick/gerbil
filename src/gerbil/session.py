@@ -55,6 +55,7 @@ class Session:
         inner_max_turns: int | None = None,
         image: str = "",
         fill_sorry: dict[str, Any] | None = None,
+        agent: dict[str, Any] | None = None,
     ):
         self.path = path
         self.model = model
@@ -119,6 +120,14 @@ class Session:
         # itself rides in ralph_done_script above.
         if fill_sorry is not None:
             start["fill_sorry"] = fill_sorry
+        # Supervisor mode: this session's place in the agent tree (see
+        # agents.session_agent_info) -- its own agent id, its parent's id and
+        # session log, its role/budget, and the base snapshot it started
+        # from. Recorded here, in the log itself, because the run registry
+        # that also knows these things is deleted when a run is dismissed,
+        # and the log is what survives (archived, and folded into commits).
+        if agent is not None:
+            start["agent"] = agent
         # Big-small mode: the small (zoom) model and the per-zoom turn cap,
         # recorded so `gerbil resume` inherits them without the user
         # re-supplying either (like model and include_session above).
@@ -233,6 +242,13 @@ class Session:
             "resumed_from": resumed_from,
             "replayed_events": replayed_events,
         })
+
+    def record_event(self, kind: str, /, **fields: Any) -> None:
+        """A structured, non-conversation event: supervisor-mode bookkeeping
+        such as agent_spawn / agent_merge / budget_decision (see agents.py).
+        Every log reader ignores event kinds it does not know, so these never
+        disturb resume, summarize, or reconstruct-patch."""
+        self._append({"event": kind, "timestamp": _now(), **fields})
 
     def record_warning(self, message: str) -> None:
         """Non-terminal event noting a recoverable problem (e.g. MCP failed to

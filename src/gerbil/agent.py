@@ -616,8 +616,19 @@ def run_session(
         zoom_in_available=small_model is not None,
         submodules=sandbox.submodule_paths,
         check_goal_available=bool(getattr(toolset, "check_script", None)),
+        agents=getattr(toolset, "agents", None),
+        sub_agent=bool(getattr(toolset, "sub_agent", False)),
+        budget=getattr(toolset, "budget", None),
     )
     tools = toolset.schemas(zoom="outer" if small_model is not None else None)
+    # Supervisor mode: the controller can veto a natural stop while this
+    # agent's sub-agents are still running or finished-but-unmerged, and
+    # announces their budget reviews between turns.
+    agents = getattr(toolset, "agents", None)
+    # Under a project agent plan: this agent's own budget, checked before
+    # every turn (it may block awaiting a review, or end the session).
+    budget = getattr(toolset, "budget", None)
+    budget_finished = False
 
     # Query the model's maximum context window once at session start; every turn
     # then reports how close the running conversation is to filling it. None means
@@ -721,6 +732,17 @@ def run_session(
         if max_turns and turn >= max_turns:
             stopped_at_max = True
             break
+        if budget is not None:
+            # May block for a while: an exhausted agent waits here, between
+            # turns, for its reviewer -- the one point where pausing loses
+            # nothing (no tool call in flight, history consistent).
+            action, note = budget.before_turn(view)
+            if note:
+                _append_user_text(messages, note)
+                session.record_warning(note)
+            if action == "finish":
+                budget_finished = True
+                break
         turn += 1
 
         view.turn_header(
@@ -767,6 +789,17 @@ def run_session(
                         "context: told the model to keep going]",
                         "bold", "yellow"), newline_before=False)
                     continue
+            # Sub-agents still out: send the model back once per distinct
+            # situation (AgentController.stop_note returns None on a repeat,
+            # so a model that deliberately stops again is let go).
+            note = agents.stop_note() if agents is not None else None
+            if note:
+                view.turn_end()
+                _append_user_text(messages, note)
+                session.record_turn("user", note)
+                view.notice(style("[sub-agents outstanding: told the model]",
+                                  "bold", "yellow"), newline_before=False)
+                continue
             view.turn_end()
             break
 
@@ -823,6 +856,15 @@ def run_session(
 
         messages.append({"role": "user", "content": tool_results})
 
+        # Sub-agents asking for budget reviews: tell the model now, inside the
+        # pending tool-result message (the only place a note can go).
+        sub_note = agents.turn_notes() if agents is not None and hasattr(agents, "turn_notes") else None
+        if sub_note:
+            _append_user_text(messages, sub_note)
+            session.record_warning(sub_note)
+            view.notice(style("[sub-agent review requested: told the model]",
+                              "bold", "yellow"))
+
         # Context pressure. Measured on the turn that just landed, and acted on
         # here -- after its tool calls have been answered, because a provider
         # rejects an assistant turn whose tool_use blocks go unanswered. So even
@@ -857,6 +899,17 @@ def run_session(
     if stopped_at_max:
         view.notice(style(f"[stopped: reached max_turns={max_turns}]",
                           "bold", "yellow"))
+
+    if budget_finished:
+        view.notice(style(
+            "[stopped: budget exhausted -- writing the commit message and "
+            "ending the session]", "bold", "yellow"))
+        # The model must know why it was cut off; the commit request that
+        # follows joins this message (both land in the pending user turn).
+        note = ("Your budget is exhausted and your supervisor has decided you "
+                "must stop here. No further tool calls will run.")
+        _append_user_text(messages, note)
+        session.record_warning(note)
 
     if out_of_context:
         view.notice(style(

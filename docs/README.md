@@ -25,6 +25,10 @@ run. These pages go deeper.
   check itself.
 - **[Big-small mode](big-small.md)** -- a big model driving the session and
   delegating individual `sorry`s to a smaller, cheaper one.
+- **[Supervisor mode](agents.md)** -- `--agents`: the model spawns
+  sub-agents in their own sandboxes, monitors them, and merges their patches.
+- **[Browsing sessions](tree.md)** -- `gerbil tree`: the session archive
+  as trees (sub-agents, resumes, ralph chains); resume, name, delete.
 - **[Resuming and reconstructing](resume.md)** -- recovering a session that
   crashed, and rebuilding a lost patch by replaying tool calls.
 - **[Usage and cost](summarize.md)** -- what `gerbil summarize` reports and how

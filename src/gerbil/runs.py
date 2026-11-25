@@ -190,8 +190,10 @@ def pid_alive(pid: int | None) -> bool:
 
 
 # The statuses a runner records on exit (via run_runner). Anything else in
-# meta.json means the run never got to record its ending.
-TERMINAL_STATUSES = ("complete", "interrupted", "error")
+# meta.json means the run never got to record its ending. "cancelled" is a
+# supervised agent stopped by its parent (or by its parent's exit) -- see
+# cancel_run.
+TERMINAL_STATUSES = ("complete", "interrupted", "error", "cancelled")
 
 
 def classify(meta: dict) -> str:
@@ -280,6 +282,102 @@ def remove_run(name: str) -> None:
     shutil.rmtree(run_dir(name), ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Agent trees (supervisor mode -- see agents.py)
+#
+# A supervised agent is an ordinary run whose meta.json carries a `parent`
+# (the run name of the agent that spawned it) and a `root`. The parent
+# pointers are the whole tree: nothing else records who owns whom, so there is
+# one source of truth to check visibility against (is_descendant).
+# ---------------------------------------------------------------------------
+
+def children(name: str) -> list[dict]:
+    """Every registered run whose parent is `name`, oldest first, in
+    list_runs() shape (meta + state + stats)."""
+    return [r for r in list_runs() if r.get("parent") == name]
+
+
+def is_descendant(ancestor: str, name: str) -> bool:
+    """Whether run `name` sits strictly below `ancestor` in the agent tree.
+    Walks up the parent pointers; a cycle (which a well-behaved registry
+    never contains) or a missing link ends the walk as False rather than
+    looping or raising."""
+    seen: set[str] = set()
+    meta = load_meta(name)
+    while meta is not None:
+        parent = meta.get("parent")
+        if not parent or parent in seen:
+            return False
+        if parent == ancestor:
+            return True
+        seen.add(parent)
+        meta = load_meta(parent)
+    return False
+
+
+def cancel_run(name: str) -> bool:
+    """Ask a live run to stop: mark it cancel-requested (run_runner turns
+    that into the terminal status "cancelled"), then SIGTERM it -- which
+    main() converts into a SystemExit, so the runner's `with` blocks stop its
+    container on the way out -- and SIGCONT it, since a SIGSTOPped (paused)
+    process would otherwise hold the SIGTERM pending forever. The runner's
+    own exit then cascades to *its* children (run_runner), so cancelling one
+    node takes down its whole subtree. Returns False if it was not alive."""
+    meta = load_meta(name) or {}
+    if classify(meta) not in ("running", "paused"):
+        return False
+    save_meta(name, cancel_requested=True)
+    pid = meta.get("pid")
+    try:
+        os.kill(pid, signal.SIGTERM)
+        os.kill(pid, signal.SIGCONT)
+    except (OSError, TypeError):
+        return False
+    return True
+
+
+def cancel_children(name: str) -> list[str]:
+    """Cancel every live direct child of `name` (each one cascades further
+    down itself). Returns the names cancelled. Never raises -- it runs on
+    exit paths."""
+    cancelled = []
+    for child in children(name):
+        try:
+            if cancel_run(child["name"]):
+                cancelled.append(child["name"])
+        except Exception:
+            pass
+    return cancelled
+
+
+def spawn_runner(name: str, argv: list[str], cwd: str | Path) -> int:
+    """Start a detached runner process for the registered run `name`:
+    `python -m gerbil <argv> --_runner <name>`, in its own session (so it
+    survives the terminal and never sees the tty's signals), with stdout and
+    stderr sharing ONE handle onto display.ansi -- a single append offset, so
+    the two streams can't corrupt each other's lines. The env keeps the
+    stream viewer-ready: GERBIL_FORCE_STYLE (ANSI despite the non-tty
+    stdout), PYTHONUNBUFFERED (stray prints that don't flush still arrive
+    promptly), PYTHONIOENCODING (the viewer decodes UTF-8 regardless of
+    locale). Records the pid and returns it."""
+    import subprocess
+    import sys
+
+    env = os.environ | {
+        "GERBIL_FORCE_STYLE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
+    with (run_dir(name) / "display.ansi").open("ab") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "gerbil", *argv, "--_runner", name],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            start_new_session=True, env=env, cwd=str(cwd),
+        )
+    save_meta(name, pid=proc.pid, status="running")
+    return proc.pid
+
+
 def tail_display(path: Path, offset: int, pending: bytes,
                  ) -> tuple[list[str], bytes, int]:
     """Incrementally read the display file: everything new past `offset`,
@@ -349,4 +447,12 @@ def run_runner(name: str, body: Callable[[], None]) -> None:
                   else "interrupted" if code == 130 else "error")
         raise
     finally:
+        # A supervised agent's parent asked it to stop (cancel_run): that,
+        # not the SIGTERM's exit code, is the truth about how it ended.
+        if (load_meta(name) or {}).get("cancel_requested"):
+            status = "cancelled"
+        # However this run ends, its sub-agents must not outlive it: nobody
+        # would be left to merge their work, and their containers would run
+        # on unsupervised. Each cancelled child cascades to its own children.
+        cancel_children(name)
         save_meta(name, status=status, finished_at=time.time())

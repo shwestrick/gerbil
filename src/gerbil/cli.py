@@ -57,9 +57,12 @@ import subprocess
 import sys
 import time
 import tomllib
+import uuid
 from datetime import datetime
 from pathlib import Path
 
+from . import agent_config
+from . import agents as agents_mod
 from . import fill_sorry, runs, runtime
 from .agent import DEFAULT_INNER_MAX_TURNS, run_session
 from .context_windows import OBSERVATIONS_PATH, table_drift
@@ -72,7 +75,7 @@ from .pricing import (
 from .sandbox import LeanSandbox, submodule_entries
 from .session import Session
 from .render import style
-from .tools import Toolset
+from .tools import Toolset, ToolResult
 from .view import PrintView, RunnerView, SessionView
 
 
@@ -448,10 +451,58 @@ def _add_run_options(p) -> None:
         help="Use the classic scrolling print output instead of the full-screen "
         "live view (chosen automatically when stdout is not a terminal).",
     )
+    p.add_argument(
+        "--agents",
+        action="store_true",
+        help="Supervisor mode: give the model tools to spawn sub-agents -- full "
+        "gerbil sessions, each in its own sandbox container, starting from a "
+        "snapshot of the supervisor's tree -- and to monitor, stop, and merge "
+        "their patches. See docs/agents.md.",
+    )
+    p.add_argument(
+        "--max-agent-depth",
+        type=int,
+        metavar="N",
+        default=None,
+        help="How many levels of sub-agents may exist below the supervisor "
+        f"(default: {agents_mod.DEFAULT_MAX_DEPTH}; 1 = sub-agents cannot "
+        "spawn). Requires --agents.",
+    )
+    p.add_argument(
+        "--max-agent-children",
+        type=int,
+        metavar="N",
+        default=None,
+        help="How many sub-agents each agent may spawn over its lifetime "
+        f"(default: {agents_mod.DEFAULT_MAX_CHILDREN}). Requires --agents.",
+    )
+    p.add_argument(
+        "--max-agents",
+        type=int,
+        metavar="N",
+        default=None,
+        help="How many sub-agents (and so sandbox containers) may run at once "
+        f"across the whole agent tree (default: {agents_mod.DEFAULT_MAX_AGENTS}). "
+        "Requires --agents.",
+    )
+    p.add_argument(
+        "--agents-config",
+        metavar="FILE",
+        default=None,
+        help="The project agent plan for supervisor mode (implies --agents): "
+        "named roles, which roles each may spawn and how many, and each "
+        "role's token/time/cost budget. Default: <project>/.gerbil/agents.toml "
+        "when it exists. See docs/agents.md.",
+    )
     # Internal: marks this process as the detached runner behind a TUI run
     # (see _spawn_and_attach). Hidden from --help; never passed by hand.
     p.add_argument("--_runner", metavar="NAME", default=None,
                        help=argparse.SUPPRESS)
+    # Internal: this run is a supervised sub-agent of the named run, spawned
+    # by agents.AgentController.spawn; its tree metadata (caps, base chain)
+    # is already in its registry entry. Never passed by hand.
+    p.add_argument("--_child-of", dest="_child_of", metavar="NAME",
+                   default=None, help=argparse.SUPPRESS)
 
 
 def main() -> None:
@@ -574,6 +625,41 @@ def main() -> None:
         "when exactly one run is active.",
     )
     grab_p.set_defaults(func=cmd_grab)
+
+    review_p = sub.add_parser(
+        "review",
+        help="list agents awaiting a budget review, or decide one "
+        "(supervisor mode with an agent plan; the human reviews the root)",
+    )
+    review_p.add_argument("name", metavar="NAME", nargs="?",
+                          help="The run to review (default: list open reviews).")
+    action = review_p.add_mutually_exclusive_group()
+    action.add_argument("--extend", action="store_true",
+                        help="Grant more budget (with --tokens/--time/--cost, "
+                        "or whatever the agent requested).")
+    action.add_argument("--finish", action="store_true",
+                        help="Have the agent wrap up now and produce its patch.")
+    action.add_argument("--deny", action="store_true",
+                        help="Refuse a (non-blocking) budget request.")
+    action.add_argument("--kill", action="store_true",
+                        help="Stop the agent (and its sub-agents).")
+    review_p.add_argument("--tokens", type=int, default=None)
+    review_p.add_argument("--time", default=None, metavar="DURATION",
+                          help='e.g. "30m"')
+    review_p.add_argument("--cost", type=float, default=None, metavar="USD")
+    review_p.add_argument("--note", default="", help="Guidance delivered with the decision.")
+    review_p.set_defaults(func=cmd_review)
+
+    tree_p = sub.add_parser(
+        "tree",
+        help="browse archived sessions as trees (sub-agents, resumes, ralph "
+        "chains): resume, name, or delete them",
+    )
+    tree_p.add_argument("--at", metavar="DIRECTORY", default=None,
+                        help="Only show trees of this project (default: all).")
+    tree_p.add_argument("--plain", action="store_true",
+                        help="Print the forest as text instead of opening the viewer.")
+    tree_p.set_defaults(func=cmd_tree)
 
     commit_p = sub.add_parser(
         "commit", help="git am the patches gerbil produced into the repo, in order"
@@ -1481,29 +1567,13 @@ def _spawn_and_attach(*, project_dir: Path, model: str,
     child in its own session (so it survives the terminal and never sees the
     tty's signals), then become a viewer over it. Never returns -- exits with
     the viewer's verdict. `d` in the viewer (or its death) leaves the run
-    going; `gerbil grab` attaches a fresh viewer later.
-
-    The child's stdout and stderr share ONE file handle onto display.ansi --
-    a single append offset, so the two streams can't corrupt each other's
-    lines -- and the env keeps the stream viewer-ready: GERBIL_FORCE_STYLE
-    (ANSI despite the non-tty stdout), PYTHONUNBUFFERED (stray prints that
-    don't flush still arrive promptly), PYTHONIOENCODING (the viewer decodes
-    UTF-8 regardless of locale)."""
+    going; `gerbil grab` attaches a fresh viewer later. The process plumbing
+    (detached session, shared display.ansi handle, viewer-ready env) lives in
+    runs.spawn_runner, which supervised sub-agents are started through too."""
     name = runs.new_run_name()
-    rd = runs.create_run(name, project_dir=project_dir, model=model,
-                         theme=theme, command=sys.argv[1:])
-    env = os.environ | {
-        "GERBIL_FORCE_STYLE": "1",
-        "PYTHONUNBUFFERED": "1",
-        "PYTHONIOENCODING": "utf-8",
-    }
-    with (rd / "display.ansi").open("ab") as log:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "gerbil", *sys.argv[1:], "--_runner", name],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-            start_new_session=True, env=env, cwd=os.getcwd(),
-        )
-    runs.save_meta(name, pid=proc.pid, status="running")
+    runs.create_run(name, project_dir=project_dir, model=model,
+                    theme=theme, command=sys.argv[1:])
+    runs.spawn_runner(name, sys.argv[1:], os.getcwd())
     from .tui import attach_viewer  # deferred: textual loads only for a tty
     sys.exit(attach_viewer(name))
 
@@ -1516,7 +1586,11 @@ def _session_view(args) -> SessionView:
 
 
 def cmd_run(args) -> None:
-    if not args.prompt and not args.fill_sorry:
+    if args.agents_config:
+        args.agents = True
+    # Under an agent plan whose root role carries a standing task, --prompt
+    # is optional; that is checked once the plan is loaded.
+    if not args.prompt and not args.fill_sorry and not args.agents:
         sys.exit("error: --prompt (or --fill-sorry) is required "
                  "(to continue a crashed session, use `gerbil resume SESSION_FILE`).")
     if args.fill_sorry and args.ralph_done:
@@ -1531,6 +1605,7 @@ def cmd_run(args) -> None:
     if args.zoom_max_turns is not None and args.zoom_max_turns < 1:
         sys.exit("error: --zoom-max-turns N must be >= 1")
     inner_max_turns = args.zoom_max_turns or DEFAULT_INNER_MAX_TURNS
+    _validate_agent_args(args)
     ralph_done_script = _load_ralph_done_script(
         args.ralph_done, have_ralph=args.ralph is not None
     )
@@ -1555,6 +1630,14 @@ def cmd_run(args) -> None:
         # --ralph always wins.
         args.ralph = spec.ralph if spec.ralph else fill_sorry.DEFAULT_RALPH
     theme = _resolve_theme(project_dir)  # validated pre-spawn, like the rest
+    if args._child_of:
+        _require_child_base(args._runner, repo_root)
+    # The project agent plan: validated here, at preflight, so a bad plan
+    # fails before anything boots. A sub-agent reads the root's frozen copy.
+    plan = _load_agent_plan(args, project_dir)
+    if (args.agents and not args._child_of and not args.prompt
+            and not (plan and plan.roles[plan.root].task)):
+        sys.exit("error: --prompt is required (or give the plan's root role a `task`).")
 
     # TUI mode never runs the session here: with the preflight passed on the
     # real terminal, hand the whole command to a detached runner child and
@@ -1564,6 +1647,21 @@ def cmd_run(args) -> None:
     if args._runner is None and _use_tui(args):
         _spawn_and_attach(project_dir=project_dir, model=args.model,
                           theme=theme)
+
+    # A --plain supervisor still needs a registry entry: the agent tree is
+    # made of registry entries, and run_runner is what cancels sub-agents
+    # when this process ends. Register in-process and re-enter, exactly as
+    # a detached runner would (the preflight above re-runs harmlessly).
+    if args.agents and args._runner is None:
+        name = runs.new_run_name()
+        runs.create_run(name, project_dir=project_dir, model=args.model,
+                        theme=theme, command=sys.argv[1:])
+        args._runner = name
+        print(style(f"supervisor registered as {name} (see `gerbil ps`)", "gray"))
+        runs.run_runner(name, lambda: cmd_run(args))
+        return
+    if args.agents and not args._child_of:
+        _register_agent_root(args, plan, _host_head(repo_root))
 
     if spec is not None:
         # The task prompt is generated; a --prompt file, when given, supplies
@@ -1582,7 +1680,15 @@ def cmd_run(args) -> None:
                            if args.fill_sorry.endswith(".toml")
                            else Path(f"fill-sorry:{args.fill_sorry}"))
     else:
-        prompt = prompt_file.read_text()
+        prompt = prompt_file.read_text() if prompt_file is not None else ""
+    if plan is not None and not args._child_of:
+        # The root plays the plan's root role: its standing task leads, and a
+        # --prompt file (if any) adds this run's specifics. (A sub-agent's
+        # role task was already folded into its prompt by spawn_agent.)
+        task = plan.roles[plan.root].task.strip()
+        prompt = "\n\n".join(p for p in (task, prompt.strip()) if p)
+        if prompt_file is None:
+            prompt_file = plan.path  # provenance for session_start
     timestamp = datetime.now().strftime("%y%m%d-%H%M%S")
     iterations = args.ralph if args.ralph else 1
     width = max(2, len(str(iterations)))
@@ -1598,6 +1704,11 @@ def cmd_run(args) -> None:
     version = os.environ.get("GERBIL_VERSION", "unknown")
 
     def session_name(i: int) -> str:
+        # A sub-agent's names carry its run name: sibling sub-agents are
+        # routinely spawned within the same second, and a shared timestamp
+        # would have them append to one another's archive log.
+        if args._child_of:
+            return f"gerbil-{timestamp}-{args._runner}"
         # In --ralph mode, number the per-session output files; otherwise a single set.
         return f"gerbil-{timestamp}-{i:0{width}d}" if args.ralph else f"gerbil-{timestamp}"
 
@@ -1625,6 +1736,22 @@ def cmd_run(args) -> None:
                     _start_mcp(sandbox, stack) if args.mcp else (None, None)
                 )
                 toolset = Toolset(sandbox, mcp, ralph=bool(args.ralph))
+
+                # A sub-agent starts from its parent's tree, not the host's:
+                # replay the recorded chain (the parent's own chain plus its
+                # snapshot at spawn time) onto the host base commit.
+                if args._child_of:
+                    child_meta = runs.load_meta(args._runner) or {}
+                    _rebuild_base(sandbox, child_meta["base_sha"], [
+                        Path(p).read_text()
+                        for p in child_meta.get("base_chain") or []])
+                    toolset.sub_agent = True
+                # Supervisor tools, for the root (--agents) and for any
+                # sub-agent allowed to spawn.
+                if args._runner and (args.agents or args._child_of):
+                    _attach_agent_tools(
+                        args, toolset, sandbox, plan, project_dir, args.model,
+                        get_session=lambda: session)
 
                 # The whole ralph chain layers on this host-reachable commit;
                 # `ancestors` accumulates each completed session's patch file, in
@@ -1672,6 +1799,16 @@ def cmd_run(args) -> None:
                         session_path = archive_dir / f"{name}.jsonl"  # live session log
                         patch_path = out_dir / f"{name}.patch"        # project-level patch
                         wip_path = archive_dir / f"{name}.wip.patch"  # live resume patch
+                        if args._child_of:
+                            # Only the root agent writes into the project: a
+                            # sub-agent's patch goes to its run dir, for its
+                            # parent to merge (or not).
+                            patch_path = runs.run_dir(args._runner) / f"{name}.patch"
+                        if args._runner:
+                            # Where a supervisor's peek_agent finds this
+                            # session's live log and work-in-progress.
+                            runs.save_meta(args._runner, session=str(session_path),
+                                           wip_patch=str(wip_path))
 
                         # Baseline before the session: recorded in the log so --resume
                         # can recreate it, and used to format-patch the session's commits.
@@ -1700,6 +1837,11 @@ def cmd_run(args) -> None:
                                 fill_sorry.session_meta(spec, fs_plan)
                                 if spec is not None else None
                             ),
+                            # Supervisor mode: this session's place in the
+                            # agent tree, so the logs alone link the tree.
+                            agent=(agents_mod.session_agent_info(args._runner)
+                                   if args._runner and (args.agents or args._child_of)
+                                   else None),
                         )
                         if mcp_warning:
                             session.record_warning(mcp_warning)
@@ -1742,10 +1884,20 @@ def cmd_run(args) -> None:
                         patch_name = _finalize_session(
                             sandbox, session_base, result,
                             session_path=session_path, patch_path=patch_path,
-                            out_dir=out_dir, archive_dir=archive_dir,
-                            include_session=not args.omit_session_log, footer=footer,
-                            view=view,
+                            out_dir=patch_path.parent, archive_dir=archive_dir,
+                            # A sub-agent's log stays in the archive: folding
+                            # it in would carry it into the parent's commit.
+                            include_session=(not args.omit_session_log
+                                             and not args._child_of),
+                            footer=footer, view=view,
                         )
+                        if args._child_of:
+                            agents_mod.write_result(
+                                args._runner, final_text=result.final_text,
+                                commit_message=result.commit_message,
+                                patch_path=patch_path if patch_name else None,
+                                session_path=session_path,
+                            )
                         # Once a session produces a commit, later sessions in the chain
                         # build on it -- record its patch as an ancestor for resume.
                         if patch_name and args.ralph:
@@ -1786,6 +1938,163 @@ def cmd_run(args) -> None:
         _abort(exc, session)
 
 
+def _validate_agent_args(args) -> None:
+    """Reject supervisor-mode combinations the MVP does not support. Ralph
+    chains, fill-sorry (a ralph chain underneath), and big-small zoom all
+    reshape the session loop in ways the agent tree does not yet model -- a
+    sub-agent's base chain, in particular, assumes one session per agent."""
+    agent_flags = (args.max_agent_depth, args.max_agent_children, args.max_agents)
+    if not args.agents and any(v is not None for v in agent_flags):
+        sys.exit("error: --max-agent-depth/--max-agent-children/--max-agents "
+                 "require --agents.")
+    for flag, value in zip(("--max-agent-depth", "--max-agent-children",
+                            "--max-agents"), agent_flags):
+        if value is not None and value < 1:
+            sys.exit(f"error: {flag} N must be >= 1")
+    if args.agents or args._child_of:
+        for flag, on in (("--ralph", args.ralph is not None),
+                         ("--fill-sorry", bool(args.fill_sorry)),
+                         ("--small-model", bool(args.small_model))):
+            if on:
+                sys.exit(f"error: {flag} is not supported together with "
+                         "--agents (yet).")
+    if args._child_of and not args._runner:
+        sys.exit("error: --_child-of is internal (set by spawn_agent).")
+
+
+def _register_agent_root(args, plan, base_sha: str) -> None:
+    """Record the top of an agent tree in the registry (args._runner's
+    meta): a fresh agent id, the host base every agent builds on, the caps,
+    and -- under a plan -- the frozen plan copy, the root role and its budget.
+    Shared by `gerbil run --agents` and the resume of a tree's root."""
+    root_id = uuid.uuid4().hex
+    root_meta = dict(
+        parent=None, root=args._runner, depth=0,
+        agent_id=root_id, root_id=root_id,
+        base_sha=base_sha, base_chain=[],
+        caps=agents_mod.Caps(
+            depth_left=(getattr(args, "max_agent_depth", None)
+                        or agents_mod.DEFAULT_MAX_DEPTH),
+            max_children=(getattr(args, "max_agent_children", None)
+                          or agents_mod.DEFAULT_MAX_CHILDREN),
+            max_agents=(getattr(args, "max_agents", None)
+                        or agents_mod.DEFAULT_MAX_AGENTS),
+            max_turns=None,
+        ).to_dict(),
+    )
+    if plan is not None:
+        # Freeze the plan for this tree: every agent reads the same copy,
+        # whatever happens to the project file mid-run.
+        frozen = runs.run_dir(args._runner) / agent_config.CONFIG_NAME
+        frozen.write_text(plan.path.read_text())
+        root_role = plan.roles[plan.root]
+        root_meta.update(agents_plan=str(frozen), role=root_role.name,
+                         budget=root_role.budget.to_dict())
+        print(style(f"agent plan {plan.path}:\n{plan.describe()}", "gray"))
+    runs.save_meta(args._runner, **root_meta)
+
+
+def _attach_agent_tools(args, toolset, sandbox, plan, project_dir: Path,
+                        model: str, *, get_session) -> None:
+    """Give this agent its supervisor tools and budget guard, as its registry
+    entry dictates: spawning by its parent's can_spawn in free-form mode, by
+    its role under an agent plan; a guard whenever it has a budget. Shared by
+    `gerbil run` and `gerbil resume`. `get_session` returns the in-flight
+    Session (the tools log their agent_* / budget_* events into it)."""
+    my_meta = runs.load_meta(args._runner) or {}
+    my_caps = agents_mod.Caps.from_dict(my_meta.get("caps"))
+    my_role = plan.role(my_meta.get("role")) if plan else None
+    child_of = getattr(args, "_child_of", None)
+    if (my_role.can_spawn() if my_role
+            else plan is None and my_caps.depth_left > 0):
+        toolset.agents = agents_mod.AgentController(
+            name=args._runner, sandbox=sandbox,
+            base_commit=lambda: (get_session().base_commit
+                                 if get_session() else sandbox.head()),
+            project_dir=project_dir, model=model,
+            child_argv=_child_passthrough(args),
+            caps=my_caps, plan=plan, role=my_role,
+        )
+        toolset.agents.session_getter = get_session
+    if plan is not None and agent_config.Budget.from_dict(
+            my_meta.get("budget")).is_set():
+        toolset.budget = agents_mod.BudgetGuard(
+            args._runner, is_root=not child_of,
+            root_policy=plan.on_root_exhausted,
+            parent=my_meta.get("parent"), session_getter=get_session)
+        if toolset.agents is not None:
+            toolset.agents.budget_guard = toolset.budget
+
+
+def _load_agent_plan(args, project_dir: Path):
+    """The agent plan governing this run, or None (free-form --agents, or no
+    supervisor mode at all). The root reads --agents-config or the project's
+    .gerbil/agents.toml; a sub-agent reads the copy its root froze into the
+    registry, so the whole tree runs under one plan. Validation problems exit
+    at preflight, all reported together."""
+    if args._child_of:
+        frozen = (runs.load_meta(args._runner) or {}).get("agents_plan")
+        path = Path(frozen) if frozen else None
+    elif args.agents:
+        path = (Path(args.agents_config).resolve() if args.agents_config
+                else agent_config.find(project_dir))
+        if args.agents_config and not path.is_file():
+            sys.exit(f"error: {path} is not a file")
+    else:
+        return None
+    if path is None:
+        return None
+    if not args._child_of and any(
+            v is not None for v in (args.max_agent_depth, args.max_agent_children,
+                                    args.max_agents)):
+        sys.exit(f"error: the agent plan {path} governs spawning; set limits "
+                 "there instead of --max-agent-depth/--max-agent-children/--max-agents.")
+    try:
+        return agent_config.load(path, default_model=args.model)
+    except ValueError as e:
+        sys.exit(f"error: invalid agent plan {e}")
+
+
+def _host_head(repo_root: Path) -> str:
+    """The host repo's HEAD commit -- the base every agent in a tree builds on."""
+    return subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _require_child_base(run_name: str, repo_root: Path) -> None:
+    """A sub-agent's sandbox is built from the host repo's tracked files and
+    then reset to the tree's base commit with its base chain replayed on top
+    -- which needs that commit in the uploaded (HEAD-only) history. (The
+    clean-worktree preflight already guarantees no uncommitted edits.)"""
+    base = (runs.load_meta(run_name) or {}).get("base_sha")
+    if not base:
+        sys.exit(f"error: sub-agent {run_name} has no base_sha in its registry entry.")
+    # The sandbox is uploaded from the host's HEAD and then hard-reset to the
+    # tree's base, so the base must be in HEAD's history -- not necessarily
+    # HEAD itself (a resumed tree typically starts from an older commit).
+    if subprocess.run(["git", "-C", str(repo_root), "merge-base", "--is-ancestor",
+                       base, "HEAD"], capture_output=True).returncode != 0:
+        sys.exit(f"error: the agent tree's base commit {base[:12]} is not in the "
+                 "history of the host repo's HEAD; a sub-agent cannot rebuild "
+                 "its parent's tree. Check out a branch containing it.")
+
+
+def _child_passthrough(args) -> list[str]:
+    """The `gerbil run` flags a spawned sub-agent inherits from this run."""
+    argv = []
+    if getattr(args, "image", None):
+        argv += ["--image", args.image]
+    if args.skip_cache:
+        argv.append("--skip-cache")
+    if not args.mcp:
+        argv.append("--no-mcp")
+    if args.omit_session_log:
+        argv.append("--omit-session-log")
+    return argv
+
+
 def _resolve_patch(name: str, dirs: list[Path]) -> Path | None:
     """Find an ancestor patch file by name across candidate directories (the
     session archive, then the project's .gerbil/)."""
@@ -1804,7 +2113,20 @@ def _reconstruct_anchor(parsed, source_file: Path, repo_root: Path,
     Exits with a clear message if the anchor is missing from the repo or an
     ancestor patch file can't be found. Shared by --resume and reconstruct-patch."""
     ralph = parsed.ralph
-    if ralph:
+    # A supervised sub-agent's base commit only ever existed in its sandbox:
+    # it is the root's host commit plus each ancestor's snapshot, which the
+    # session logs themselves record (agents.chain_from_logs).
+    start = next((e for e in parsed.events if e.get("event") == "session_start"
+                  and not e.get("replayed")), {})
+    agent = start.get("agent") or {}
+    agent_chain: list[str] | None = None
+    if agent.get("parent_id"):
+        try:
+            anchor, agent_chain = agents_mod.chain_from_logs(agent, source_file)
+        except ValueError as e:
+            sys.exit(f"error: cannot rebuild sub-agent base: {e}")
+        ancestor_names = []
+    elif ralph:
         anchor = ralph.get("chain_base") or parsed.base_commit
         ancestor_names = list(ralph.get("ancestors") or [])
     else:
@@ -1821,7 +2143,7 @@ def _reconstruct_anchor(parsed, source_file: Path, repo_root: Path,
             "with its history intact."
         )
 
-    texts = []
+    texts = list(agent_chain or [])
     for nm in ancestor_names:
         p = _resolve_patch(nm, patch_dirs)
         if p is None:
@@ -1881,6 +2203,18 @@ def cmd_resume(args) -> None:
     if not parsed.model:
         sys.exit(f"error: {resume_file.name} does not record a model; cannot resume.")
 
+    # Supervisor mode: a sub-agent's patch is relative to its parent's tree,
+    # so it is not resumable on its own; a tree's ROOT resumes with its
+    # supervisor tools (and plan) restored -- its conversation used them.
+    start_ev = next((e for e in parsed.events if e.get("event") == "session_start"
+                     and not e.get("replayed")), {})
+    agent = start_ev.get("agent") or None
+    if agent and agent.get("parent_id"):
+        sys.exit(
+            f"error: {resume_file.name} is a sub-agent session: its patch only "
+            "applies on top of its parent's tree, so it cannot be resumed on its "
+            "own. Resume its tree's root instead (see `gerbil tree`).")
+
     # Operate on --at if given, else the project the session ran in.
     project_dir = _resolve_at(args.at) if args.at else Path(parsed.project_dir).resolve()
     if not project_dir.is_dir():
@@ -1900,6 +2234,29 @@ def cmd_resume(args) -> None:
     if args._runner is None and _use_tui(args):
         _spawn_and_attach(project_dir=project_dir, model=parsed.model,
                           theme=theme)
+    # A resumed tree root needs a registry entry (the tree is made of them),
+    # exactly as a --plain `gerbil run --agents` does: register and re-enter.
+    if agent and args._runner is None:
+        name = runs.new_run_name()
+        runs.create_run(name, project_dir=project_dir, model=parsed.model,
+                        theme=theme, command=sys.argv[1:])
+        args._runner = name
+        print(style(f"supervisor registered as {name} (see `gerbil ps`)", "gray"))
+        runs.run_runner(name, lambda: cmd_resume(args))
+        return
+    plan = None
+    if agent:
+        if agent.get("plan"):
+            plan_path = runs.run_dir(args._runner) / agent_config.CONFIG_NAME
+            plan_path.write_text(agent["plan"])
+            try:
+                plan = agent_config.load(plan_path, default_model=parsed.model)
+            except ValueError as e:
+                sys.exit(f"error: the agent plan recorded in {resume_file.name} "
+                         f"no longer validates: {e}")
+        _register_agent_root(args, plan, agent.get("base_sha") or parsed.base_commit)
+        if agent.get("caps"):
+            runs.save_meta(args._runner, caps=agent["caps"])
 
     archive_dir = Path.home() / ".gerbil" / "sessions"
     archive_dir.mkdir(parents=True, exist_ok=True)
@@ -2013,6 +2370,10 @@ def cmd_resume(args) -> None:
                 # (The --fill-sorry plan file needs no rebuilding of its own:
                 # the ancestor patches and the wip patch below carry it.)
                 _rebuild_base(sandbox, anchor, ancestor_patches)
+                if agent:
+                    _attach_agent_tools(
+                        args, toolset, sandbox, plan, project_dir, parsed.model,
+                        get_session=lambda: session)
                 if fs_spec is not None:
                     sandbox.force_include = [
                         f"{fs_subdir}/{fs_plan}" if fs_subdir else fs_plan]
@@ -2080,7 +2441,12 @@ def cmd_resume(args) -> None:
                             ),
                             image=image,
                             fill_sorry=parsed.fill_sorry,
+                            agent=(agents_mod.session_agent_info(args._runner)
+                                   if agent else None),
                         )
+                        if agent:
+                            runs.save_meta(args._runner, session=str(session_path),
+                                           wip_patch=str(wip_path))
                         view.session_begin(
                             name=name, model=parsed.model,
                             small_model=parsed.small_model, ralph=ralph_meta,
@@ -2220,7 +2586,8 @@ def cmd_ps(args) -> None:
             ctx = f"{used / window:.0%}"
         rows.append((
             e["name"],
-            e["state"],
+            e["state"] + (" (review)" if e.get("review_pending")
+                          and e["state"] in ("running", "paused") else ""),
             Path(e.get("project_dir") or "?").name,
             e.get("model") or "?",
             stats_doc.get("session_name") or "-",
@@ -2246,6 +2613,106 @@ def cmd_ps(args) -> None:
         print()
         for hint in hints:
             print(style(hint, "gray"))
+
+
+def cmd_tree(args) -> None:
+    """Browse the session archive as a forest (see sessions_tree.py). The
+    viewer hands resume/grab back to us as its result, because both take over
+    the terminal: we then exec the real command -- through the installed
+    launcher when there is one (GERBIL_LAUNCHER, set by bin/gerbil), so a
+    resume gets the launcher's version-matched sandbox image."""
+    from . import sessions_tree
+
+    project = str(_resolve_at(args.at)) if args.at else None
+    if args.plain or not sys.stdout.isatty():
+        skipped: list[Path] = []
+        sys.stdout.write(sessions_tree.render_plain(
+            sessions_tree.build_forest(project=project, skipped=skipped)))
+        if skipped:
+            print(style(f"\n{len(skipped)} file(s) skipped (not readable session "
+                        "logs): " + ", ".join(p.name for p in skipped), "gray"))
+        return
+    from .tree_tui import TreeApp  # deferred: textual loads only for a tty
+
+    result = TreeApp(project=project).run()
+    if not result:
+        return
+    action, target = result
+    launcher = os.environ.get("GERBIL_LAUNCHER")
+    cmd = ([launcher] if launcher else [sys.executable, "-m", "gerbil"])
+    if action == "resume":
+        cmd += ["resume", target]
+        # Resume runs in the session's own project (it reads it from the log).
+        node = sessions_tree.scan_log(Path(target))
+        cwd = (node.project_dir if node and Path(node.project_dir).is_dir()
+               else os.getcwd())
+    else:
+        cmd += ["grab", target]
+        cwd = os.getcwd()
+    print(style(f"$ gerbil {action} {target}", "gray"))
+    os.chdir(cwd)
+    os.execvp(cmd[0], cmd)
+
+
+def cmd_review(args) -> None:
+    """The human end of the budget-review protocol (agents.py): list open
+    reviews, or answer one. Normally that is the root's (its reviewer is the
+    human); answering a sub-agent's overrides its parent -- the human outranks
+    every agent, so no headroom check applies here."""
+    entries = [e for e in runs.list_runs()
+               if e.get("review_pending") and e["state"] in ("running", "paused")]
+    if args.name is None:
+        if not entries:
+            print("no open budget reviews.")
+            return
+        for e in entries:
+            rv = agents_mod.load_review(e["name"]) or {}
+            from .agent_config import Budget
+            usage = agents_mod.subtree_usage(e["name"])
+            print(style(f"{e['name']}", "bold")
+                  + (f" ({e['role']})" if e.get("role") else "")
+                  + f" -- {rv.get('kind', '?')}"
+                  + (", PAUSED" if rv.get("blocking") else ", still working"))
+            print(f"  {rv.get('reason', '')}")
+            print(f"  usage: {agents_mod.describe_usage(Budget.from_dict(e.get('budget')), usage)}")
+            if rv.get("requested"):
+                print(f"  requested: {agents_mod._describe_grant(rv['requested'])}")
+            for line in (rv.get("progress") or "").splitlines():
+                print(f"  {line}")
+        print(style("\ndecide with: gerbil review NAME --extend [--tokens N] "
+                    "[--time 30m] [--cost USD] | --finish | --deny | --kill", "gray"))
+        return
+
+    name = args.name
+    meta = runs.load_meta(name)
+    if meta is None:
+        sys.exit(f"error: no run named {name!r} (see `gerbil ps`).")
+    if args.kill:
+        print(f"cancelled {name}." if runs.cancel_run(name)
+              else f"{name} is not running.")
+        return
+    rv = agents_mod.load_review(name)
+    if not rv or runs.classify(meta) not in ("running", "paused"):
+        sys.exit(f"error: {name} has no open review.")
+    if args.finish or args.deny:
+        action = "finish" if (args.finish or rv.get("blocking")) else "deny"
+        agents_mod.write_decision(name, rv["id"], action, note=args.note, by="human")
+        print(f"{name}: {action}.")
+        return
+    if not args.extend:
+        sys.exit("error: choose --extend, --finish, --deny, or --kill.")
+    try:
+        minutes = (agent_config.parse_duration(args.time) / 60
+                   if args.time is not None else None)
+        grant = agents_mod._grant_args(args.tokens, minutes, args.cost)
+    except ValueError as e:
+        sys.exit(f"error: {e}")
+    grant = grant or dict(rv.get("requested") or {})
+    if not grant:
+        sys.exit("error: say how much: --tokens, --time, or --cost.")
+    agents_mod.write_decision(name, rv["id"], "extend", grant=grant,
+                              note=args.note, by="human")
+    print(f"{name}: extended by {agents_mod._describe_grant(grant)}.")
 
 
 def cmd_grab(args) -> None:
@@ -2285,6 +2752,8 @@ def cmd_grab(args) -> None:
 # intentionally replayed too -- the sub-sessions mutate the same working tree --
 # while zoom_in/zoom_out themselves are naturally skipped.
 _REPLAY_TOOLS = {"bash", "write_file", "edit_file"}
+# A pseudo-call in the replay list: re-apply a logged sub-agent merge.
+_MERGE_REPLAY = "<merge_agent>"
 
 
 def _confirm(question: str) -> bool:
@@ -2344,11 +2813,16 @@ def cmd_reconstruct_patch(args) -> None:
         parsed, session_file, repo_root, patch_dirs
     )
 
-    # The mutating tool calls to replay, in order.
+    # The mutating tool calls to replay, in order -- plus, in supervisor mode,
+    # each successful sub-agent merge, whose patch the log embeds (the
+    # sub-agent's own edits happened in another sandbox, so no tool call here
+    # reproduces them).
     calls = [
-        (e["name"], e.get("args") or {})
+        (e["name"], e.get("args") or {}) if e.get("event") == "tool_call"
+        else (_MERGE_REPLAY, {"run": e.get("run"), "patch": e.get("patch", "")})
         for e in parsed.events
-        if e.get("event") == "tool_call" and e.get("name") in _REPLAY_TOOLS
+        if (e.get("event") == "tool_call" and e.get("name") in _REPLAY_TOOLS)
+        or (e.get("event") == "agent_merge" and e.get("ok"))
     ]
     if not calls:
         sys.exit(f"error: {session_file.name} logged no replayable tool calls.")
@@ -2388,7 +2862,13 @@ def cmd_reconstruct_patch(args) -> None:
                     f"{style(name, 'bold', 'cyan')}({_short_args(call_args)})",
                     flush=True,
                 )
-                result = toolset.dispatch(name, call_args)
+                if name == _MERGE_REPLAY:
+                    sandbox.commit(f"gerbil: checkpoint before merging sub-agent "
+                                   f"{call_args['run']}")
+                    ok, out = sandbox.try_git_am_3way(call_args["patch"])
+                    result = ToolResult(out, is_error=not ok)
+                else:
+                    result = toolset.dispatch(name, call_args)
                 if result.is_error:
                     errors += 1
                     preview = result.content[:160].replace("\n", " ")

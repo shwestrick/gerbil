@@ -82,6 +82,20 @@ src/gerbil/
                         render_stats, and the tree-style file summary
                         (render_file_tree / file_summary, session + summed
                         chain sections). Never imports textual
+  agents.py             supervisor mode (--agents): Caps, the AgentController
+                        behind spawn_agent/list_agents/peek_agent/wait_agents/
+                        merge_agent/kill_agent, child result records, and the
+                        stop-note nudge; plus budget accounting (subtree
+                        usage from stats.json), the review protocol
+                        (review.json / decision.json), and BudgetGuard
+  sessions_tree.py      `gerbil tree`'s model: archive logs -> forest (agent,
+                        resume, ralph links), status, resumability, labels
+                        sidecar (labels.json), subtree deletion. Pure
+  tree_tui.py           `gerbil tree`'s textual shell (resume/grab are handed
+                        back to cli.cmd_tree, which execs them)
+  agent_config.py       the project agent plan (.gerbil/agents.toml): roles,
+                        spawn tables, budgets; strict validation (DAG, child
+                        budgets within parent's, priced cost caps)
   runs.py               the background-run registry (~/.gerbil/running/<name>/):
                         adjective-animal naming, meta/stats files (atomic
                         replace, tolerant reads), pid liveness + the one
@@ -231,6 +245,38 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
   earlier, softer layers. Host gate and in-container check share one glob
   semantics (fnmatch, `*` crosses `/`; bash `[[ == ]]` agrees) via
   `fill_sorry.normalize_off_limits` -- don't let them drift apart.
+- **Supervisor mode isolates on the host, and only the root writes to the
+  project.** (`--agents`, agents.py.) Every sub-agent is an ordinary run with
+  its own runner process and container; meta.json's `parent` pointers are the
+  tree, and `runs.is_descendant` is the single visibility rule every
+  supervisor tool checks -- a target outside the caller's subtree gets the
+  same error as a nonexistent one. The tools execute in the caller's host
+  process; never expose the container runtime to an agent. A child's base is
+  `base_sha` + `base_chain` (the parent's chain + its `wip_patch` snapshot at
+  spawn), replayed by `cli._rebuild_base`, so the host HEAD must not move
+  (`cli._require_child_base`). A child's patch lands in its run dir, never
+  `.gerbil/patches/`; work reaches the host only by being merged
+  (`git am -3`) up the tree into the root's one patch. Caps (`agents.Caps`)
+  only shrink downward, and `runs.run_runner` cancels a run's live children
+  on every exit path (cascading), so no sub-agent outlives its parent.
+  Under an agent plan, budgets are enforced by `agents.BudgetGuard` at turn
+  boundaries only (never mid-tool-call). tokens/cost are *subtree* totals
+  read from each run's stats.json. Each review file has one writer:
+  `review.json` is written by the agent, `decision.json` by its reviewer.
+  After spawn, only the agent itself writes its meta `budget`; it applies
+  decisions to it. A reviewer's extension must fit its own headroom
+  (`agents.headroom`); the human (`gerbil review`) is exempt.
+  **Agent relations live in the logs, not just the registry.** The registry
+  is deleted on dismissal; the archive logs are permanent.
+  `Session(agent=agents.session_agent_info(run))` writes the tree position
+  into `session_start`: agent ids, `parent_session`, the agent's own
+  `base_patch`, and `base_chain_sha256`. Parent-side `agent_*` and own-side
+  `budget_*` events go through `Session.record_event` (whose `kind` parameter
+  is positional-only, because event fields include `kind`).
+  `agents.chain_from_logs` rebuilds a sub-agent's base from the logs alone,
+  hash-checked, for `_reconstruct_anchor`. `agent_merge` embeds the applied
+  patch, so reconstruct-patch replays merges (`_MERGE_REPLAY`). Keep any new
+  agent bookkeeping that matters for replay in the log.
 - **Built-in tool names win** over colliding MCP tool names (today none collide).
 - **Tool output is truncated once** (`tools.truncate_tool_output`, 10k chars,
   head+tail) and the *same* truncated text is what the model sees and what the log
@@ -268,7 +314,26 @@ archive copy in `~/.gerbil/sessions/` is kept regardless).
 - `gerbil run --prompt FILE [--model M] [--small-model M] [--zoom-max-turns N]
   [--fill-sorry SORRY[,SORRY..]|SPEC.toml] [--ralph N] [--ralph_done SCRIPT]
   [--max-turns N] [--image IMAGE] [--skip-cache] [--no-mcp]
-  [--omit-session-log] [--plain]`
+  [--omit-session-log] [--plain] [--agents [--max-agent-depth N]
+  [--max-agent-children N] [--max-agents N]] [--agents-config FILE]`
+  (supervisor mode, optionally under a project agent plan: see docs/agents.md)
+- `gerbil tree [--at DIR] [--plain]` — browse ~/.gerbil/sessions/ as trees
+  (sub-agents, resume continuations, ralph chains); `r` resume, `g` grab,
+  `n` name (labels.json sidecar — logs stay append-only), `d` delete a
+  subtree's archive files (refused while any of it is live). Resuming a
+  sub-agent log is refused (`cmd_resume` too); resuming a tree root
+  restores supervisor mode (`_register_agent_root` + `_attach_agent_tools`,
+  shared with `cmd_run`). The launcher passes `GERBIL_LAUNCHER` so the
+  viewer's resume re-execs through it and gets the version-matched image.
+  **Logs are untrusted input to the forest:** `build_forest` must keep every
+  session reachable. Cycles are cut at their oldest member, a duplicated
+  agent_id is never guessed at, malformed fields become notes, and nothing
+  may crash the viewer. All traversal is iterative. textual's `Tree` lays out
+  recursively, so the viewer caps display nesting (`MAX_VIEW_DEPTH`).
+  `tests/test_tree.py` covers each of these cases.
+- `gerbil review [NAME] [--extend [--tokens N] [--time D] [--cost USD] |
+  --finish | --deny | --kill] [--note TEXT]` — list open budget reviews, or
+  decide one (the human is the root's reviewer).
 - `gerbil new-fill [same options as run]` — author a `--fill-sorry` task spec
   interactively: opens `$VISUAL`/`$EDITOR`/`vi` on `fill_sorry.SPEC_TEMPLATE`
   (written to `<project>/.gerbil/tasks/fill-task-<ts>.toml`, kept regardless),
@@ -538,6 +603,14 @@ uv run python tests/test_tui.py          # live view: stats model, wip-patch fil
 uv run python tests/test_runs.py         # background-run registry: naming, liveness,
                                          # pause/resume, display tailing, stats wire
                                          # format, ps/grab commands (no Docker)
+uv run python tests/test_agents.py       # supervisor mode: caps, tree visibility, spawn/
+                                         # merge/wait/kill tools, stop nudge, cascade
+                                         # cancel, run_session stop hook (no Docker)
+uv run python tests/test_agent_plan.py   # agent plans: parsing/validation, subtree usage,
+                                         # role-governed spawn, BudgetGuard + review
+                                         # protocol, budget finish in run_session (no Docker)
+uv run python tests/test_tree.py         # gerbil tree: forest linking, status, labels,
+                                         # subtree delete, resume refusal, TUI via pilot
 uv run python tests/test_empty_turn.py   # glitched empty-turn guard + filter (no network)
 uv run python tests/test_sandbox_cleanup.py  # container cleanup on interrupt (no Docker)
 uv run python tests/test_ollama.py       # ollama provider plumbing (no Docker; live smoke if a server is up)

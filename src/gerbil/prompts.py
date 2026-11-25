@@ -147,6 +147,53 @@ at a time.
 """
 
 
+# Appended to the system prompt of an agent that may spawn sub-agents
+# (supervisor mode, see agents.py). {limits} describes its caps.
+SUPERVISOR_NOTE = """\
+
+You can delegate work to sub-agents with spawn_agent. Each sub-agent is a full \
+agent like you, working in its OWN isolated sandbox on a copy of your current \
+working tree; sub-agents run concurrently with you and with each other. They \
+cannot see your later changes, cannot see each other, and cannot ask you \
+questions -- so give each one a precise, self-contained prompt. Delegate \
+independent pieces of work (e.g. separate sorries or separate files) so that \
+their patches do not conflict.
+
+Follow them with list_agents and peek_agent, collect them with wait_agents, \
+and stop any that go astray with kill_agent. A sub-agent's changes reach YOUR \
+tree only when you merge_agent it; review its report first, and build after \
+merging to confirm everything still compiles. Sub-agents still running when \
+you finish are cancelled, and unmerged work is discarded. Spawn only when \
+parallelism or focus clearly helps -- each sub-agent costs a whole session. \
+Limits: {limits}.
+"""
+
+# Appended to the system prompt of a supervised sub-agent.
+SUB_AGENT_NOTE = """\
+
+You are a sub-agent: another agent delegated this task to you and will review \
+and merge your result. It cannot answer questions, so work with what the task \
+gives you. Stay within the scope of your task -- do not make unrelated changes, \
+since your patch must merge cleanly alongside other agents' work. When you \
+finish, your final message is your report to that agent: say exactly what you \
+did, what remains unfinished, and anything it must know before merging.
+"""
+
+
+# Appended to the system prompt of an agent with a budget (project agent
+# plan). {budget} is its limits; {reviewer} who reviews it.
+BUDGET_NOTE = """\
+
+You are working under a budget: {budget}. Tokens and cost count everything \
+spent by you AND by any sub-agents you spawn; time is your own wall clock. When \
+the budget runs out you will be paused between turns until {reviewer} reviews \
+your progress and decides whether to extend it, have you finish up, or stop \
+you -- so make steady, visible progress (keep the tree compiling, commit \
+meaningful intermediate states). If you can see you will need more, call \
+request_budget early with a concrete reason.
+"""
+
+
 def zoom_task_prompt(args: dict, inner_max_turns: int) -> str:
     """The small model's initial prompt: the task prompt the big model supplied
     in its zoom_in call, with one line appended naming the sorry and the turn
@@ -236,9 +283,12 @@ def context_pressure_note(level: float, used: int, limit: int) -> str:
 def build_system_prompt(
     has_lsp_tools: bool, ralph: bool = False, base_commit: str = "",
     zoom_in_available: bool = False, submodules: list[str] | None = None,
-    check_goal_available: bool = False,
+    check_goal_available: bool = False, agents=None, sub_agent: bool = False,
+    budget=None,
 ) -> str:
-    """The system prompt, with notes appended for active features."""
+    """The system prompt, with notes appended for active features. `agents`
+    is the session's agents.AgentController (supervisor mode), if any;
+    `sub_agent` marks a session that is itself a supervised sub-agent."""
     prompt = SYSTEM_PROMPT
     if has_lsp_tools:
         prompt += LSP_TOOLS_NOTE
@@ -248,6 +298,27 @@ def build_system_prompt(
         prompt += CHECK_GOAL_NOTE
     if zoom_in_available:
         prompt += ZOOM_NOTE
+    if sub_agent:
+        prompt += SUB_AGENT_NOTE
+    if agents is not None and agents.can_spawn() and getattr(agents, "plan", None):
+        role = agents.role
+        prompt += SUPERVISOR_NOTE.format(
+            limits=f"set by the project's agent plan -- you play the role "
+            f"'{role.name}', and spawn_agent's description lists exactly which "
+            "roles you may spawn, how many, and their budgets")
+    elif agents is not None and agents.can_spawn():
+        caps = agents.caps
+        limits = (
+            f"at most {caps.max_children} sub-agents spawned by you, at most "
+            f"{caps.max_agents} running at once across all agents"
+            + (", and your sub-agents may themselves be allowed to spawn "
+               "(can_spawn)" if caps.depth_left > 1 else
+               ", and your sub-agents cannot spawn further sub-agents")
+        )
+        prompt += SUPERVISOR_NOTE.format(limits=limits)
+    if budget is not None and budget.budget.is_set():
+        prompt += BUDGET_NOTE.format(budget=budget.budget.describe(),
+                                     reviewer=budget._reviewer())
     if base_commit:
         prompt += GIT_STATE_NOTE.format(base=base_commit)
     if submodules:
